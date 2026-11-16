@@ -67,6 +67,7 @@ class AstProfile:
     identifier_nodes: frozenset[str] = field(default_factory=lambda: COMMON_IDENTIFIER_NODES)
     name_fields: tuple[str, ...] = ("name", "declarator", "declaration", "path", "type")
     parameter_fields: tuple[str, ...] = ("parameters", "parameter_list", "formal_parameters", "function_value_parameters")
+    parameter_declarator_field: str | None = None
     return_fields: tuple[str, ...] = ("return_type", "type", "result")
     base_fields: tuple[str, ...] = ("superclass", "superclasses", "base_class", "base_clause", "extends_clause", "interfaces", "super_interfaces")
     import_fields: tuple[str, ...] = ("path", "source", "module", "name")
@@ -149,10 +150,6 @@ COMMON_CONTROL_CALLS = frozenset(
 DEFAULT_PROFILE = AstProfile(name="default", languages=frozenset())
 
 
-def profile_for(language: str | None) -> AstProfile:
-    return DEFAULT_PROFILE
-
-
 class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
     profile: AstProfile = DEFAULT_PROFILE
 
@@ -165,6 +162,8 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
 
     def _walk_generic(self, node: Any, scope: list[CodeSymbol]) -> None:
         node_type = str(getattr(node, "type", ""))
+        if self.syntax_recovery_containers and not self._recoverable_syntax_node(node):
+            return
         if self.profile.is_comment_node(node_type):
             self.comments.append(_text(self.artifact, _owner(scope), _node_text(self.source, node), _line(node), _end_line(node), "comment"))
             return
@@ -210,6 +209,22 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
             self._call(node, scope)
         self._walk_generic_children(node, scope)
 
+    def _recoverable_syntax_node(self, node: Any) -> bool:
+        """Trust intact subtrees and function bodies, never damaged declarators or bodies."""
+        if bool(getattr(node, "is_missing", False)) or str(node.type) == "ERROR":
+            return False
+        if not bool(getattr(node, "has_error", False)) or str(node.type) in self.syntax_recovery_containers:
+            return True
+        if str(node.type) not in self.profile.function_nodes:
+            return False
+        declarator = _field(node, "declarator")
+        body = _field(node, "body")
+        return bool(
+            declarator is not None and body is not None
+            and not declarator.has_error and not body.has_error
+            and all(not child.has_error or child.end_byte <= declarator.start_byte for child in _children(node))
+        )
+
     def _walk_generic_children(self, node: Any, scope: list[CodeSymbol]) -> None:
         for child in _children(node):
             self._walk_generic(child, scope)
@@ -238,9 +253,11 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
             _end_line(node),
             bases=_generic_bases(self.source, node, self.profile),
             args=_generic_params(self.source, node, self.profile),
-            returns=_clean_type_text(_node_text(self.source, _first_field(node, self.profile.return_fields))),
+            returns=None if bool(getattr(node, "has_error", False)) else _clean_type_text(_node_text(self.source, _first_field(node, self.profile.return_fields))),
         )
         symbol.metadata.update({"language": self.language_key, "profile": self.profile.name, "ast_node": str(getattr(node, "type", ""))})
+        if bool(getattr(node, "has_error", False)):
+            symbol.metadata["syntax_recovered"] = True
         return symbol
 
     def _generic_variable_container_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
@@ -364,9 +381,10 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
             return
         caller = _call_owner(scope)
         self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
-        for argument in _call_argument_nodes(node, self.profile):
+        arguments = _call_argument_nodes(node)
+        for argument in arguments:
             self._generic_expression_references(argument, scope, access="read")
-        argument_values = _quoted_texts_in_nodes(self.source, _call_argument_nodes(node, self.profile))
+        argument_values = _quoted_texts_in_nodes(self.source, arguments)
         self.calls.append(
             CodeCall(
                 id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
@@ -437,8 +455,16 @@ def _identifier_texts(source: bytes, node: Any | None, profile: AstProfile) -> l
 
 def _generic_params(source: bytes, node: Any, profile: AstProfile) -> list[str]:
     params = _first_field(node, profile.parameter_fields)
+    while params is None and profile.parameter_declarator_field is not None:
+        node = _field(node, profile.parameter_declarator_field)
+        if node is None:
+            break
+        params = _first_field(node, profile.parameter_fields)
     if params is None:
         return []
+    if profile.parameter_declarator_field is not None:
+        return [_node_text(source, name) for child in _named_children(params)
+                if (name := _declaration_name_node(_field(child, profile.parameter_declarator_field), profile)) is not None]
     return [values[0] for child in _named_children(params) if (values := _identifier_texts(source, child, profile))]
 
 
@@ -551,7 +577,8 @@ def _call_target_node(node: Any, profile: AstProfile) -> Any | None:
     return None
 
 
-def _call_argument_nodes(node: Any, profile: AstProfile) -> list[Any]:
+def _call_argument_nodes(node: Any) -> list[Any]:
+    """Collect call arguments once for references and quoted argument metadata."""
     values: list[Any] = []
     for field_name in ("arguments", "argument", "argument_list"):
         field = _field(node, field_name)

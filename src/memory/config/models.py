@@ -1,7 +1,8 @@
 """Configuration domain objects for REQL."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
+import math
 from typing import Any, Mapping, get_args, get_origin, get_type_hints
 
 from .path_rules import normalize_scan_exclude_pattern, resolve_scan_exclude_pattern
@@ -34,7 +35,6 @@ class ProjectConfig:
 @dataclass(frozen=True, slots=True)
 class ScanConfig:
     max_file_size_mb: float
-    use_gitignore: bool
     ignore_defaults: bool
     include: list[str]
     exclude: list[str]
@@ -46,7 +46,6 @@ class ScanConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_file_size_mb": self.max_file_size_mb,
-            "use_gitignore": self.use_gitignore,
             "ignore_defaults": self.ignore_defaults,
             "include": list(self.include),
             "exclude": list(self.exclude),
@@ -142,9 +141,6 @@ class REQLConfig:
             "retention": self.retention.to_dict(),
         }
 
-    def with_overrides(self, overrides: Mapping[str, Any] | None = None, **kwargs: Any) -> "REQLConfig":
-        return merge_config(self, {**(overrides or {}), **kwargs})
-
 
 SECTION_TYPES = {
     "project": ProjectConfig,
@@ -169,10 +165,12 @@ def merge_config(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig
             target = nested.setdefault(section, {})
             option_parts = option_path.split(".")
             for part in option_parts[:-1]:
-                child = target.setdefault(part, {})
-                if not isinstance(child, dict):
+                child = target.get(part, {})
+                if not isinstance(child, Mapping):
                     raise ValueError(f"Config override conflicts with a scalar option: {key}")
-                target = child
+                # Copy only the traversed branch; nested overrides belong to callers.
+                target[part] = dict(child)
+                target = target[part]
             target[option_parts[-1]] = value
         elif isinstance(value, Mapping):
             nested.setdefault(key, {}).update(dict(value))
@@ -265,7 +263,7 @@ def _section(cls: type[Any], raw: object, section_name: str) -> Any:
     unknown = set(raw_values) - option_names
     if unknown:
         raise ValueError(f"Unknown config option(s) in [{section_name}]: {', '.join(sorted(unknown))}")
-    missing = option_names - set(raw_values)
+    missing = {field.name for field in fields(cls) if field.default is MISSING and field.default_factory is MISSING} - set(raw_values)
     if missing:
         raise ValueError(f"Missing config option(s) in [{section_name}]: {', '.join(sorted(missing))}")
     values = {
@@ -282,7 +280,10 @@ def _coerce_value(section: str, key: str, value: Any, expected_type: Any) -> Any
     if expected_type is float:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError(f"Config option {section}.{key} must be a number")
-        return float(value)
+        try:
+            return float(value)
+        except OverflowError as exc:
+            raise ValueError(f"Config option {section}.{key} must be a finite number") from exc
     if expected_type is int:
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError(f"Config option {section}.{key} must be an integer")
@@ -360,8 +361,8 @@ def _coerce_document_formats(value: Any) -> dict[str, dict[str, list[str]]]:
 def _validate(config: REQLConfig) -> None:
     if not config.project.id.strip():
         raise ValueError("Config option project.id must not be empty")
-    if config.scan.max_file_size_mb <= 0:
-        raise ValueError("Config option scan.max_file_size_mb must be greater than zero")
+    if not math.isfinite(config.scan.max_file_size_mb) or config.scan.max_file_size_mb <= 0:
+        raise ValueError("Config option scan.max_file_size_mb must be finite and greater than zero")
     for pattern in config.scan.exclude:
         resolve_scan_exclude_pattern(pattern)
     if config.cache.fingerprint_strategy != "sha256":

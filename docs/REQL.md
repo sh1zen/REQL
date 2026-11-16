@@ -1,7 +1,11 @@
-﻿# REQL
+﻿# REQL Queries and Graph
 
-REQL can query all graph node and edge types because storage uses generic
-property-graph nodes and edges.
+Use `reql query "STATEMENT"` to inspect property-graph records or run graph
+analysis. Add `--json` for structured output.
+
+- [Query syntax and examples](#first-class-graph-commands)
+- [Graph schema](#graph-schema)
+- [Graph analysis](#graph-analysis)
 
 ## First-Class Graph Commands
 
@@ -22,13 +26,7 @@ SYMBOLS TYPE Class,Method ORDER BY relative_path ASC LIMIT 50
 FINDINGS WHERE finding_type = "unused_variable" LIMIT 20
 ```
 
-Analysis records:
-
-```text
-COMMUNITIES LIMIT 20
-HUBS LIMIT 20
-HUBS TYPE Topic,Concept,Function LIMIT 10
-```
+For communities and hubs, see [graph analysis](#graph-analysis).
 
 Incremental compilation records:
 
@@ -40,6 +38,18 @@ CACHE STATUS
 These commands support `WHERE`, `LIMIT`, and `ORDER BY` where applicable. Fields
 resolve against node properties first-class, so artifact fields such as
 `artifact_type` and symbol fields such as `name` can be filtered directly.
+
+`FIND`, typed listings, and `MATCH` apply predicates and ordering to the complete
+eligible type scope before `LIMIT`. The limit controls returned rows, not a
+candidate window. Type filters and equality comparisons are case-insensitive;
+native fields, custom or nested properties, and source-span aliases share the
+same field resolution. Explicit `SYMBOLS TYPE` lists retain every requested type.
+`STATS TYPE` uses the same type matching.
+
+`LIMIT`, `TOP`, and `DEPTH` require non-negative integers; fractional numbers and
+booleans are errors. `LIMIT 0` returns no rows. Numeric comparisons and ordering
+preserve integer precision. Mixed sort values order nulls before numbers and
+numbers before text in ascending order.
 
 `WHERE` supports boolean composition with `AND`, `OR`, and `NOT`, comparison
 operators (`=`, `!=`, `>`, `>=`, `<`, `<=`), list membership with `IN`, text
@@ -70,6 +80,11 @@ MATCH (f:Function)-[:CALLS]->(g)
 RETURN f.name,g.name
 ```
 
+`MATCH` aliases are case-insensitive and bind only to their declared pattern
+roles. Without `RETURN`, column names use those aliases. Anonymous roles receive
+distinct aliases. Repeating a node alias requires the same node at both ends;
+an edge alias cannot also name a node. Undirected self-loops produce one row.
+
 Find imported modules:
 
 ```text
@@ -82,10 +97,13 @@ Find classes and methods:
 FIND nodes TYPES Class,Method RETURN name,qualified_name,start_line,end_line LIMIT 50
 ```
 
-Compiled code symbols expose both `start_line/end_line` and `line_start/line_end`
-as equivalent source-span aliases. `SYMBOLS`, `FIND`, `MATCH`, and `RETRIEVE`
-queries can use either spelling, and compiled symbols include `source_path` plus
-`relative_path` so targeted source reads can resolve exact spans.
+Although results can use either set of [source-span fields](#node-records),
+including `relative_path` lets callers resolve paths within the project.
+
+```text
+MATCH (file:File)-[:DEFINES]->(fn:Function)
+RETURN file.relative_path,fn.name
+```
 
 Find compile-time static analysis findings:
 
@@ -94,11 +112,10 @@ FINDINGS WHERE finding_type = "unused_import"
 RETURN symbol_name,relative_path,line_start,cleanup_priority,reason
 ```
 
-Application-surface compilation connects CSS selectors with matching template
-attributes and JavaScript selector/class APIs. It also emits
-`unused_css_class` and high-confidence `always_overridden_css_declaration`
-findings. PHP `include`/`require` partials resolve to view files when their path
-is static, while template-render edges expose detected `view_variables`.
+```text
+MATCH (s:Variable)-[:HAS_FINDING]->(f:StaticAnalysisFinding)
+RETURN s.name,f.finding_type,f.relative_path,f.line_start
+```
 
 `FINDINGS` sorts active findings by numeric `cleanup_rank` by default, so direct
 cleanup candidates appear before low-confidence or test-local noise. Explicit
@@ -137,32 +154,6 @@ RETRIEVE "payment workflow" TYPE Function,Method NO SOURCES RETURN id,type,label
 RETRIEVE "source provenance" RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start,line_end
 ```
 
-## Graph Analysis Examples
-
-List detected communities:
-
-```text
-COMMUNITIES LIMIT 20
-```
-
-List top hubs:
-
-```text
-HUBS LIMIT 20
-```
-
-Limit hubs to selected node types:
-
-```text
-HUBS TYPE Topic,Concept,Function LIMIT 10
-```
-
-Explain why a node was or was not scored as a hub:
-
-```text
-EXPLAIN HUB "node_id"
-```
-
 ## Path Example
 
 Find a bounded path between text-selected concepts:
@@ -171,4 +162,231 @@ Find a bounded path between text-selected concepts:
 PATH FROM TEXT "incremental compiler" TO TEXT "activation engine" DEPTH 5
 ```
 
+## Graph Schema
 
+REQL's active schema is a code graph. Nodes describe projects, source
+artifacts, source fragments, code symbols, deterministic document terms and
+events, static-analysis findings, graph-analysis records, cache entries,
+compilation runs, and deltas. Edges describe containment, definitions,
+references, calls, imports, inheritance, configuration, tests, provenance,
+document co-occurrence, cleanup findings, and graph-analysis membership.
+
+### Node Records
+
+Each `MemoryNode` has:
+
+- `id`
+- `type`
+- `label`
+- `text`
+- `canonical_key`
+- `properties`
+- status
+- salience, activation, confidence
+- evidence and usage counters
+- timestamps
+
+Compiled symbols expose interchangeable `start_line/end_line` and
+`line_start/line_end` fields, plus `source_path` and `relative_path`. `SYMBOLS`,
+`FIND`, `MATCH`, and `RETRIEVE` accept either span spelling. Free-search
+retrieval ranks active records with lexical coverage, graph context, salience,
+and usage signals.
+
+### Edge Records
+
+Each `MemoryEdge` has:
+
+- `id`
+- `from_id`
+- `to_id`
+- `type`
+- weight
+- confidence
+- polarity
+- origin
+- `properties`
+- timestamps
+
+Edges are directed. `from_id` is the outgoing/source endpoint and `to_id` is
+the incoming/target endpoint. Query and context payloads may expose aliases such
+as `source_id`, `target_id`, `incoming`, and `outgoing`, but the stored
+canonical edge record remains `from_id -> to_id`.
+
+Deterministic compile-time technical edges carry `confidence=1.0` and store
+`source_id`, `target_id`, `type`, `confidence`, `source_file`, `line_start`,
+`line_end`, `extractor`, `evidence`, `created_at`, `updated_at`,
+`mode=compile`, `is_semantic=false`, and `is_technical=true` in their
+properties.
+
+### Main Node Types
+
+- `Project`: scanned project root.
+- `Directory`: deterministic project directory.
+- `File`: deterministic project file.
+- `SourceArtifact`: registered source, document, data, config, or binary file.
+- `SourceFragment`: deterministic fragment derived from a source artifact.
+- `Module`, `Package`, `Class`, `Interface`, `Function`, `Method`,
+  `Variable`, `CodeSymbol`: compile-mode code symbols and containers.
+- `Import`, `Dependency`, `Endpoint`, `Schema`, `Config`, `Test`, `Comment`,
+  `Docstring`: compile-mode technical graph records.
+- `StaticAnalysisFinding`: deterministic static-analysis or cleanup candidate.
+- `Concept`: deterministic document term or explicit heading concept.
+- `RawEvent`: underlying document observation used as evidence for terms.
+- `ArtifactCacheEntry`: successful artifact compilation fingerprint.
+- `CompilationRun`: one incremental compilation invocation.
+- `GraphDelta`: change trace for a compilation run.
+- `ProjectRevision`: immutable content-addressed project tree metadata with its
+  parent id, manifest hashes, and changed paths.
+- `Community`: topological cluster written by deterministic community
+  detection.
+
+Retrieval usage is stored in the sidecar `<store>.usage.jsonl` journal rather
+than as graph nodes.
+
+### Main Relations
+
+```text
+Project/Directory -CONTAINS-> Directory/File
+File/SourceArtifact -DEFINES-> Module/Class/Interface/Function/Method/Variable
+Module -CONTAINS-> Function/Class/Interface/Method/Variable
+Class/Interface -METHOD-> Method
+SourceFragment -REFERENCES-> code symbol
+Function/Method -CALLS-> Function/Method
+File/Module -IMPORTS-> Import
+File -DEPENDS_ON-> Dependency
+Module -IMPORTS_FROM-> Dependency
+Module -RE_EXPORTS-> Symbol/Module/File
+Class/Interface -INHERITS-> Class/CodeSymbol
+Method -OVERRIDES-> Method
+Function/Method -WRAPS-> Function/Method/Class
+ProjectRevision -PARENT_REVISION-> ProjectRevision
+ProjectRevision -DERIVED_FROM-> CompilationRun
+ProjectRevision -CHANGES-> SourceArtifact
+Class -IMPLEMENTS-> Interface
+Function/Method -READS/WRITES/RETURNS/RAISES-> code node
+Function/Method -INSTANTIATES-> Class/Interface
+Function/Method -EMITS-> event symbol
+Class/Interface/Module -USES-> code symbol
+Module/Function/Class/Interface/Method -EVIDENCED_BY-> SourceFragment
+Function/Class/Method -HAS_DOCSTRING-> Docstring
+Module/Function/Class/Method -HAS_COMMENT-> Comment
+Function/Class/Method -DECORATED_BY-> CodeSymbol
+Function/Method -HANDLES_ROUTE-> Endpoint
+Test -TESTS-> code symbol
+SourceArtifact/Symbol/Import -HAS_FINDING-> StaticAnalysisFinding
+graph member -BELONGS_TO_COMMUNITY-> Community
+bridging node -BRIDGES_COMMUNITY-> neighboring Community
+```
+
+The schema also defines `CONFIGURES` for configuration relations.
+
+### Document Relations
+
+```text
+SourceArtifact -CONTAINS_FRAGMENT/HAS_SECTION-> SourceFragment
+SourceFragment -LINKS_TO-> URI
+SourceFragment -HAS_CODE_BLOCK-> SourceFragment
+SourceFragment -DERIVED_FROM-> SourceArtifact
+SourceFragment -REFERENCES-> compiled code symbol
+SourceFragment -MENTIONS-> Concept
+SourceArtifact/SourceFragment -CONTAINS-> heading Concept
+Concept -EVIDENCED_BY-> RawEvent
+Concept -CO_OCCURS_WITH-> Concept
+```
+
+See the [compilation pipeline](PIPELINE.md#document-ingestion) for how REQL
+builds document fragments and [code analysis](PIPELINE.md#extracted-graph) for
+static findings and unresolved calls.
+
+Shared `work_record` nodes belong to a separate store. Their fields, relations
+and lifecycle are defined in [Engineering coordination](COORDINATION.md#work-records).
+
+## Graph Analysis
+
+REQL includes deterministic graph analysis for communities, hubs, and bridge
+signals. The implementation is dependency-light and does not require NetworkX,
+Leiden, or an LLM.
+
+### Communities
+
+Community detection uses bounded deterministic label propagation over active
+graph nodes. It ignores maintenance records such as reports, deltas, cache
+entries, and prior community nodes. The detector writes `Community` nodes with:
+
+- `id`
+- `project_id`
+- `label`
+- `size`
+- `density`
+- `salience`
+- `status`
+- `created_at`
+- `updated_at`
+
+Members are connected with `BELONGS_TO_COMMUNITY`. Nodes that touch neighboring
+communities receive `BRIDGES_COMMUNITY` edges.
+
+### Hub Analysis
+
+Hub analysis detects high-degree graph nodes, but REQL avoids
+promoting generic high-degree nodes by requiring both structural centrality and
+semantic specificity.
+
+The score is:
+
+```text
+hub_score =
+    0.20 * normalized_degree
+  + 0.15 * weighted_degree
+  + 0.15 * activation_frequency
+  + 0.15 * retrieval_usefulness
+  + 0.10 * salience
+  + 0.10 * community_bridge_score
+  + 0.10 * specificity
+  + 0.05 * confidence
+  - 0.20 * generic_penalty
+```
+
+If activation or retrieval usefulness is not present on a node, the analyzer
+uses zero. It does not synthesize usage data.
+
+The specificity scorer is deterministic. It rewards concise topical labels,
+specific node types, focused neighborhoods, and known successful usage. It
+penalizes stopword-heavy or generic vocabulary, generic node types, high degree
+without topical focus, unknown/binary artifacts, and high entropy across
+neighbor types.
+
+Hub analysis updates node properties:
+
+- `hub_score`
+- `centrality_score`
+- `specificity_score`
+- `community_bridge_score`
+- `is_hub`
+- `hub_rank`
+- `hub_reason`
+
+For scalability, `HUBS` does not run full community detection by default and
+does not materialize the whole graph. It first asks the storage adapter for a
+bounded top-degree candidate set, then computes centrality over the candidate
+subgraph with bounded incident-edge queries. Existing `BELONGS_TO_COMMUNITY`
+edges are still used for community bridge scoring. Run `COMMUNITIES` explicitly
+when community assignments need to be refreshed before hub analysis.
+
+### Commands
+
+```bash
+reql query "COMMUNITIES LIMIT 20"
+reql query "HUBS LIMIT 20"
+reql query "HUBS TYPE Topic,Concept,Function LIMIT 10"
+reql query "EXPLAIN HUB 'node_id'" --json
+```
+
+Use `--json` on `reql query` for structured output.
+
+### Limitations
+
+The community detector is designed for local graphs with thousands of nodes. It
+is deterministic and fast, but it is not a full modularity optimizer. Hub and
+bridge analysis are based on current graph structure and stored usage signals;
+absent usage signals remain absent.

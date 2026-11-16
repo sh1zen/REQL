@@ -603,7 +603,7 @@ class JsonContextRendererMixin:
             features.add("sequence:" + "/".join(sequence[index : index + 3]))
         return tuple(sequence), features
 
-    def _query_explore_followups(self, query_text: str, views: Sequence[str], seed_nodes: OrderedDict[str, MemoryNode]) -> list[dict[str, str]]:
+    def _query_explore_followups(self, query_text: str, views: Sequence[str]) -> list[dict[str, str]]:
         query = self._reql_string(query_text)
         followups = [
                 {
@@ -617,14 +617,6 @@ class JsonContextRendererMixin:
                     "purpose": "expanded edge details",
                 },
         ]
-        if seed_nodes:
-            followups.append(
-                {
-                    "label": "Inspect first seed",
-                    "command": f"reql inspect --node-id {next(iter(seed_nodes))} --json",
-                    "purpose": "seed provenance and neighbors",
-                }
-            )
         for view in views:
             followups.append(
                 {

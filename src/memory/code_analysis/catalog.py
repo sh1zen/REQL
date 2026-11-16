@@ -104,6 +104,7 @@ def tree_sitter_language_key(path: str, language: str | None) -> str:
 
 
 def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
+    """Accept current grammar capsules or already constructed Language objects."""
     language_cls = getattr(tree_sitter, "Language")
     raw = _load_direct_language(language)
     if raw is None:
@@ -112,10 +113,9 @@ def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
         raise ValueError(f"Unsupported Tree-sitter language: {language}")
     if isinstance(raw, int):
         raise ValueError("Tree-sitter integer grammar pointers are unsupported")
-    try:
-        return language_cls(raw)
-    except TypeError:
+    if isinstance(raw, language_cls):
         return raw
+    return language_cls(raw)
 
 
 def _load_direct_language(language: str) -> Any | None:
@@ -133,14 +133,41 @@ def _load_direct_language(language: str) -> Any | None:
     return getattr(module, function_name)()
 
 
+def grammar_packages(language: str) -> tuple[str, ...]:
+    """Identify the runtime and direct or fallback grammar dependencies."""
+    from .factory import EXTRACTOR_BY_LANGUAGE
+
+    module_name = getattr(EXTRACTOR_BY_LANGUAGE.get(language), "tree_sitter_module", None)
+    fallback = ("tree-sitter-language-pack",)
+    if not module_name:
+        return ("tree-sitter", *fallback)
+    direct = module_name.replace("_", "-")
+    try:
+        # Consult the same loader used to choose a grammar. No parser is created.
+        use_direct = _load_direct_language(language) is not None
+    except (ImportError, AttributeError):
+        # Leave grammar errors to compilation so they remain artifact-local.
+        use_direct = False
+    return ("tree-sitter", direct) if use_direct else ("tree-sitter", direct, *fallback)
+
+
 def _load_language_pack_language(language: str) -> Any | None:
+    """Load only locally available fallback grammars; downloads require explicit setup."""
     try:
         language_pack = import_module("tree_sitter_language_pack")
     except ModuleNotFoundError:
         return None
     get_language = getattr(language_pack, "get_language")
+    available = set(language_pack.available_languages())
+    keys = tuple(key for key in _language_pack_keys(language) if key in available)
+    if not keys:
+        raise ValueError(
+            f"Tree-sitter grammar {language!r} is not available locally. "
+            "Install its direct grammar package or explicitly download it with "
+            "tree_sitter_language_pack.download before compiling."
+        )
     last_error: Exception | None = None
-    for key in _language_pack_keys(language):
+    for key in keys:
         try:
             return get_language(key)
         except Exception as exc:

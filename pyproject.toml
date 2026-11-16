@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reql"
-version = "0.1.6"
+version = "0.3.0"
 description = "Relational Entities Query Language: a graph-native deterministic memory engine."
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
@@ -69,15 +69,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-watch = ["watchdog>=4.0"]
 pdf = ["pypdf>=4.0"]
-all = [
-  "pypdf>=4.0",
-  "watchdog>=4.0",
-]
+all = ["pypdf>=4.0"]
 dev = [
+  "coverage[toml]>=7.10,<8",
   "pypdf>=4.0",
-  "watchdog>=4.0",
 ]
 
 [project.urls]
@@ -98,3 +94,23 @@ api = ["py.typed"]
 memory = ["py.typed", "config/conf.yaml"]
 mcp = ["py.typed"]
 reql = ["py.typed"]
+
+[tool.coverage.run]
+branch = true
+source_pkgs = ["agents", "api", "memory", "mcp", "reql"]
+relative_files = true
+data_file = ".tmp/coverage/.coverage"
+parallel = true
+patch = ["subprocess"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.html]
+directory = ".tmp/coverage/html"
+
+[tool.coverage.xml]
+output = ".tmp/coverage/coverage.xml"
+
+[tool.coverage.json]
+output = ".tmp/coverage/coverage.json"

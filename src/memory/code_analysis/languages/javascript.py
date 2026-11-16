@@ -5,11 +5,8 @@ from typing import Any
 
 from ..base import (
     TreeSitterExtractorBase,
-    _call_owner,
-    _call_target,
     _children,
     _clean_type_text,
-    _column,
     _end_line,
     _field,
     _has_direct_child,
@@ -21,13 +18,11 @@ from ..base import (
     _owner,
     _params,
     _parent,
-    _reference,
     _string_literal,
     _symbol,
     _text,
-    stable_id,
 )
-from ..models import CodeCall, CodeSymbol, SymbolKind
+from ..models import CodeSymbol, SymbolKind
 
 
 class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
@@ -62,19 +57,48 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
                 self.symbols.append(symbol)
                 self._walk_javascript_children(node, [*scope, symbol])
                 return
-        if node_type in {"variable_declarator", "public_field_definition"}:
+        if node_type in {"variable_declarator", "public_field_definition", "assignment_expression"}:
             symbol = self._javascript_variable_function_symbol(node, scope)
             if symbol:
                 self.symbols.append(symbol)
                 self._walk_javascript_children(node, [*scope, symbol])
                 return
         if node_type == "call_expression":
-            self._call(node, scope, function_field="function")
+            self._record_call(node, scope, function_field="function")
+            test = self._javascript_test_callback(node, scope)
+            if test is not None:
+                symbol, callback = test
+                self.symbols.append(symbol)
+                self._walk_javascript_children(callback, [*scope, symbol])
+                return
         self._walk_javascript_children(node, scope)
 
     def _walk_javascript_children(self, node: Any, scope: list[CodeSymbol]) -> None:
         for child in _children(node):
             self._walk_javascript(child, scope)
+
+    def _javascript_test_callback(self, node: Any, scope: list[CodeSymbol]) -> tuple[CodeSymbol, Any] | None:
+        """Use literal test registrations as callback reference owners.
+
+        See docs/PIPELINE.md#changing-an-extractor for versions and tests.
+        """
+        from ...artifacts.context_scope import artifact_context_scope
+
+        function = _node_text(self.source, _field(node, "function"))
+        if function not in {"test", "it", "test.only", "it.only"} or artifact_context_scope(self.artifact) != "test":
+            return None
+        arguments = _field(node, "arguments")
+        items = _named_children(arguments) if arguments is not None else []
+        if len(items) < 2 or items[0].type != "string" or items[1].type not in {"arrow_function", "function_expression"}:
+            return None
+        name = _string_literal(_node_text(self.source, items[0]))
+        if not name or len(name) > 160:
+            return None
+        callback = items[1]
+        symbol = _symbol(self.artifact, "function", _parent(self.module, scope), name,
+                         _line(node), _end_line(node), args=_params(self.source, _field(callback, "parameters")))
+        symbol.metadata["test_case"] = True
+        return symbol, callback
 
     def _javascript_import(self, node: Any) -> None:
         source_node = _field(node, "source")
@@ -82,22 +106,53 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
         if module is None and str(getattr(node, "type", "")) == "import_statement":
             module = _last_quoted(_node_text(self.source, node))
         if module is None:
+            for clause in _named_children(node):
+                if clause.type == "export_clause":
+                    for entry in _named_children(clause):
+                        name = _node_text(self.source, _field(entry, "name"))
+                        alias = _node_text(self.source, _field(entry, "alias")) or name
+                        if name:
+                            self.module.metadata.setdefault("local_exports", []).append([name, alias])
             return
-        self.imports.append(_import(self.artifact, module, None, None, _line(node), _node_text(self.source, node).strip()))
+        raw = _node_text(self.source, node).strip()
+        exported = node.type == "export_statement"
+        bindings: list[tuple[str | None, str | None]] = []
+        for child in _named_children(node):
+            if child.type not in {"import_clause", "export_clause", "namespace_export"}:
+                continue
+            for entry in _named_children(child):
+                if entry.type in {"import_specifier", "export_specifier", "named_imports"}:
+                    specifiers = _named_children(entry) if entry.type == "named_imports" else [entry]
+                    for specifier in specifiers:
+                        name = _node_text(self.source, _field(specifier, "name"))
+                        alias = _node_text(self.source, _field(specifier, "alias")) or None
+                        if name:
+                            bindings.append((name, alias))
+                elif entry.type == "namespace_import":
+                    bindings.append(("*", _node_text(self.source, _named_children(entry)[0])))
+                elif entry.type == "identifier" and not exported:
+                    bindings.append(("default", _node_text(self.source, entry)))
+        for name, alias in bindings or [(None, None)]:
+            item = _import(self.artifact, module, name, alias, _line(node), raw)
+            if exported:
+                item.metadata["is_re_export"] = True
+            self.imports.append(item)
 
     def _javascript_class_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
         name_node = _field(node, "name")
         if name_node is None:
             return None
         base = _javascript_class_base(self.source, node)
-        return _symbol(self.artifact, "class", _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(node), bases=[base] if base else [])
+        symbol = _symbol(self.artifact, "class", _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(node), bases=[base] if base else [])
+        return self._javascript_exported_symbol(symbol, node)
 
     def _javascript_function_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
         name_node = _field(node, "name")
         if name_node is None:
             return None
         kind: SymbolKind = "async_function" if _has_direct_child(node, "async") else "function"
-        return _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(node), args=_params(self.source, _field(node, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(node, "return_type"))))
+        symbol = _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(node), args=_params(self.source, _field(node, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(node, "return_type"))))
+        return self._javascript_exported_symbol(symbol, node)
 
     def _javascript_method_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
         name_node = _field(node, "name")
@@ -108,32 +163,44 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
         return _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(node), args=_params(self.source, _field(node, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(node, "return_type"))))
 
     def _javascript_variable_function_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
-        value = _field(node, "value")
+        """Extract function bindings, including static CommonJS/property assignments."""
+        assignment = str(getattr(node, "type", "")) == "assignment_expression"
+        value = _field(node, "right" if assignment else "value")
         if value is None or str(getattr(value, "type", "")) not in {"arrow_function", "function", "function_expression"}:
             return None
-        name_node = _field(node, "name")
+        name_node = _field(node, "left" if assignment else "name")
         if name_node is None:
             return None
+        name = _javascript_binding_name(self.source, name_node) if assignment else _node_text(self.source, name_node)
+        if not name:
+            return None
         kind: SymbolKind = "async_function" if _has_direct_child(value, "async") else "function"
-        return _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(value), args=_params(self.source, _field(value, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(value, "return_type"))))
+        symbol = _symbol(self.artifact, kind, _parent(self.module, scope), name, _line(node), _end_line(value), args=_params(self.source, _field(value, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(value, "return_type"))))
+        return self._javascript_exported_symbol(symbol, node.parent)
 
-    def _call(self, node: Any, scope: list[CodeSymbol], *, function_field: str) -> None:
-        target_node = _field(node, function_field)
-        target = _call_target(self.source, target_node)
-        if not target or target.split(".")[0] in {"if", "for", "while", "switch", "catch", "function", "return", "class", "import", "export"}:
-            return
-        caller = _call_owner(scope)
-        self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
-        self.calls.append(
-            CodeCall(
-                id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
-                artifact_id=self.artifact.id,
-                caller=caller,
-                target=target,
-                line=_line(node),
-                column=_column(node),
-            )
-        )
+    @staticmethod
+    def _javascript_exported_symbol(symbol: CodeSymbol, declaration: Any) -> CodeSymbol:
+        """Record the public name from an enclosing export declaration."""
+        parent = declaration.parent if declaration is not None else None
+        if parent is not None and parent.type == "export_statement":
+            symbol.metadata["export_name"] = "default" if _has_direct_child(parent, "default") else symbol.name
+        return symbol
+
+
+def _javascript_binding_name(source: bytes, node: Any) -> str | None:
+    """Resolve a static assignment path without inventing computed receiver identities."""
+    node_type = str(getattr(node, "type", ""))
+    if node_type in {"identifier", "property_identifier", "this"}:
+        return _node_text(source, node)
+    if node_type == "member_expression":
+        receiver = _field(node, "object")
+        property_node = _field(node, "property")
+        if receiver is not None and property_node is not None:
+            owner = _javascript_binding_name(source, receiver)
+            name = _javascript_binding_name(source, property_node)
+            if owner and name:
+                return f"{owner}.{name}"
+    return None
 
 
 def _javascript_class_base(source: bytes, node: Any) -> str | None:

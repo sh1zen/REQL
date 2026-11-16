@@ -15,7 +15,6 @@ from api import (
     MemoryQuery,
     MemorySubgraph,
     ProjectPipeline,
-    ProjectWatchEvent,
     QueryResult,
     QueryContextRequest,
     QueryMode,
@@ -25,6 +24,7 @@ from api import (
     REQLSyntaxError,
     RetrievalBudget,
     SourceRevision,
+    TestAssociation,
     load_config,
 )
 
@@ -44,7 +44,7 @@ __all__ = [
     "QueryMode",
     "RetrievalBudget",
     "SourceRevision",
-    "ProjectWatchEvent",
+    "TestAssociation",
     "BlockGraphStore",
     "QueryResult",
     "REQLError",

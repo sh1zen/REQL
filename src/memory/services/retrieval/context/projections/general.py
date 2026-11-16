@@ -1,11 +1,12 @@
 """General and document context projections."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
+from .....artifacts.context_scope import is_test_context_path
 from .....domain.constants import INACTIVE_STATUSES
 from .....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from .....extraction.normalization import clamp, tokenize
@@ -36,30 +37,32 @@ class GeneralContextProjectionMixin:
         ):
             candidates[node.id] = node
 
-        project_ids = {
-            str(node.properties.get("project_id"))
-            for node in candidates.values()
-            if node.properties.get("project_id") and self._node_query_token_overlap_tokens(node, profile.informative_tokens)
-        }
-        grouped: dict[tuple[str | None, str], list[tuple[MemoryNode, set[str]]]] = {}
+        grouped: dict[tuple[str, str, str], list[tuple[MemoryNode, set[str]]]] = {}
         for node in candidates.values():
             if node.type in TECHNICAL_NODE_TYPES or node.status in INACTIVE_STATUSES:
                 continue
-            node_project_id = node.properties.get("project_id")
-            if project_ids and node_project_id not in project_ids:
+            project_id = node.properties.get("project_id")
+            if not isinstance(project_id, str) or not project_id:
                 continue
             path = self._node_relative_path(node)
-            if not path or self._related_file_role(node, path) not in {"documentation", "implementation"}:
+            if not path:
+                continue
+            role = self._related_file_role(node, path)
+            if role is None:
                 continue
             overlap = self._node_query_token_overlap_tokens(node, profile.informative_tokens)
             if not overlap:
                 continue
-            project_id = str(node_project_id) if node_project_id is not None else None
-            grouped.setdefault((project_id, path), []).append((node, overlap))
+            grouped.setdefault((project_id, path, role), []).append((node, overlap))
 
+        reasons = {
+            "documentation": "matching terms in project documentation",
+            "implementation": "matching terms in project code",
+            "translation_catalog": "matching terms in the project translation catalog",
+        }
+        terms_by_role: dict[tuple[str, str], set[str]] = defaultdict(set)
         rows: list[dict[str, Any]] = []
-        for (project_id, path), matches in grouped.items():
-            role = self._related_file_role(matches[0][0], path)
+        for (project_id, path, role), matches in grouped.items():
             best_node, best_overlap = max(
                 matches,
                 key=lambda item: (
@@ -70,6 +73,7 @@ class GeneralContextProjectionMixin:
                 ),
             )
             line_start, line_end = self._line_span(best_node)
+            terms_by_role[(project_id, role)].update(best_overlap)
             rows.append(
                 {
                     "action": "open" if role == "documentation" else "review",
@@ -80,63 +84,20 @@ class GeneralContextProjectionMixin:
                     "line_end": line_end,
                     "matched_terms": sorted(best_overlap),
                     "node_ids": sorted({node.id for node, _overlap in matches})[:4],
-                    "reason": "FAQ documentation match" if role == "documentation" else "the same query terms appear in application code",
+                    "reason": reasons[role],
                 }
             )
 
-        correlated_terms: dict[str | None, set[str]] = {}
-        for project_id in {row["project_id"] for row in rows}:
-            docs_terms = set().union(
-                *(set(row["matched_terms"]) for row in rows if row["project_id"] == project_id and row["role"] == "documentation")
-            )
-            code_terms = set().union(
-                *(set(row["matched_terms"]) for row in rows if row["project_id"] == project_id and row["role"] == "implementation")
-            )
-            shared = docs_terms & code_terms
-            if shared:
-                correlated_terms[project_id] = shared
-        if not correlated_terms:
-            return []
+        correlated_terms = {
+            project_id: docs_terms & terms_by_role.get((project_id, "implementation"), set())
+            for (project_id, role), docs_terms in terms_by_role.items()
+            if role == "documentation"
+        }
         rows = [
-            row
-            for row in rows
-            if row["project_id"] in correlated_terms and set(row["matched_terms"]) & correlated_terms[row["project_id"]]
+            row for row in rows
+            if correlated_terms.get(row["project_id"], set()).intersection(row["matched_terms"])
         ]
-        for row in rows:
-            if "faq" in correlated_terms[row["project_id"]]:
-                row["reason"] = "FAQ documentation match" if row["role"] == "documentation" else "the same FAQ terms appear in application code"
-
-        translation_rows: list[dict[str, Any]] = []
-        for project_id in sorted(value for value in correlated_terms if value is not None):
-            artifacts = self.store.find_nodes_by_property(
-                "project_id",
-                project_id,
-                type_="SourceArtifact",
-                limit=10000,
-                clone=False,
-            )
-            for artifact in artifacts:
-                if artifact.status in INACTIVE_STATUSES:
-                    continue
-                path = self._node_relative_path(artifact)
-                if not path or self._related_file_role(artifact, path) != "translation_catalog":
-                    continue
-                translation_rows.append(
-                    {
-                        "action": "update",
-                        "role": "translation_catalog",
-                        "project_id": project_id,
-                        "path": path,
-                        "line_start": None,
-                        "line_end": None,
-                        "matched_terms": sorted(correlated_terms[project_id]),
-                        "node_ids": [artifact.id],
-                        "reason": "translation catalog for the same project; synchronize translatable strings after code changes",
-                    }
-                )
-
         role_order = {"documentation": 0, "implementation": 1, "translation_catalog": 2}
-        rows.extend(translation_rows)
         rows.sort(key=lambda row: (role_order.get(str(row["role"]), 9), str(row["path"]).casefold()))
         selected = rows[: min(max_items, 8)]
         for row in selected:
@@ -145,15 +106,13 @@ class GeneralContextProjectionMixin:
 
     @staticmethod
     def _related_file_role(node: MemoryNode, path: str) -> str | None:
-        normalized = path.replace("\\", "/").casefold()
-        suffix = Path(normalized).suffix
-        if suffix in {".pot", ".po"}:
+        """Use the compiled scope for code and documentation roles."""
+        if Path(path).suffix.casefold() in {".pot", ".po"}:
             return "translation_catalog"
         scope = str(node.properties.get("context_scope") or "").casefold()
-        if scope in {"code", "test"} or suffix in {".php", ".py", ".js", ".ts", ".java", ".rb", ".go", ".rs", ".cs"}:
+        if scope in {"code", "test"}:
             return "implementation"
-        name = normalized.rsplit("/", 1)[-1]
-        if scope == "docs" or name.startswith(("readme", "changelog")) or suffix in {".md", ".rst", ".txt"}:
+        if scope == "docs":
             return "documentation"
         return None
 
@@ -234,7 +193,7 @@ class GeneralContextProjectionMixin:
             if node.type == "RawEvent":
                 continue
             path = self._node_relative_path(node) or ""
-            if prefer_general and self._is_test_context_path(path) and self._is_code_context_node(node):
+            if prefer_general and is_test_context_path(path) and self._is_code_context_node(node):
                 deferred_indirect.append(item)
                 continue
             searchable = " ".join(part for part in (node.label, node.text, node.canonical_key) if part)
@@ -538,12 +497,6 @@ class GeneralContextProjectionMixin:
             )
         ) or any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))
 
-    @staticmethod
-    def _is_test_context_path(path: str) -> bool:
-        value = path.replace("\\", "/").lstrip("/")
-        name = value.rsplit("/", 1)[-1]
-        return value.startswith("tests/") or name.startswith("test_") or name.endswith("_test.py")
-
     def _is_generic_context_node(self, node: MemoryNode, local_degree: int) -> bool:
         text = (node.canonical_key or node.label or node.text or "").strip().casefold()
         if node.type in TECHNICAL_NODE_TYPES:
@@ -618,7 +571,7 @@ class GeneralContextProjectionMixin:
             for node in candidates.values():
                 text = self._compact_text(node.text or node.label or node.canonical_key or node.id, max_chars=260)
                 path = self._node_relative_path(node) or ""
-                if query_tokens & set(_expanded_tokens(text)) and not self._is_test_context_path(path):
+                if query_tokens & set(_expanded_tokens(text)) and not is_test_context_path(path):
                     has_non_test_source = True
                     break
         for node in candidates.values():
@@ -626,7 +579,7 @@ class GeneralContextProjectionMixin:
             if query_tokens and not (query_tokens & set(_expanded_tokens(text))):
                 continue
             path = self._node_relative_path(node) or ""
-            if has_non_test_source and self._is_test_context_path(path):
+            if has_non_test_source and is_test_context_path(path):
                 continue
             location = self._location_summary(node)
             dedupe_key = f"{location or ''}|{' '.join(text.casefold().split())}"
@@ -762,7 +715,7 @@ class GeneralContextProjectionMixin:
                 continue
             if hide_raw_event_links and edge.type == "DERIVED_FROM" and (left.type in SOURCE_NODE_TYPES or right.type in SOURCE_NODE_TYPES):
                 continue
-            if hide_test_code_links and (self._is_test_context_path(self._node_relative_path(left) or "") or self._is_test_context_path(self._node_relative_path(right) or "")):
+            if hide_test_code_links and (is_test_context_path(self._node_relative_path(left) or "") or is_test_context_path(self._node_relative_path(right) or "")):
                 continue
             seen.add(edge.id)
             left_label = self._compact_text(self._node_label(left), max_chars=90)
@@ -784,39 +737,19 @@ class GeneralContextProjectionMixin:
         followup_items = list(ranked_items) if ranked_items is not None else subgraph.ranked_nodes
         ids = [item.node.id for item in followup_items[: min(3, max_items)]]
         query = self._reql_string(subgraph.query.text)
-        followups: list[dict[str, str]] = []
-        if ids:
-            followups.append(
-                {
-                    "label": "Inspect top node",
-                    "command": f"reql inspect --node-id {ids[0]} --json",
-                    "purpose": "top node provenance and neighbors",
-                }
-            )
-        non_source_id = next((item.node.id for item in followup_items if item.node.type not in SOURCE_NODE_TYPES), None)
-        if ids and non_source_id and non_source_id != ids[0]:
-            followups.append(
-                {
-                    "label": "Inspect best non-source node",
-                    "command": f"reql inspect --node-id {non_source_id} --json",
-                    "purpose": "best non-source node provenance and neighbors",
-                }
-            )
         retrieve_statement = f"RETRIEVE {query} LIMIT {min(max_items, 8)} RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start"
-        followups.append(
+        followups = [
             {
                 "label": "Retrieve source rows",
                 "command": f"reql query {self._shell_string(retrieve_statement)}",
                 "purpose": "compact source/location rows",
-            }
-        )
-        followups.append(
+            },
             {
                 "label": "Expand graph context",
                 "command": f"reql query_graph --query {query} --max-depth {subgraph.query.max_depth} --json",
                 "purpose": "expanded graph context",
-            }
-        )
+            },
+        ]
         if len(ids) > 1:
             id_list = ", ".join(self._reql_string(node_id) for node_id in ids)
             compare_statement = f"FIND nodes WHERE id IN [{id_list}] RETURN id,type,label,text"

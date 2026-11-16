@@ -1,6 +1,7 @@
 """Deterministic lexical search and ranking primitives."""
 from __future__ import annotations
 
+import re
 from typing import MutableMapping, Sequence
 
 from ...domain.constants import INACTIVE_STATUSES
@@ -15,8 +16,47 @@ from .common import (
 )
 from .context.models import NodeMatchMetrics, QueryProfile
 
+RANKED_SYMBOL_TYPES = {"Function", "Method", "Class", "Interface", "Endpoint", "Schema"}
+_IDENTIFIER = re.compile(r"[^\W\d]\w*(?:\.[^\W\d]\w*)*")
+_FIELD_REFERENCE = re.compile(r"(?<![\w./])([^\W\d]\w*)\.([^\W\d]\w*)(?![\w./])")
+
 
 class RetrievalSearchMixin:
+    @staticmethod
+    def _identifier_terms(text: str) -> set[str]:
+        tokens = _IDENTIFIER.findall(text.casefold())
+        return {part for token in tokens for part in [token, *token.split(".")] if len(part) >= 3}
+
+    @staticmethod
+    def _exact_symbol_match(node: MemoryNode, terms: set[str]) -> bool:
+        return node.type in RANKED_SYMBOL_TYPES and any(
+            isinstance(value, str) and value.casefold() in terms
+            for value in (node.properties.get("name"), node.properties.get("qualified_name"))
+        )
+
+    def _field_owner_seeds(self, query: MemoryQuery, lexical_node_types: Sequence[str] | None,
+                           scopes: set[str]) -> dict[str, float]:
+        """Use literal field appearances in source fragments to find their owners."""
+        fields = tuple(dict.fromkeys(field for _, field in _FIELD_REFERENCE.findall(query.text)))[:3]
+        owners: dict[str, float] = {}
+        for field in fields:
+            expression = re.compile(rf"(?<!\w){re.escape(field)}(?!\w)", re.IGNORECASE)
+            fragments = self.store.lexical_search(field, top_k=12, node_types=("SourceFragment",),
+                                                  include_archived=query.include_archived, clone=False)
+            for fragment, _ in fragments:
+                if not expression.search(fragment.text or ""):
+                    continue
+                for _, owner in self.store.neighbors(fragment.id, direction="in", edge_types={"EVIDENCED_BY"},
+                                                       limit=6, clone=False):
+                    if owner.type not in RANKED_SYMBOL_TYPES or not query.include_archived and owner.status in INACTIVE_STATUSES:
+                        continue
+                    if lexical_node_types is not None and owner.type not in lexical_node_types:
+                        continue
+                    if scopes and not self._node_matches_query_context_scope(owner, scopes):
+                        continue
+                    owners[owner.id] = 0.7
+        return owners
+
     @staticmethod
     def _normalized_query_path(query_text: str) -> str:
         """Normalize a whole-query path without treating free-form prose as a path."""
@@ -58,14 +98,7 @@ class RetrievalSearchMixin:
 
     def _nodes_for_types(self, node_types: Sequence[str]) -> list[MemoryNode]:
         """Load only indexed node types while preserving ``all_nodes`` order."""
-        find_many = getattr(self.store, "find_nodes_by_types", None)
-        if callable(find_many):
-            return find_many(node_types, clone=False)
-        nodes: dict[str, MemoryNode] = {}
-        for node_type in sorted(set(node_types)):
-            for node in self.store.find_nodes(type_=node_type, limit=2**63 - 1, clone=False):
-                nodes.setdefault(node.id, node)
-        return sorted(nodes.values(), key=lambda node: (node.created_at, node.id))
+        return self.store.find_nodes_by_types(node_types, clone=False)
 
     def _scoped_lexical_search(
         self,
@@ -79,27 +112,18 @@ class RetrievalSearchMixin:
     ) -> list[tuple[MemoryNode, float]]:
         allowed_types = set(lexical_node_types) if lexical_node_types is not None else None
         candidate_limit = max(top_k * (8 if scopes & {"docs", "test"} else 4), 160)
-        try:
-            indexed = self.store.lexical_search(
-                query.text,
-                top_k=candidate_limit,
-                node_types=allowed_types,
-                include_archived=query.include_archived,
-                clone=False,
-            )
-        except TypeError:
-            # Preserve compatibility with external GraphStore adapters that
-            # implement the pre-clone keyword signature.
-            indexed = self.store.lexical_search(
-                query.text,
-                top_k=candidate_limit,
-                node_types=allowed_types,
-                include_archived=query.include_archived,
-            )
+        indexed = self.store.lexical_search(
+            query.text,
+            top_k=candidate_limit,
+            node_types=allowed_types,
+            include_archived=query.include_archived,
+            clone=False,
+        )
         candidates = [node for node, _score in indexed]
         if not candidates:
             candidates = self._nodes_for_types(allowed_types) if allowed_types is not None else self.store.all_nodes()
         matches: list[tuple[MemoryNode, float]] = []
+        terms = self._identifier_terms(query.text)
         for node in candidates:
             if allowed_types is not None and node.type not in allowed_types:
                 continue
@@ -108,6 +132,10 @@ class RetrievalSearchMixin:
             if not query.include_archived and node.status in INACTIVE_STATUSES:
                 continue
             if not self._node_matches_query_context_scope(node, scopes):
+                continue
+            exact = bool(terms and self._exact_symbol_match(node, terms))
+            if exact:
+                matches.append((node, 1.0))
                 continue
             raw_overlap = _raw_query_token_overlap(self._node_search_parts(node), query_profile.informative_tokens)
             if (

@@ -204,7 +204,7 @@ def _directory_has_agent_profile_signal(path: Path) -> bool:
 
 
 def _is_reql_owned_path(path: Path) -> bool:
-    if path.name in {"reql-agent", "reql-context-compact"}:
+    if path.name == "reql-agent":
         return True
     if path.is_file():
         return _is_reql_owned_file(path)
@@ -375,20 +375,16 @@ def _planned_files(
 
     if platform_name == "cursor":
         base = project_dir / ".cursor" / "rules" if project else home / ".cursor" / "rules"
-        skill_base = project_dir / ".cursor" if project else home / ".cursor"
         return [
             ("rule", base / "reql.mdc", _cursor_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-            _compact_skill_file(skill_base, platform_name),
         ]
 
     if platform_name == "copilot":
         target = project_dir / ".github" / "copilot-instructions.md" if project else home / ".github" / "copilot-instructions.md"
         vscode_target = project_dir / ".github" / "instructions" / "reql.instructions.md" if project else home / ".github" / "instructions" / "reql.instructions.md"
-        skill_base = project_dir / ".github" if project else home / ".copilot"
         return [
             ("instructions", target, instructions),
             ("rule", vscode_target, _vscode_copilot_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-            _compact_skill_file(skill_base, platform_name),
         ]
 
     if platform_name == "opencode":
@@ -731,24 +727,25 @@ def _remove_section(existing: str) -> str:
 
 
 def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool, home_dir: Path | None = None) -> tuple[Path, str] | None:
-    plan = _hook_plan(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
-    if plan is None:
+    """Install a managed reminder for session startup."""
+    path = _hook_settings_path(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
+    if path is None:
         return None
-    path, event, hook = plan
     settings = _read_json_object(path)
-    hooks = settings.setdefault("hooks", {})
+    _remove_managed_hooks(settings)
+    hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
-        hooks = {}
-        settings["hooks"] = hooks
-    existing = hooks.get(event, [])
-    if not isinstance(existing, list):
-        existing = []
-    filtered = [item for item in existing if not _is_reql_hook(item)]
-    desired = [*filtered, hook]
-    hooks[event] = desired
-    if path.exists() and _read_json_object(path) == settings:
-        return path, "unchanged"
+        hooks = settings["hooks"] = {}
+    startup = hooks.get("SessionStart")
+    if not isinstance(startup, list):
+        startup = hooks["SessionStart"] = []
+    startup.append({
+        "matcher": "startup",
+        "hooks": [{"type": "command", "command": _python_hook_command(platform_name)}],
+    })
     existed = path.exists()
+    if existed and _read_json_object(path) == settings:
+        return path, "unchanged"
     if dry_run:
         return path, "would-update" if existed else "would-create"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -757,28 +754,15 @@ def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_r
 
 
 def _uninstall_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool, home_dir: Path | None = None) -> tuple[Path, str] | None:
-    plan = _hook_plan(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
-    if plan is None:
+    """Remove REQL's startup reminder while keeping user configuration."""
+    path = _hook_settings_path(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
+    if path is None:
         return None
-    path, event, _hook = plan
     if not path.exists():
         return path, "missing"
     settings = _read_json_object(path)
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
+    if not _remove_managed_hooks(settings):
         return path, "unchanged"
-    existing = hooks.get(event, [])
-    if not isinstance(existing, list):
-        return path, "unchanged"
-    filtered = [item for item in existing if not _is_reql_hook(item)]
-    if len(filtered) == len(existing):
-        return path, "unchanged"
-    if filtered:
-        hooks[event] = filtered
-    else:
-        hooks.pop(event, None)
-    if not hooks:
-        settings.pop("hooks", None)
     if dry_run:
         return path, "would-update" if settings else "would-remove"
     if settings:
@@ -789,67 +773,62 @@ def _uninstall_hook(platform_name: str, *, project: bool, project_dir: Path, dry
     return path, "removed"
 
 
-def _hook_plan(platform_name: str, *, project: bool, project_dir: Path, home_dir: Path | None = None) -> tuple[Path, str, dict[str, object]] | None:
+def _remove_managed_hooks(settings: dict[str, object]) -> bool:
+    """Remove owned startup commands, preserving other commands in each group."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    groups = hooks.get("SessionStart")
+    if not isinstance(groups, list):
+        return False
+    remaining = []
+    for group in groups:
+        commands = group.get("hooks") if isinstance(group, dict) else None
+        if isinstance(commands, list):
+            kept = [command for command in commands if not _is_reql_hook(command)]
+            if len(kept) != len(commands):
+                if kept:
+                    remaining.append({**group, "hooks": kept})
+                continue
+        remaining.append(group)
+    if remaining == groups:
+        return False
+    if remaining:
+        hooks["SessionStart"] = remaining
+    else:
+        del hooks["SessionStart"]
+        if not hooks:
+            del settings["hooks"]
+    return True
+
+
+def _hook_settings_path(platform_name: str, *, project: bool, project_dir: Path, home_dir: Path | None = None) -> Path | None:
+    """Resolve the settings file for clients that support REQL startup hooks."""
     home = (home_dir or Path.home()).expanduser()
     if platform_name == "claude":
         base = project_dir / ".claude" if project else _env_path("CLAUDE_CONFIG_DIR", home / ".claude")
-        return base / "settings.json", "PreToolUse", _claude_hook()
+        return base / "settings.json"
     if platform_name == "gemini":
         base = project_dir / ".gemini" if project else _gemini_user_dir(home)
-        return base / "settings.json", "BeforeTool", _gemini_hook()
+        return base / "settings.json"
     return None
 
 
-def _claude_hook() -> dict[str, object]:
-    return {
-        "matcher": "Read|Grep|Glob|Bash",
-        "hooks": [
-            {
-                "type": "command",
-                "command": _python_hook_command("claude"),
-            }
-        ],
-    }
-
-
-def _gemini_hook() -> dict[str, object]:
-    return {
-        "matcher": "read_file|list_directory|run_shell_command",
-        "hooks": [
-            {
-                "type": "command",
-                "command": _python_hook_command("gemini"),
-            }
-        ],
-    }
-
-
 def _python_hook_command(platform_name: str) -> str:
-    message = (
-        f"{HOOK_ID}: REQL graph context may be available. "
-        "For repository context, run `reql project status`, then build a query from the user request's own feature, "
-        "behavior, file, command, error, field, endpoint, API, or symbol terms; preserve the user's language, "
-        "identifiers, and exact errors. Use commands such as "
-        "`reql query_memories --query \"<terms from user request>\"`, "
-        "`reql query_context --query \"<terms from user request>\"`, or "
-        "`reql query_explore --query \"<terms from user request>\"` for repository context; do not duplicate that context with broad "
-        "`rg`, recursive directory listings, or custom scanners. If status reports "
-        "`Project not found`, immediately run `reql project compile` before broad raw file exploration. "
-        "For resumed or substantial work, read `reql project overview`; query_context includes relevant shared engineering work. "
-        "Record durable outcomes/decisions with `reql agent record`, reconcile by id/revision, and finish the session for a checkpoint. "
-        "Start watch mode only when continuous monitoring was requested. "
-        "If no watch process is running, run `reql project compile` once after modifying project files before finishing."
-    )
-    if platform_name == "gemini":
-        payload = {"decision": "allow", "additionalContext": message}
-    else:
-        payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": message}}
-    encoded = json.dumps(payload, separators=(",", ":"))
-    return (
-        "python -c \"import json,pathlib,sys;"
+    """Emit one short reminder when a supported client starts in a REQL project."""
+    context = {"additionalContext": "Use REQL for repository discovery. Reuse verified excerpts and supplied checks."}
+    if platform_name == "claude":
+        context["hookEventName"] = "SessionStart"
+    encoded = json.dumps({"hookSpecificOutput": context}, separators=(",", ":"))
+    script = (
+        "import pathlib,sys;"
         "e=pathlib.Path('.reql/memory.reql').exists() or pathlib.Path('reql.conf').exists();"
-        f"sys.stdout.write({encoded!r} if e else '')\""
+        f"sys.stdout.write({encoded!r} if e else ''); # {HOOK_ID}"
     )
+    args = [sys.executable or "python", "-c", script]
+    if host_platform.system() == "Windows":
+        return subprocess.list2cmdline(args)
+    return " ".join(shlex.quote(arg) for arg in args)
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
@@ -904,28 +883,17 @@ def _skill_files(
             fallback_command=fallback_command,
         )
     ]
-    resources = getattr(_skill_generator(), "skill_resources", None)
-    if resources is not None:
-        files.extend(
-            ("skill-resource", base / "skills" / skill_dir / relative_path, content)
-            for skill_dir, relative_path, content in resources(
-                platform_name=platform_name,
-                project=project,
-                command_name=command_name,
-                command_path=command_path,
-                fallback_command=fallback_command,
-            )
+    files.extend(
+        ("skill-resource", base / "skills" / skill_dir / relative_path, content)
+        for skill_dir, relative_path, content in _skill_generator().skill_resources(
+            platform_name=platform_name,
+            project=project,
+            command_name=command_name,
+            command_path=command_path,
+            fallback_command=fallback_command,
         )
-    return files
-
-
-def _compact_skill_file(base: Path, platform_name: str) -> tuple[str, Path, str]:
-    """Install the manual compact skill on platforms without the REQL agent skill."""
-    return (
-        "skill",
-        base / "skills" / "reql-context-compact" / "SKILL.md",
-        _skill_generator().context_compact_skill(platform_name),
     )
+    return files
 
 
 def _skill_generator() -> ModuleType:

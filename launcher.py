@@ -138,51 +138,6 @@ class Launcher:
                 print(text)
         return 0
 
-    def _watch(self, tail: str) -> int:
-        options, path = _parse_options(
-            tail,
-            [
-                OptionSpec("--interval", "interval", default=2.0, cast=float),
-                OptionSpec("--watch-interval", "interval", default=2.0, cast=float),
-                OptionSpec("--debounce", "debounce", default=0.25, cast=float),
-                OptionSpec("--watch-debounce", "debounce", default=0.25, cast=float),
-                OptionSpec("--iterations", "iterations", default=None, cast=int),
-                OptionSpec("--watch-iterations", "iterations", default=None, cast=int),
-            ],
-        )
-        path = path.strip() or "."
-        print(f"Watching {Path(path).expanduser().resolve(strict=False)}")
-        exit_code = 0
-        try:
-            for event in self.graph.watch_project(
-                path,
-                user_id=self.user_id,
-                interval_seconds=options["interval"],
-                debounce_seconds=options["debounce"],
-                max_iterations=options["iterations"],
-            ):
-                print(
-                    f"Watch poll {event.iteration}: "
-                    f"dirty={event.dirty_artifacts} deleted={event.deleted_artifacts} total={event.total_artifacts}"
-                )
-                if event.result is None:
-                    print("No changes detected")
-                    continue
-                run = event.result.run
-                print(f"Run: {run.id}")
-                print(f"Status: {run.status}")
-                print(f"Changed: {run.files_changed}")
-                print(f"Deleted: {run.files_deleted}")
-                print(f"Delta: {event.result.delta.id}")
-                if event.errors:
-                    exit_code = 1
-                    for error in event.errors:
-                        print(f"Error: {error}", file=sys.stderr)
-        except KeyboardInterrupt:
-            print("Watch stopped")
-            return 130
-        return exit_code
-
 
 class GuidedMenu:
     def __init__(self, launcher: Launcher) -> None:
@@ -444,18 +399,12 @@ class GuidedMenu:
             "3": ("Cache status", self.cache_status),
             "4": ("List deltas", self.delta_list),
             "5": ("Project report", self.project_report),
-            "6": ("Watch project", self.project_watch),
         }
         return self._submenu("Project and code", actions)
 
     def project_compile(self) -> int:
         path = _prompt("Project path", ".")
         return self._compile_project_path(path)
-
-    def project_watch(self) -> int:
-        path = _prompt("Project path", ".")
-        interval = _prompt_int("Interval seconds", 2)
-        return self.launcher._watch(f"{shlex.quote(path)} --interval {interval}")
 
     def _compile_project_path(self, path: str) -> int:
         result = self.launcher.graph.compile_project(path, user_id=self.launcher.user_id)

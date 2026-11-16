@@ -71,11 +71,7 @@ TEXT_LANGUAGES = {
     ".sql": "SQL",
 }
 
-DOCUMENT_STEMS = {"readme", "changelog", "changes", "faq", "frequently-asked-questions"}
-WORDPRESS_TITLE_RE = re.compile(r"^===\s*\S.*?\s*===$")
-WORDPRESS_SECTION_RE = re.compile(r"^==\s*\S.*?\s*==$")
 MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
-MARKDOWN_LIST_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 MARKDOWN_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
 MARKDOWN_SETEXT_RE = re.compile(r"^\s*(?:=+|-+)\s*$")
 
@@ -98,9 +94,9 @@ def is_binary_sample(sample: bytes) -> bool:
 
 
 def classify_path(path: str | Path, sample: bytes) -> Classification:
-    suffix = Path(path).suffix.casefold()
-    lower_name = Path(path).name.casefold()
-    stem = Path(path).stem.casefold()
+    target = Path(path)
+    suffix = target.suffix.casefold()
+    lower_name = target.name.casefold()
 
     if sample.startswith(b"%PDF-"):
         return Classification("pdf", "PDF", True)
@@ -117,11 +113,7 @@ def classify_path(path: str | Path, sample: bytes) -> Classification:
         return Classification("code", code_language, False)
     if suffix in {".md", ".markdown"}:
         return Classification("markdown", "Markdown", False)
-    if suffix in {"", ".txt"} and stem in DOCUMENT_STEMS:
-        return Classification("markdown", "Markdown", False)
-    if _looks_like_wordpress_readme(sample):
-        return Classification("markdown", "Markdown", False)
-    if not suffix and _looks_like_structured_markdown(sample):
+    if suffix in {"", ".txt"} and _looks_like_structured_markdown(sample):
         return Classification("markdown", "Markdown", False)
     if suffix in CONFIG_EXTENSIONS:
         return Classification("config", CONFIG_LANGUAGES.get(suffix), False)
@@ -152,34 +144,15 @@ def classify_path(path: str | Path, sample: bytes) -> Classification:
     return Classification("unknown", None, False)
 
 
-def _sample_lines(sample: bytes) -> list[str]:
-    return sample.decode("utf-8", errors="ignore").splitlines()[:120]
-
-
-def _looks_like_wordpress_readme(sample: bytes) -> bool:
-    lines = [line.strip() for line in _sample_lines(sample) if line.strip()]
-    has_title = any(WORDPRESS_TITLE_RE.match(line) for line in lines)
-    has_section = any(WORDPRESS_SECTION_RE.match(line) for line in lines)
-    header_names = {"contributors", "tags", "requires at least", "tested up to", "stable tag", "license"}
-    header_count = sum(1 for line in lines if line.partition(":")[0].strip().casefold() in header_names and ":" in line)
-    return has_title and (has_section or header_count >= 2)
-
-
 def _looks_like_structured_markdown(sample: bytes) -> bool:
-    lines = _sample_lines(sample)
-    signals = 0
-    if any(MARKDOWN_HEADING_RE.match(line) for line in lines):
-        signals += 2
-    if any(MARKDOWN_FENCE_RE.match(line) for line in lines):
-        signals += 2
-    if any(
-        index > 0 and lines[index - 1].strip() and MARKDOWN_SETEXT_RE.match(line)
+    """Recognize Markdown markup in a bounded sample, irrespective of document names."""
+    lines = sample.decode("utf-8", errors="ignore").splitlines()[:120]
+    return any(
+        MARKDOWN_HEADING_RE.match(line)
+        or MARKDOWN_FENCE_RE.match(line)
+        or (index > 0 and lines[index - 1].strip() and MARKDOWN_SETEXT_RE.match(line))
         for index, line in enumerate(lines)
-    ):
-        signals += 2
-    if sum(1 for line in lines if MARKDOWN_LIST_RE.match(line)) >= 2:
-        signals += 1
-    return signals >= 2
+    )
 
 
 def is_unsupported_media_file(path: str | Path, sample: bytes) -> bool:

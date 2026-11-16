@@ -35,7 +35,6 @@ from ..artifacts.fingerprint import (
 from ..artifacts.models import ArtifactCompilationResult, ScanResult, SourceArtifact
 from ..artifacts.options import (
     CompilationOptions,
-    RawCompilationOptions,
     normalize_compilation_options,
 )
 from ..artifacts.project import ProjectRegistry
@@ -49,6 +48,7 @@ from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
 from ..storage.retention import RetentionCleanupResult, prune_project_data
+from ..testing.static_links import refresh_static_links
 
 ORPHAN_DIRECTORY_MIN_FILES = 2
 ORPHAN_DIRECTORY_FINDING_TYPE = "possibly_orphan_directory"
@@ -114,9 +114,9 @@ class IncrementalCompilationService:
         store: GraphStore,
         *,
         compiler: ArtifactCompiler | None = None,
-        parser_version: str = DEFAULT_PARSER_VERSION,
-        chunking_version: str = DEFAULT_CHUNKING_VERSION,
-        compile_options: RawCompilationOptions = None,
+        parser_version: str | None = None,
+        chunking_version: str | None = None,
+        compile_options: CompilationOptions | None = None,
         retention_commits: int = 20,
         profile_logger: PerformanceLogger | None = None,
     ) -> None:
@@ -124,14 +124,22 @@ class IncrementalCompilationService:
         self.profile_logger = profile_logger
         self.retention_commits = retention_commits
         self.project_registry = ProjectRegistry(store)
-        self.default_options = normalize_compilation_options(compile_options)
-        self.compiler = compiler or ArtifactCompiler(options=self.default_options)
-        self.cache = ArtifactCache(
-            store,
-            parser_version=parser_version,
-            chunking_version=chunking_version,
-            compile_options=self.default_options.cache_payload(),
+        self.default_options = normalize_compilation_options(
+            compiler.options if compiler is not None and compile_options is None else compile_options
         )
+        if compiler is not None:
+            if (compiler.options != self.default_options
+                    or (parser_version is not None and parser_version != compiler.parser_version)
+                    or (chunking_version is not None and chunking_version != compiler.chunking_version)):
+                raise ValueError("Injected compiler and incremental service must share compilation options and versions")
+            self.compiler = compiler
+        else:
+            self.compiler = ArtifactCompiler(
+                options=self.default_options,
+                parser_version=DEFAULT_PARSER_VERSION if parser_version is None else parser_version,
+                chunking_version=DEFAULT_CHUNKING_VERSION if chunking_version is None else chunking_version,
+            )
+        self.cache = self._cache_for_options(self.default_options)
         self.deltas = DeltaRepository(store)
         self.revisions = RevisionRepository(store)
 
@@ -145,7 +153,7 @@ class IncrementalCompilationService:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         profile = self.profile_logger
         compile_start = profile.span("compile.total", path=Path(path).expanduser().resolve(strict=False)) if profile else nullcontext()
@@ -179,13 +187,13 @@ class IncrementalCompilationService:
         exclude_patterns: list[str] | None,
         config_path: str | Path | None,
         cache_enabled: bool,
-        parsing_options: RawCompilationOptions,
+        parsing_options: CompilationOptions | None,
     ) -> CompileProjectResult:
         profile = self.profile_logger
         root = Path(path).expanduser().resolve(strict=False)
         options = self.default_options if parsing_options is None else normalize_compilation_options(parsing_options)
-        cache = self._cache_for_options(options, project_root=root)
         compiler = self._compiler_for_options(options)
+        cache = self._cache_for_options(options, project_root=root, compiler=compiler)
         cache_entries = cache.project_entry_map(project_id(normalize_path(root)), active_only=True) if cache_enabled else {}
         scanner = ProjectScanner(
             max_file_size_bytes=max_file_size_bytes,
@@ -193,12 +201,15 @@ class IncrementalCompilationService:
             exclude_patterns=exclude_patterns,
             config_path=config_path,
             use_default_ignores=not options.ignore_defaults,
-            use_gitignore=options.use_gitignore,
         )
         with (profile.span("compile.scan", path=Path(path).expanduser().resolve(strict=False)) if profile else nullcontext()):
             scan = scanner.scan(root)
         if profile:
             profile.event("compile.scan.result", category="counter", artifacts=len(scan.artifacts), skipped=len(scan.skipped_files), errors=len(scan.errors))
+        if scan.errors:
+            # An incomplete scan cannot prove deletions or a complete revision.
+            details = "; ".join(f"{error.relative_path or error.path}: {error.message}" for error in scan.errors)
+            raise StorageError(f"Project scan failed; the previous graph and cache were preserved. {details}")
         with (profile.span("compile.plan", artifacts=len(scan.artifacts), cache_enabled=cache_enabled) if profile else nullcontext()):
             if cache_enabled:
                 dirty = cache.dirty_set(scan, entries=cache_entries)
@@ -209,8 +220,7 @@ class IncrementalCompilationService:
                 )
             recovered_artifact_ids = cache.recoverable_artifact_ids(scan, dirty.changed_artifact_ids, entries=cache_entries) if cache_enabled else set()
             dirty.changed_artifact_ids.difference_update(recovered_artifact_ids)
-            if cache_enabled:
-                dirty.deleted_artifact_ids.update(cache.deleted_project_artifact_ids(scan))
+            dirty.deleted_artifact_ids.update(cache.deleted_project_artifact_ids(scan))
         run = self.deltas.new_run(project_id=scan.project.id)
         run.files_seen = len(scan.artifacts)
         run.files_changed = len(dirty.changed_artifact_ids)
@@ -358,11 +368,7 @@ class IncrementalCompilationService:
                     errors=len(result.errors),
                 )
 
-        if dirty.changed_artifact_ids and not run.errors:
-            with (profile.span("compile.refresh_structural_links", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
-                aggregate.merge(refresh_project_structural_links(self.store, scan.project.id, profile_logger=profile))
-
-        if dirty.changed_artifact_ids and self._document_ingest_enabled(compiler):
+        if dirty.changed_artifact_ids and compiler.options.ingest_documents:
             link_artifact_ids = self._document_code_link_scope(dirty.changed_artifact_ids, artifacts_by_id, compiler)
             with (profile.span("compile.link_documents_to_code", changed=len(dirty.changed_artifact_ids), scoped=link_artifact_ids is not None) if profile else nullcontext()):
                 link_result = link_document_fragments_to_code(
@@ -381,10 +387,6 @@ class IncrementalCompilationService:
                     archived_edges=len(link_result.archived_edges),
                 )
 
-        if dirty.changed_artifact_ids and not run.errors:
-            with (profile.span("compile.refresh_unused_symbol_findings", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
-                aggregate.merge(self._refresh_unused_symbol_findings(scan))
-
         for artifact_id in sorted(dirty.deleted_artifact_ids):
             node = self.store.get_node(artifact_id, clone=False)
             if node is None:
@@ -397,7 +399,7 @@ class IncrementalCompilationService:
             aggregate.archived_nodes.add(artifact_id)
             aggregate.affected_node_ids.add(artifact_id)
             cache_entry = cache.get_entry(scan.project.id, artifact_id)
-            if cache_enabled and cache_entry is not None:
+            if cache_entry is not None:
                 cache.archive_entry(cache_entry.id)
 
         if dirty.changed_artifact_ids or dirty.deleted_artifact_ids:
@@ -405,6 +407,11 @@ class IncrementalCompilationService:
                 aggregate.merge(refresh_project_css_surface_findings(self.store, scan.project.id))
 
         if not run.errors and (dirty.changed_artifact_ids or dirty.deleted_artifact_ids):
+            with (profile.span("compile.refresh_structural_links", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
+                aggregate.merge(refresh_project_structural_links(self.store, scan.project.id, profile_logger=profile))
+                aggregate.merge(refresh_static_links(self.store, scan.project.id))
+            with (profile.span("compile.refresh_unused_symbol_findings", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
+                aggregate.merge(self._refresh_unused_symbol_findings(scan))
             with (profile.span("compile.orphan_directories", artifacts=len(scan.artifacts)) if profile else nullcontext()):
                 aggregate.merge(self._refresh_orphan_directory_findings(scan))
 
@@ -735,10 +742,6 @@ class IncrementalCompilationService:
             if artifact.artifact_type in {"markdown", "text", "config", "data", "unknown"} and compiler.document_ingest_enabled(artifact)
         }
 
-    @staticmethod
-    def _document_ingest_enabled(compiler: ArtifactCompiler) -> bool:
-        return bool(getattr(compiler, "ingest_documents", True))
-
     def cache_status(
         self,
         path: str | Path,
@@ -749,20 +752,24 @@ class IncrementalCompilationService:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> dict[str, object]:
         root = Path(path).expanduser().resolve(strict=False)
         options = self.default_options if parsing_options is None else normalize_compilation_options(parsing_options)
-        cache = self._cache_for_options(options, project_root=root)
         scanner = ProjectScanner(
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             config_path=config_path,
             use_default_ignores=not options.ignore_defaults,
-            use_gitignore=options.use_gitignore,
         )
         scan = scanner.scan(root)
+        return self.cache_status_for_scan(scan, cache_enabled=cache_enabled, options=options)
+
+    def cache_status_for_scan(
+        self, scan: ScanResult, *, cache_enabled: bool, options: CompilationOptions | None = None,
+    ) -> dict[str, object]:
+        """Read cache diagnostics from a scan already performed by the caller."""
         if not cache_enabled:
             return {
                 "cache_enabled": False,
@@ -775,6 +782,9 @@ class IncrementalCompilationService:
                 "dirty": [artifact.id for artifact in scan.artifacts],
                 "deleted": [],
             }
+        cache = self._cache_for_options(
+            self.default_options if options is None else options, project_root=scan.project.root_path,
+        )
         return cache.status_for_scan(scan)
 
     def clear_cache(self, path: str | Path) -> dict[str, object]:
@@ -796,14 +806,16 @@ class IncrementalCompilationService:
 
         return new_id("delta")
 
-    def _cache_for_options(self, options: CompilationOptions, *, project_root: str | Path | None = None) -> ArtifactCache:
+    def _cache_for_options(
+        self, options: CompilationOptions, *, project_root: str | Path | None = None,
+        compiler: ArtifactCompiler | None = None,
+    ) -> ArtifactCache:
+        compiler = self._compiler_for_options(options) if compiler is None else compiler
         cache_path = artifact_cache_path(project_root) if project_root is not None else None
         return ArtifactCache(
             self.store,
             cache_path=cache_path,
-            parser_version=DEFAULT_PARSER_VERSION,
-            chunking_version=DEFAULT_CHUNKING_VERSION,
-            compile_options=options.cache_payload(),
+            identity=compiler.identity,
         )
 
     def _compiler_for_options(
@@ -812,7 +824,11 @@ class IncrementalCompilationService:
     ) -> ArtifactCompiler:
         if options == self.default_options:
             return self.compiler
-        return ArtifactCompiler(options=options)
+        return ArtifactCompiler(
+            options=options,
+            parser_version=self.compiler.parser_version,
+            chunking_version=self.compiler.chunking_version,
+        )
 
 
 def _candidate_orphan_directory_groups(artifacts: list[SourceArtifact]) -> list[tuple[str, list[SourceArtifact]]]:

@@ -29,7 +29,7 @@ from ..base import (
     _text,
     stable_id,
 )
-from ..models import CodeCall, CodeSymbol, SymbolKind
+from ..models import CodeSymbol, SymbolKind
 
 
 class PythonTreeSitterExtractor(TreeSitterExtractorBase):
@@ -66,13 +66,16 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
                 self._walk_python_body(node, [*scope, symbol])
             return
         if node_type in {"import_statement", "import_from_statement"}:
+            start = len(self.imports)
             self._python_import(node)
+            for item in self.imports[start:]:
+                item.metadata["binding_scope"] = _parent(self.module, scope)
             return
         if node_type in {"assignment", "augmented_assignment"}:
             self._python_assignment(node, scope)
             return
         if node_type == "call":
-            self._call(node, scope, function_field="function")
+            self._record_call(node, scope, function_field="function")
             self._python_call_argument_references(node, scope)
         if node_type in {"if_statement", "elif_clause", "while_statement"}:
             self._python_condition_references(node, scope)
@@ -254,24 +257,6 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
         owner = _call_owner(scope) or _parent(self.module, scope)
         for name, ref_node in _read_reference_names(self.source, iterable):
             self.references.append(_reference(self.artifact, owner, name, _line(ref_node), _column(ref_node), "read"))
-
-    def _call(self, node: Any, scope: list[CodeSymbol], *, function_field: str) -> None:
-        target_node = _field(node, function_field)
-        target = _call_target(self.source, target_node)
-        if not target or target.split(".")[0] in {"if", "for", "while", "switch", "catch", "function", "return", "class", "import", "export"}:
-            return
-        caller = _call_owner(scope)
-        self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
-        self.calls.append(
-            CodeCall(
-                id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
-                artifact_id=self.artifact.id,
-                caller=caller,
-                target=target,
-                line=_line(node),
-                column=_column(node),
-            )
-        )
 
 
 def _is_docstring_statement(node: Any) -> bool:

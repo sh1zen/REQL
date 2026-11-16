@@ -7,10 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
+from stat import S_ISREG
 from typing import Iterable
 
 from ..config import (
     PROJECT_CONFIG_FILENAME,
+    ScanConfig,
     ScanExcludeRule,
     default_config,
     load_project_config_data,
@@ -19,20 +21,19 @@ from ..config import (
 )
 from ..domain.timeutils import utcnow_iso
 from .fingerprint import (
-    DEFAULT_CHUNKING_VERSION,
-    DEFAULT_PARSER_VERSION,
     artifact_id,
     normalize_path,
     project_id,
     relative_path,
 )
-from .ignore import build_ignore_matcher
 from .mime import classify_path, is_unsupported_media_file
 from .models import Project, ScanError, ScanResult, ScanSkippedFile, SourceArtifact
 
-DEFAULT_MAX_FILE_SIZE_BYTES = default_config().scan.max_file_size_bytes
+_DEFAULT_SCAN_CONFIG = default_config().scan
+DEFAULT_MAX_FILE_SIZE_BYTES = _DEFAULT_SCAN_CONFIG.max_file_size_bytes
+_DEFAULT_EXCLUDE_RULES = tuple(resolve_scan_exclude_pattern(pattern) for pattern in _DEFAULT_SCAN_CONFIG.exclude)
 SAMPLE_BYTES = 8192
-SMALL_SCAN_MAX_FILES = 512
+SMALL_SCAN_MAX_FILES = 64
 SMALL_SCAN_WORKERS = 2
 MAX_SCAN_WORKERS = 8
 
@@ -57,25 +58,28 @@ class ProjectScanner:
         self,
         *,
         max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
-        parser_version: str = DEFAULT_PARSER_VERSION,
-        chunking_version: str = DEFAULT_CHUNKING_VERSION,
-        options: dict[str, object] | None = None,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         use_default_ignores: bool = True,
-        use_gitignore: bool = False,
+        ignored_paths: tuple[Path, ...] = (),
     ) -> None:
         self.max_file_size_bytes = max_file_size_bytes
-        self.parser_version = parser_version
-        self.chunking_version = chunking_version
-        self.options = options or {}
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
         self.exclude_rules = tuple(resolve_scan_exclude_pattern(pattern) for pattern in self.exclude_patterns)
         self.config_path = Path(config_path).expanduser().resolve(strict=False) if config_path else None
         self.use_default_ignores = use_default_ignores
-        self.use_gitignore = use_gitignore
+        self.ignored_paths = frozenset(path.resolve() for path in ignored_paths)
+
+    @classmethod
+    def from_config(cls, config: ScanConfig, *, config_path: Path | None,
+                    ignored_paths: tuple[Path, ...] = ()) -> ProjectScanner:
+        """Apply the effective project policy at filesystem entry points."""
+        return cls(max_file_size_bytes=config.max_file_size_bytes,
+                   include_patterns=config.include, exclude_patterns=config.exclude,
+                   config_path=config_path, use_default_ignores=not config.ignore_defaults,
+                   ignored_paths=ignored_paths)
 
     def scan(
         self,
@@ -83,11 +87,7 @@ class ProjectScanner:
         *,
         name: str | None = None,
     ) -> ScanResult:
-        root = Path(root_path).expanduser().resolve(strict=False)
-        if not root.exists():
-            raise FileNotFoundError(f"Project path does not exist: {root}")
-        if not root.is_dir():
-            raise NotADirectoryError(f"Project path is not a directory: {root}")
+        root = _scan_root(root_path)
 
         now = utcnow_iso()
         normalized_root = _normalized_scan_path(root)
@@ -99,64 +99,10 @@ class ProjectScanner:
             created_at=now,
             updated_at=now,
         )
-        matcher = build_ignore_matcher(
-            root,
-            use_default_ignores=self.use_default_ignores,
-            use_gitignore=self.use_gitignore,
-        )
-        artifacts: list[SourceArtifact] = []
         skipped: list[ScanSkippedFile] = []
         errors: list[ScanError] = []
-        candidates: list[Path] = []
-
-        selected_config = self.config_path
-        base_scope_root = selected_config.parent if selected_config is not None else root
-        if not root.is_relative_to(base_scope_root) and not base_scope_root.is_relative_to(root):
-            base_scope_root = root
-        base_scopes = (_ExcludeScope(base_scope_root, self.exclude_rules),) if self.exclude_rules else ()
-
-        stack = [(root, base_scopes)]
-        while stack:
-            current, inherited_scopes = stack.pop()
-            scopes = self._scopes_for_directory(
-                root,
-                current,
-                inherited_scopes,
-                selected_config=selected_config,
-            )
-            try:
-                entries = sorted(os.scandir(current), key=lambda item: item.name.casefold())
-            except OSError as exc:
-                rel = _safe_relative(root, current)
-                errors.append(ScanError(_normalized_scan_path(current), rel, str(exc)))
-                continue
-
-            for entry in entries:
-                path = Path(entry.path)
-                rel = _safe_relative(root, path)
-                try:
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                    is_file = entry.is_file(follow_symlinks=False)
-                except OSError as exc:
-                    errors.append(ScanError(_normalized_scan_path(path), rel, str(exc)))
-                    continue
-
-                if matcher.is_ignored(rel, is_dir=is_dir):
-                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "ignored"))
-                    continue
-                if _matches_exclude_scopes(path, scopes):
-                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "excluded"))
-                    continue
-                if is_dir:
-                    stack.append((path, scopes))
-                    continue
-                if not is_file:
-                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "not_regular_file"))
-                    continue
-                if self.include_patterns and not _matches_include(rel, self.include_patterns):
-                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "not_included"))
-                    continue
-                candidates.append(path)
+        candidates = self._candidate_paths(root, skipped, errors)
+        artifacts: list[SourceArtifact] = []
 
         # Hashing dominates scans of large projects. A small bounded pool avoids
         # paying for dozens of short-lived threads on the common small-file
@@ -175,6 +121,64 @@ class ProjectScanner:
             counts[artifact.artifact_type] = counts.get(artifact.artifact_type, 0) + 1
         artifacts.sort(key=lambda item: item.relative_path)
         return ScanResult(project=project, artifacts=artifacts, skipped_files=skipped, errors=errors, counts_by_type=counts)
+
+    def input_paths(self, root_path: str | Path) -> list[Path]:
+        """Discover verification inputs without applying compiler format or size limits."""
+        errors: list[ScanError] = []
+        paths = self._candidate_paths(_scan_root(root_path), [], errors)
+        if errors:
+            first = errors[0]
+            raise OSError(f"Cannot scan verification inputs at {first.relative_path}: {first.message}")
+        return paths
+
+    def _candidate_paths(self, root: Path, skipped: list[ScanSkippedFile], errors: list[ScanError]) -> list[Path]:
+        """Apply one traversal and path policy for compilation and verification."""
+        default_rules = _DEFAULT_EXCLUDE_RULES if self.use_default_ignores else ()
+        candidates: list[Path] = []
+        selected_config = self.config_path
+        base_scope_root = selected_config.parent if selected_config is not None else root
+        if not root.is_relative_to(base_scope_root) and not base_scope_root.is_relative_to(root):
+            base_scope_root = root
+        base_scopes = (_ExcludeScope(base_scope_root, self.exclude_rules),) if self.exclude_rules else ()
+
+        stack = [(root, base_scopes)]
+        while stack:
+            current, inherited_scopes = stack.pop()
+            scopes = self._scopes_for_directory(root, current, inherited_scopes, selected_config=selected_config)
+            try:
+                entries = sorted(os.scandir(current), key=lambda item: item.name.casefold())
+            except OSError as exc:
+                rel = _safe_relative(root, current)
+                errors.append(ScanError(_normalized_scan_path(current), rel, str(exc)))
+                continue
+
+            for entry in entries:
+                path = Path(entry.path)
+                rel = _safe_relative(root, path)
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError as exc:
+                    errors.append(ScanError(_normalized_scan_path(path), rel, str(exc)))
+                    continue
+
+                if path in self.ignored_paths or any(rule.matches(rel) for rule in default_rules):
+                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "ignored"))
+                    continue
+                if _matches_exclude_scopes(path, scopes):
+                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "excluded"))
+                    continue
+                if is_dir:
+                    stack.append((path, scopes))
+                    continue
+                if not is_file:
+                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "not_regular_file"))
+                    continue
+                if self.include_patterns and not _matches_include(rel, self.include_patterns):
+                    skipped.append(ScanSkippedFile(_normalized_scan_path(path), rel, "not_included"))
+                    continue
+                candidates.append(path)
+        return candidates
 
     def _scopes_for_directory(
         self,
@@ -207,28 +211,13 @@ class ProjectScanner:
     ) -> _FileScanOutcome:
         rel = _safe_relative(root, path)
         normalized = _normalized_scan_path(path)
-        for _attempt in range(3):
-            try:
-                before = path.stat()
-                size = int(before.st_size)
-                if size > self.max_file_size_bytes:
-                    return _FileScanOutcome(skipped=ScanSkippedFile(normalized, rel, "max_file_size_exceeded", size))
-                digest = hashlib.sha256()
-                sample = b""
-                with path.open("rb") as fh:
-                    while chunk := fh.read(1024 * 1024):
-                        if not sample:
-                            sample = chunk[:SAMPLE_BYTES]
-                        digest.update(chunk)
-                after = path.stat()
-            except OSError as exc:
-                return _FileScanOutcome(error=ScanError(normalized, rel, str(exc)))
-            if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
-                stat = after
-                sha256 = digest.hexdigest()
-                break
-        else:
-            return _FileScanOutcome(error=ScanError(normalized, rel, "file changed repeatedly while being scanned"))
+        try:
+            stat, sha256, sample = fingerprint_file(path, max_bytes=self.max_file_size_bytes)
+        except OSError as exc:
+            return _FileScanOutcome(error=ScanError(normalized, rel, str(exc)))
+        size = stat.st_size
+        if sha256 is None:
+            return _FileScanOutcome(skipped=ScanSkippedFile(normalized, rel, "max_file_size_exceeded", size))
         if is_unsupported_media_file(path, sample):
             return _FileScanOutcome(skipped=ScanSkippedFile(normalized, rel, "unsupported_media", size))
         classification = classify_path(path, sample)
@@ -251,6 +240,46 @@ class ProjectScanner:
         ))
 
 
+def fingerprint_file(path: Path, *, max_bytes: int | None = None) -> tuple[os.stat_result, str | None, bytes]:
+    """Hash stable regular-file bytes and retain a classification sample."""
+    for _attempt in range(3):
+        before = path.stat(follow_symlinks=False)
+        if not S_ISREG(before.st_mode):
+            raise OSError(f"Expected a regular file: {path}")
+        if max_bytes is not None and before.st_size > max_bytes:
+            return before, None, b""
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if _file_stamp(before) != _file_stamp(opened):
+                continue
+            sample = stream.read(SAMPLE_BYTES)
+            digest.update(sample)
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            closed = os.fstat(stream.fileno())
+        after = path.stat(follow_symlinks=False)
+        # Windows reports different ctime values for path and descriptor stats.
+        if (_file_stamp(before) == _file_stamp(after) and before.st_ctime_ns == after.st_ctime_ns
+                and _file_stamp(opened) == _file_stamp(closed) and opened.st_ctime_ns == closed.st_ctime_ns):
+            return after, digest.hexdigest(), sample
+    raise OSError("file changed repeatedly while being scanned")
+
+
+def _file_stamp(info: os.stat_result) -> tuple[int, ...]:
+    """Identify the file and detect concurrent changes to its content or mode."""
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns
+
+
+def _scan_root(path: str | Path) -> Path:
+    root = Path(path).expanduser().resolve(strict=False)
+    if not root.exists():
+        raise FileNotFoundError(f"Project path does not exist: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"Project path is not a directory: {root}")
+    return root
+
+
 def _safe_relative(root: Path, path: Path) -> str:
     try:
         return path.relative_to(root).as_posix()
@@ -268,6 +297,7 @@ def _normalized_scan_path(path: Path) -> str:
 
 
 def _scan_worker_count(candidate_count: int) -> int:
+    """Keep small scans lean and bound larger scans by available CPUs and eight workers."""
     if candidate_count <= 1:
         return candidate_count
     if candidate_count <= SMALL_SCAN_MAX_FILES:

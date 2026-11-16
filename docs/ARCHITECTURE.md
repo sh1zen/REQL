@@ -2,273 +2,180 @@
 
 ## Goal
 
-REQL implements a storage-agnostic property-graph engine for code memory. The
-runtime is deterministic and does not require LLM calls. Optional adapters may
-exist at boundaries, but the active graph model is built from repository
-structure, parsed code, static analysis, and structural document fragments.
+REQL compiles repository facts into a local property graph and combines bounded
+source retrieval with separately stored engineering work. Core compilation,
+queries, analysis and storage require no model calls or external graph service.
 
 ## Layers
 
 ```text
-Public API
-  MemoryGraph
+Python API / CLI / MCP
+        -> application services
+        -> deterministic engines and projections
+        -> GraphStore port
+        -> local block adapter
 
-Application Services
-  Retrieval / Reporting / Project Scan / Project Compile
-
-Engines
-  Activation / Salience / Static Analysis
-
-Storage
-  GraphStore / SemanticExtractor / BlockGraphStore
-
-Domain
-  MemoryNode / MemoryEdge / Queries / Results / Exceptions
+Domain models define the records and contracts shared by these layers.
 ```
 
-The public facade lives in `src/api`. Agent-facing installer integrations live
-in `src/agents`. Deterministic graph services live in `src/memory`. The bundled
-local graph adapter lives in `memory.storage.adapters`. The MCP transport and tool
-handlers live in `src/mcp`.
+| Owner | Responsibility |
+| --- | --- |
+| `src/api` | Public `MemoryGraph` facade and exported models |
+| `src/memory/services` | Compilation, retrieval and coordination |
+| `src/memory/artifacts` | Scanning, compilation, cache, revisions and deltas |
+| `src/memory/code_analysis` | Registered Tree-sitter parsers and extractors |
+| `src/memory/testing` | Test association evidence and transactional observation import |
+| `src/memory/document_ingestion` / `extraction` | Document parsing and deterministic term processing |
+| `src/memory/analysis` / `engines` | Communities, hubs, activation and salience |
+| `src/memory/explanation` / `pipeline` | Read-only repository and flow projections |
+| `src/memory/storage` | Storage port and block adapter |
+| `src/mcp` | Tool handlers and stdio/HTTP transport |
+| `src/agents` | Generated assistant guidance, installation and hooks |
 
 ## Storage Boundary
 
-`memory.storage.GraphStore` is the storage boundary. Services operate on graph
-operations such as node/edge upsert, property lookup, bounded neighborhoods,
-transactions, and batch writes. The bundled block adapter implements that
-contract as a local fixed-size page store; the architecture does not depend on
-Neo4j or any external graph service.
+`memory.storage.GraphStore` defines reads, writes, indexed lookups,
+neighborhoods, counts and transactions. The bundled `BlockGraphStore` owns
+block persistence, transaction journals, lazy loading, checkpoint serialization
+and index lifecycle. Its public package exports resolve to the same class.
+Stateless token selection lives in `memory.storage.adapters.lexical_index`.
 
-`memory.storage.adapters.block_store.BlockGraphStore` owns persistence,
-transaction journals, lazy record loading, and lexical-index lifecycle. Bounded
-term selection lives in the stateless `lexical_index` module. All supported
-block-store import paths resolve to that same class. Older lexical postings still
-migrate when first loaded.
-
-Routine operations should prefer bounded or indexed port methods:
-
-- `find_nodes_by_property` and `find_edges_by_property` for project/artifact
-  scoped lookups;
-- `batch_upsert_nodes` and `batch_upsert_edges` for bulk graph writes;
-- `archive_nodes_by_artifact` for artifact deletion handling;
-- `bounded_neighborhood` for retrieval and graph exploration.
-
-Bulk node reads and neighbor traversal clone records by default for public
-callers. Internal read-only compile and retrieval stages may request borrowed
-views, but they must clone the final bounded result before crossing the public
-API boundary. This avoids repeated deep copies without exposing mutable store
-state.
-
-Full graph loads through `all_nodes` and `all_edges` are reserved for exports,
-reports, tests, and explicit administrative inspection.
+Public results are independent of mutable store state. Internal read-only stages
+may borrow records and copy the bounded result. Full graph reads belong to
+exports, reports and explicit administration. See [Storage](STORAGE.md) for
+the file format, locking, transactions and adapter contract.
 
 ## Compile Flow
 
-Effective configuration is normalized once into the immutable
-`CompilationOptions` model before the compile service starts. Scanner policy,
-document-format policy, parser selection, watch mode, and cache fingerprinting
-all consume that same object. Mapping-based `parsing_options` remain accepted
-at the public Python boundary for compatibility, but are not propagated through
-the internal pipeline.
+Configuration produces one immutable `CompilationOptions` model. The scanner
+uses it to select paths and owns filesystem hashes and artifact identity.
+Verification reuses the walk and hashing code, including for declared inputs
+outside scan selection.
 
-```text
-project root
-  -> read-only filesystem scan
-  -> default ignores plus config include/exclude filtering
-  -> dirty planning from .reql/artifact-cache.json fingerprints
-  -> register Project, Directory, File, and SourceArtifact deltas
-  -> parse dirty code artifacts with Tree-sitter
-  -> emit code graph nodes, technical edges, and static-analysis findings
-  -> compile document fragments structurally
-  -> process document terms, raw events, and co-occurrences locally
-  -> link document fragments and ranked terms to high-signal code symbols
-  -> archive graph records for deleted artifacts
-  -> persist CompilationRun and GraphDelta nodes
-```
-
-Every compile phase returns `ArtifactCompilationResult`, whose change sets are
-deduplicated at creation time and merged directly. There is no second aggregate
-representation with parallel node and edge state.
-
-Code artifacts produce deterministic nodes such as `Module`, `Package`,
-`Class`, `Interface`, `Function`, `Method`, `Variable`, `Import`,
-`Dependency`, `Endpoint`, `Schema`, `Config`, `Test`, `Comment`, `Docstring`,
-and `StaticAnalysisFinding`. Document artifacts produce `SourceFragment`
-records, explicit-heading `Concept` nodes, ranked document `Concept` nodes, and
-underlying `RawEvent` observations. They are used as source context,
-provenance, and deterministic semantic links for the code graph.
-
-Every deterministic compile edge has `confidence=1.0` and provenance fields in
-edge properties, including source file, line range, extractor, evidence,
-`mode=compile`, `is_semantic=false`, and `is_technical=true`.
+`IncrementalCompilationService` owns stage ordering and transaction boundaries.
+`ProjectRegistry` registers project structure, `ArtifactCompiler` parses and
+persists artifact facts, and cache and revision repositories track successful
+compilation provenance. See the [compilation pipeline](PIPELINE.md) for stage
+ordering, parsing, relationships, cache recovery and deletions.
 
 ## Retrieval
 
 ```text
-query
-  -> QueryContextRequest
-  -> QueryContextService
-  -> deterministic query extraction
-  -> lexical seed discovery
-  -> bounded graph expansion
-  -> graph-aware ranking
-  -> code/general/cleanup projection
-  -> Markdown or structured context output
+QueryContextRequest -> QueryContextService -> RetrievalEngine
+  -> lexical seeds -> bounded expansion -> ranking
+  -> code / general / cleanup projection -> Markdown or structured output
 ```
 
-`memory.services.retrieval.RetrievalEngine` remains the stable facade, but its
-implementation is assembled from focused pipeline components:
+`memory.services.query_context.QueryContextService` is the common Python, CLI,
+and MCP boundary. It owns request conversion, confidence, revision and freshness
+metadata, engineering-context attachment and `ContextResult` serialization.
+Providers submit typed requests. Assigned text briefs can focus on exact names
+in the task's declared files. Indexed ranges remain available when the source
+body exceeds the brief budget. Follow-up briefs share that source selection.
 
-- `retrieval/search.py` owns lexical matching and ranking primitives;
-- `retrieval/expansion.py` owns bounded graph traversal;
-- `retrieval/context/service.py` coordinates context construction;
-- `retrieval/context/projections/` selects code, general, and cleanup payloads;
-- `retrieval/context/renderers/` turns payloads into Markdown or structured
-  dictionaries;
-- `retrieval/context/models.py` defines the internal models and component
-  protocols shared by the pipeline.
+Within `memory.services.retrieval`:
 
-Scoped retrieval starts from bounded lexical posting candidates instead of
-enumerating every node in a scope. Matching metrics are computed once and reused
-by seed selection and graph expansion; identifier/path components and plural
-variants participate in the same deterministic ranking used by `SEARCH`,
-`query_context`, `query_graph`, `query_explore`, and `query_memories`.
-When the complete query is an indexed project-relative path, retrieval uses the
-path property index directly and constrains seeds to that file and source
-artifact before expansion. This keeps exact file intent ahead of incidental
-prose or shared-extension matches across context, graph, memory, and raw
-retrieval surfaces. Documentation-scoped and exact documentation-path queries
-use the general/document projection rather than the code-owner projection.
-Graph expansion traverses borrowed read-only neighbor views and copies only the
-final bounded nodes and edges returned to callers. Ranking, traversal limits,
-ordering, and defensive result isolation remain unchanged.
+- `search.py` selects and scores lexical candidates. Exact indexed paths use
+  property lookups. Other searches share identifier and path tokenization.
+- `expansion.py` traverses bounded neighborhoods using request scopes and path
+  coverage scores.
+- `context/service.py` coordinates projection. `context/projections/` selects
+  code, general and cleanup evidence using the indexed scopes and relationships.
+- `context/source.py` confines file capture to the registered project. It
+  checks current hashes against the committed manifest and reuses request-local
+  snapshots across previews, verified excerpts and indexed Markdown sections.
+- `context/models.py` defines projection contracts.
+  `context/renderers/` formats the evidence.
 
-Retrieval modules use explicit imports for their shared constants, helpers, and
-domain types. This keeps component dependencies visible and prevents additions
-to a common module from silently changing every pipeline stage.
-
-`memory.services.query_context.QueryContextService` is the application boundary
-above that pipeline. Python API, CLI, and MCP adapters all submit the same
-immutable `QueryContextRequest` and receive a versioned `ContextResult`.
-The service owns request-to-`MemoryQuery` conversion, projection, confidence,
-trace metadata, deterministic graph revision fingerprinting, and canonical
-envelope serialization. Providers do not call retrieval components directly.
-
-`query_context_result` exposes the typed result. Python structured output, CLI
-JSON, and MCP serialize schema-v2 envelopes with the query-specific
-`graph_revision`, committed `source_revision`, explicit freshness metadata,
-`confidence`, and a nested `payload`.
-
-Agent context is built with `reql query_context --query ...`, dependency slices
-from `reql query_explore --query ...`, or the structured
-`reql query_graph --query ...` command. These builders return bounded graph
-context instead of dumping the full store. Lower-level source fragments can
-contribute evidence and surrounding text, but query semantics operate over the
-higher-level code graph.
-
-## Repository Explanation
-
-`memory.explanation.RepositoryExplanationService` is a read-only projection
-over the compiled technical graph. It groups modules and high-signal symbols
-into business capabilities, assigns architectural roles, builds semantic
-workflow entities from corroborating call, dependency, structure, convention,
-signature, and documentation evidence, and ranks code starting points for an
-optional focus phrase.
-
-The projection is computed on demand by `MemoryGraph.explain_project` and
-`reql project explain`. It does not persist inferred capability or workflow
-nodes, does not mutate graph metrics, and does not require an LLM. Every owner,
-workflow participant, workflow evidence item, and change starting point retains
-a node id and source location. Workflow participants are exposed through
-`implemented_by` relations rather than an invented linear call path. This keeps
-the business view explainable while allowing the underlying code graph to
-remain the single source of truth.
-
-Workflow candidates reuse documentation tokens within a single explanation.
-Normalization and token-signal helpers use bounded caches keyed by immutable
-input text; changes to source text therefore need no cache invalidation.
-
-## Project Pipeline Projection
-
-`memory.pipeline.ProjectPipelineService` is a second read-only view over the
-same compiled graph. Unlike repository explanation, it preserves observed flow
-direction: all admitted entrypoints are traversed through project-local calls,
-route handling, instantiation, wrappers, and resolved imports. Return, write,
-emit, and raise relations become outcomes. Private implementation symbols may
-connect the traversal. Test nodes and every node originating from a test path
-are removed before adjacency, import, outcome, and component projection, so no
-test data can enter the typed pipeline payload or its rendered output.
-
-The service groups reachable symbols with the repository-explanation
-capability and layer heuristics. Component nodes are global to the projection,
-so multiple workflows converge on the same application, domain, core, or
-infrastructure component instead of duplicating it. Aggregated edges retain
-their relation and workflow ids; strongly connected components are marked as
-feedback cycles. `MemoryGraph.project_pipeline` returns the versioned typed
-payload without persisting nodes or metrics. The CLI renders that payload as
-Mermaid or as an embedded-data `vis-network` HTML file.
+Ranking prioritizes exact identifiers and resolved relationships, then
+diversifies symbols across files. Source-backed context includes owner, test
+and implementation links. See [retrieval commands](CLI.md#retrieval-commands)
+for budgets, freshness, read plans and output fields.
 
 ## Engineering Work and Agent Sessions
 
-`memory.services.coordination.CoordinationStore` owns durable work records in
-`.reql/agent-dashboard.reql`: goals, tasks, decisions, constraints, failures,
-questions, changes, observations and checkpoints. Stable ids and typed relation
-fields connect work over time. Transactional revision checks prevent lost updates;
-replacement retires old assumptions atomically. Bounded snapshots retain causes
-and provenance. Execution/readiness and project direction are read projections.
+| State | Owner and default location |
+| --- | --- |
+| Repository facts | Canonical project graph, `.reql/memory.reql` |
+| Shared engineering work | `CoordinationStore`, `.reql/agent-dashboard.reql` |
+| Private session scratch | `AgentWorkspace`, `.reql/agents/` |
+| Test observations and verification receipts | `TestEvidenceStore`, `.reql/test-evidence.reql` |
 
-Coordination reads use structural indexes and defer the existing lexical index
-until search or checkpoint finalization needs it. Single-record reads use identity
-lookup; ordinary writes load only the causal closure needed for cycle validation.
-Completion still checks the full current snapshot. Context and overview build a
-request-local conflict lookup, retaining the same directional and terminal-state
-rules without scanning all records for each projected item.
+Work records link to source using evidence paths and keep their own revisions.
+`CoordinationStore` owns validation, atomic revision-checked writes and
+read projections for readiness and task overlap. Task claims store their
+agent and session independently of the latest write provenance.
+`AgentWorkspace` owns private identity and lifecycle. The shared store
+commits a claim before optional source recovery. A single shared finish
+transaction checks the observed revision, completes the selected task when
+applicable, releases other unfinished claims, and saves a checkpoint.
+Private session close follows that commit. A retry uses the saved checkpoint
+to finish closing without repeating shared writes.
 
-`memory.agent.AgentWorkspace` supplies agent/session identity and private scratch
-under `.reql/agents/`. Existing task/rejection APIs route to the shared work owner;
-legacy private work migrates on resume or cleanup. Finish saves a durable
-checkpoint before closing the private session and releasing scratch storage.
-Session/roster retention does not remove engineering knowledge. Lifecycle leases
-and existing block-store reader/writer locks protect cleanup and shared updates.
+`TestEvidenceStore` owns saved check identities and receipts. Assigned finish
+captures the current check selection, verifies it under the receipt writer
+lease, and holds an evidence read lease through task completion. The standalone
+edit command reads the project's current revision from `RevisionRepository`.
+The source editor validates file hashes and coordinates its writes under the
+workspace edit lease.
 
-The canonical project graph owns files, symbols, source spans and dependencies.
-Work records carry relative evidence paths and intent, without copying graph facts.
-`QueryContextService` joins bounded engineering context to the source projection
-for Python, CLI and MCP. Code confidence/revision remain source-only; work context
-has its own revision. `project context` works without opening the canonical graph;
-`project overview` combines compact source architecture and derived work state.
+The failure service ranks causal, file, verified-symbol and lexical matches.
+Source retrieval attaches work in a bounded section and can reference an
+already included failure record. See [Engineering coordination](COORDINATION.md)
+for handoffs, verification and retention.
 
-See [Engineering coordination](COORDINATION.md) for schema, lifecycle, ranking,
-retention, commands and migration limits. The generator in `src/agents/gen-skill.py`
-is the source for installed skills, platform rules and routed references;
-`src/agents/install.py` owns their installation and guidance hooks.
+`src/agents/gen-skill.py` generates installed skills and platform rules.
+`src/agents/install.py` owns installation and guidance hooks.
 
-## Maintenance
+## Analysis and Projections
 
-```text
-activation and usage signals
-  -> salience update
-  -> rank useful graph records
-  -> keep project/source provenance available for context
-```
+Activation and salience rank graph records using structural and usage signals.
+[Community and hub analysis](REQL.md#graph-analysis) can persist results through
+the storage port.
 
-Salience ranks project and source graph records from structural, retrieval, and
-usage signals.
+`RepositoryExplanationService` and `ProjectPipelineService` build read-only
+views of the compiled graph. The former groups ownership and corroborated
+workflows. The latter groups reachable code into architectural components and
+marks outcomes and feedback cycles. Their typed results retain source
+locations through `MemoryGraph.explain_project` and `MemoryGraph.project_pipeline`.
+See [repository explanation](CLI.md#repository-explanation) and
+[pipeline export](CLI.md#project-pipeline-export).
 
-After each successful compilation that creates a changed-manifest
-`ProjectRevision`, project-scoped retention keeps the latest
-`retention.commits` REQL commits and removes run, delta, revision, archived
-graph, and usage-journal data before that commit boundary. It preserves the
-active graph and retained commits' associated history, does not advance on
-clean or failed compiles, and compacts storage only when graph records were
-removed.
+## Extension Points
 
-## Analysis
+Use the [storage adapter contract](STORAGE.md#storage-adapters) for a new
+backend. The compilation pipeline documents how to
+[change a code extractor](PIPELINE.md#changing-an-extractor) or
+[add a document parser](PIPELINE.md#adding-a-document-parser).
 
-Graph analysis remains deterministic: community detection, hub analysis, and
-cleanup findings are graph algorithms with no required LLM or external graph
-database. Project compilation stays on the parser and code/document graph path.
+### Query seed extractors
 
-`project compile --watch` is a `watchdog` filesystem monitor over the same
-incremental compiler and cache. It uses the same compile pipeline as one-shot
-compile, so CLI, API, and MCP updates stay consistent.
+Implement `SemanticExtractor` from `memory.storage.extractor`.
+
+The extractor should return `ExtractionResult` objects and is injected through
+`MemoryGraph(store, extractor=extractor)` or `MemoryGraph.open(path, extractor=extractor)`.
+It supplies query seed discovery. Core compile paths use
+deterministic local processing through the
+[document processor](PIPELINE.md#graph-output).
+
+### New engines
+
+New engines should be placed under `memory/engines/` when they operate on
+low-level graph state in the same style as the current activation and salience
+engines. Keep project orchestration under `memory/services/`, and keep graph
+analysis algorithms under `memory/analysis/`.
+
+Existing examples:
+
+- `memory.engines.activation.ActivationEngine`
+- `memory.engines.salience.SalienceEngine`
+- `memory.analysis.communities.CommunityDetector`
+- `memory.analysis.hubs.HubAnalyzer`
+
+### New node or edge types
+
+Add constants in `memory/domain/constants.py`, then update compiler, retrieval,
+reporting, services, engines, or analysis code only where the new type needs
+dedicated behavior. The storage layer accepts arbitrary `type` strings, so
+schema evolution is mainly a domain and service concern.
+Add integration tests when a type changes retrieval, salience, or analysis.

@@ -24,6 +24,7 @@ class GraphExpansionMixin:
         *,
         edge_types: set[str],
         code_context: bool,
+        scopes: set[str],
         metrics_cache: MutableMapping[str, NodeMatchMetrics] | None = None,
     ) -> tuple[OrderedDict[str, PathCandidate], OrderedDict[str, MemoryEdge]]:
         candidates: dict[str, PathCandidate] = {}
@@ -31,6 +32,7 @@ class GraphExpansionMixin:
         queue: list[tuple[str, int, float, float, set[str], list[str]]] = []
         seen_depth: dict[str, int] = {}
         metrics_by_node = metrics_cache if metrics_cache is not None else {}
+        visit_budget = max(80, query.top_k * 8)
 
         def metrics_for(node: MemoryNode) -> NodeMatchMetrics:
             metrics = metrics_by_node.get(node.id)
@@ -43,7 +45,7 @@ class GraphExpansionMixin:
             seed = self.store.get_node(seed_id)
             if seed is None:
                 continue
-            if not self._candidate_node_allowed(seed, query, code_context=code_context):
+            if not self._candidate_node_allowed(seed, query, code_context=code_context, scopes=scopes):
                 continue
             seed_score = seed_scores.get(seed_id, 0.0)
             seed_metrics = metrics_for(seed)
@@ -53,7 +55,7 @@ class GraphExpansionMixin:
                 seed,
                 query_profile,
                 seed_score=seed_score,
-                path_tokens=seed_tokens,
+                path_coverage=self._coverage(seed_tokens, query_profile),
                 depth=0,
                 edge_signal=1.0,
                 edge_ids=[],
@@ -73,35 +75,39 @@ class GraphExpansionMixin:
                 direction="both",
                 edge_types=edge_types,
                 min_weight=0.01,
-                limit=120,
+                limit=64,
                 clone=False,
             )
+            current_coverage = self._coverage(path_tokens, query_profile)
             for edge, neighbor in neighbors:
                 if edge.type in TECHNICAL_EDGE_TYPES:
                     continue
-                if not self._candidate_node_allowed(neighbor, query, code_context=code_context):
+                if not self._candidate_node_allowed(neighbor, query, code_context=code_context, scopes=scopes):
                     continue
                 next_depth = depth + 1
                 metrics = metrics_for(neighbor)
                 neighbor_tokens = set(metrics.overlap_tokens)
                 combined_tokens = path_tokens | neighbor_tokens
+                coverage = current_coverage if combined_tokens == path_tokens else self._coverage(combined_tokens, query_profile)
                 previous_depth = seen_depth.get(neighbor.id)
                 existing = candidates.get(neighbor.id)
                 if (
                     previous_depth is not None
                     and previous_depth <= next_depth
                     and existing is not None
-                    and existing.coverage >= self._coverage(combined_tokens, query_profile)
+                    and existing.coverage >= coverage
                 ):
                     continue
                 if (
                     next_depth > 1
                     and metrics.match_score <= 0.0
-                    and self._coverage(combined_tokens, query_profile) <= self._coverage(path_tokens, query_profile)
+                    and coverage <= current_coverage
                 ):
                     continue
                 edge_signal = clamp(edge.weight * edge.confidence * max(edge.polarity, 0))
-                next_path_score = clamp(0.55 * current_path_score + 0.25 * self._coverage(combined_tokens, query_profile) + 0.20 * edge_signal)
+                if edge.type in {"CALLS", "REFERENCES", "WRAPS", "TESTS"} and not edge.properties.get("resolver"):
+                    edge_signal *= 0.35
+                next_path_score = clamp(0.55 * current_path_score + 0.25 * coverage + 0.20 * edge_signal)
                 next_edge_ids = [*path_edge_ids, edge.id]
                 candidate_edges.setdefault(edge.id, edge)
                 self._add_path_candidate(
@@ -109,13 +115,13 @@ class GraphExpansionMixin:
                     neighbor,
                     query_profile,
                     seed_score=root_seed_score,
-                    path_tokens=combined_tokens,
+                    path_coverage=coverage,
                     depth=next_depth,
                     edge_signal=next_path_score,
                     edge_ids=next_edge_ids,
                     metrics=metrics,
                 )
-                if previous_depth is None or next_depth < previous_depth:
+                if (previous_depth is None or next_depth < previous_depth) and len(queue) < visit_budget:
                     seen_depth[neighbor.id] = next_depth
                     queue.append((neighbor.id, next_depth, root_seed_score, next_path_score, combined_tokens, next_edge_ids))
 
@@ -132,14 +138,13 @@ class GraphExpansionMixin:
         )
         return ordered, candidate_edges
 
-    def _candidate_node_allowed(self, node: MemoryNode, query: MemoryQuery, *, code_context: bool) -> bool:
+    def _candidate_node_allowed(self, node: MemoryNode, query: MemoryQuery, *, code_context: bool, scopes: set[str]) -> bool:
         if not self._is_graph_layer_node(node):
             return False
         if code_context and not self._is_code_context_node(node):
             return False
         if query.node_types and node.type not in query.node_types:
             return False
-        scopes = self._normalize_query_context_scopes(query.context_scopes)
         if scopes and not self._node_matches_query_context_scope(node, scopes):
             return False
         return query.include_archived or node.status not in INACTIVE_STATUSES
@@ -151,7 +156,7 @@ class GraphExpansionMixin:
         query_profile: QueryProfile,
         *,
         seed_score: float,
-        path_tokens: set[str],
+        path_coverage: float,
         depth: int,
         edge_signal: float,
         edge_ids: list[str],
@@ -159,7 +164,7 @@ class GraphExpansionMixin:
     ) -> None:
         metrics = metrics or self._node_match_metrics(node, query_profile)
         direct_coverage = metrics.coverage
-        path_coverage = max(direct_coverage, self._coverage(path_tokens, query_profile))
+        path_coverage = max(direct_coverage, path_coverage)
         type_bonus = self._retrieval_type_bonus(node, metrics.match_score)
         depth_penalty = min(0.30, depth * 0.08)
         path_score = clamp(0.60 * edge_signal + 0.40 * path_coverage)

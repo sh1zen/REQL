@@ -7,17 +7,14 @@ import unittest
 from api import MemoryGraph
 from mcp.tools import MCPToolError, call_tool, list_tools
 from memory.domain.models import MemoryEdge, MemoryNode
-from memory.security import SecurityError, validate_url
 
 
 class SecurityBoundaryTests(unittest.TestCase):
-    def test_validate_url_blocks_private_and_metadata_destinations(self) -> None:
-        with self.assertRaises(SecurityError):
-            validate_url("http://169.254.169.254/latest/meta-data", allow_loopback=True)
-        with self.assertRaises(SecurityError):
-            validate_url("http://10.0.0.1/api", allow_loopback=True)
-        with self.assertRaises(SecurityError):
-            validate_url("file:///etc/passwd", allow_loopback=True)
+    def test_mcp_rejects_urls_at_the_local_storage_boundary(self) -> None:
+        """MCP storage inputs are local paths, with no outbound URL resolution."""
+        for path in ("http://169.254.169.254/latest/meta-data", "http://10.0.0.1/api", "file:///etc/passwd"):
+            with self.subTest(path=path), self.assertRaisesRegex(MCPToolError, "local filesystem path"):
+                call_tool("query_memories", {"storage_path": path, "query": "anything"})
 
     def test_mcp_rejects_storage_paths_outside_allowed_root(self) -> None:
         outside = Path.home() / "outside-reql-security-test.reql"
@@ -53,48 +50,6 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn("</untrusted_source>", rendered)
         self.assertNotIn("<|system|>", rendered)
         self.assertIn("&lt;", rendered)
-
-    def test_mcp_inspect_node_returns_location_context(self) -> None:
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            try:
-                function = MemoryNode(
-                    id="function:plant",
-                    type="Function",
-                    label="water_office_plant",
-                    text="def water_office_plant(): ...",
-                    properties={"path": "notes.md", "relative_path": "notes.md", "line_start": 3, "line_end": 3},
-                )
-                fragment = MemoryNode(
-                    id="fragment:plant",
-                    type="SourceFragment",
-                    label="notes.md:3",
-                    text="The office plant should be watered every Monday.",
-                    properties={"path": "notes.md", "relative_path": "notes.md", "start_line": 3, "end_line": 3, "artifact_id": "artifact:notes"},
-                )
-                graph.add_node(function)
-                graph.add_node(fragment)
-                graph.add_edge(
-                    MemoryEdge(
-                        id="edge:function-fragment",
-                        from_id="function:plant",
-                        to_id="fragment:plant",
-                        type="HAS_DOCSTRING",
-                        properties={"source_file": "notes.md", "line_start": 3, "line_end": 3, "artifact_id": "artifact:notes"},
-                    )
-                )
-            finally:
-                graph.close()
-
-            result = call_tool("inspect_node", {"storage_path": str(db), "node_id": "function:plant"})
-
-        self.assertTrue(result["found"])
-        self.assertEqual(result["location"]["path"], "notes.md")
-        self.assertTrue(any(item["other_id"] == "fragment:plant" for item in result["neighbors"]))
-        self.assertTrue(any(item["location"]["relative_path"] == "notes.md" for item in result["sources"]))
 
     def test_mcp_query_explore_is_read_only_and_structured(self) -> None:
         tmp_root = Path.cwd() / ".tmp"

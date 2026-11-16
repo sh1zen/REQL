@@ -107,12 +107,5 @@ class DeterministicExtractor:
         ][:10]
 
     def _extract_entities(self, text: str) -> list[tuple[str, str, float]]:
-        entities: list[tuple[str, str, float]] = []
-        for entity in extract_capitalized_entities(text):
-            key = canonicalize(entity)
-            if not key or key == "ok":
-                continue
-            kind = "technology" if any(ch.isdigit() for ch in entity) or key in {"neo4j", "sqlite", "llm"} else "named_thing"
-            score = 0.85 if kind == "technology" else 0.65
-            entities.append((entity, kind, score))
-        return entities[:16]
+        """Use lexical mentions as seeds without inferring their semantic type."""
+        return [(entity, "named_thing", 0.65) for entity in extract_capitalized_entities(text)[:16]]

@@ -7,6 +7,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from ..artifacts.fingerprint import PARSER_FACTS_VERSION
 from ..artifacts.models import SourceArtifact
 from ..domain.ids import stable_id
 from .models import (
@@ -25,14 +26,14 @@ from .catalog import CODE_LANGUAGE_CATALOG, language_key, load_tree_sitter_langu
 
 class TreeSitterCodeParser:
     parser_name = "tree_sitter"
-    parser_version = "tree-sitter-code-v11"
+    parser_version = f"tree-sitter-code-v{PARSER_FACTS_VERSION}"
 
     def supports(self, language: str) -> bool:
         return language_key(language) in CODE_LANGUAGE_CATALOG
 
     def parse_artifact(self, artifact: SourceArtifact, text: str) -> CodeParseResult:
         language = _language(artifact)
-        parser_language = tree_sitter_language_key(artifact.path, language)
+        parser_language = artifact_grammar(artifact, language)
         source = text.removeprefix("\ufeff").encode("utf-8", errors="replace")
         try:
             parser = _parser_for(parser_language)
@@ -42,9 +43,11 @@ class TreeSitterCodeParser:
             return _parser_unavailable_result(artifact, language, str(exc))
         tree = parser.parse(source)
         root = tree.root_node
+        extractor = _extractor_for(artifact, source, language, parser_language)
         if bool(getattr(root, "has_error", False)):
-            return _syntax_recovery_result(artifact, language)
-        return _extractor_for(artifact, source, language, parser_language).extract(root)
+            recovered = extractor.extract(root) if extractor.syntax_recovery_containers else None
+            return _syntax_recovery_result(artifact, language, recovered)
+        return extractor.extract(root)
 
 
 class TreeSitterExtractorBase(ABC):
@@ -52,6 +55,17 @@ class TreeSitterExtractorBase(ABC):
 
     parser_name = TreeSitterCodeParser.parser_name
     parser_version = TreeSitterCodeParser.parser_version
+    facts_revision = 0
+    syntax_recovery_containers: frozenset[str] = frozenset()
+
+    @classmethod
+    def facts_revisions(cls) -> tuple[tuple[str, int], ...]:
+        """Include independent revisions of the derived and shared extractors."""
+        return tuple(
+            (f"{owner.__module__}.{owner.__qualname__}", revision)
+            for owner in cls.__mro__
+            if (revision := owner.__dict__.get("facts_revision", 0))
+        )
 
     def __init__(self, artifact: SourceArtifact, source: bytes, language: str, language_key: str) -> None:
         self.artifact = artifact
@@ -75,6 +89,7 @@ class TreeSitterExtractorBase(ABC):
 
     def extract(self, root: Any) -> CodeParseResult:
         self._walk_root(root)
+        revisions = self.facts_revisions()
         return CodeParseResult(
             module=self.module,
             symbols=self.symbols,
@@ -85,7 +100,26 @@ class TreeSitterExtractorBase(ABC):
             docstrings=self.docstrings,
             errors=[],
             parser_name=self.parser_name,
-            parser_version=self.parser_version,
+            parser_version=stable_id(self.parser_version, revisions) if revisions else self.parser_version,
+        )
+
+    def _record_call(self, node: Any, scope: list[CodeSymbol], *, function_field: str) -> None:
+        """Record a call and its read reference in source traversal order."""
+        target_node = _field(node, function_field)
+        target = _call_target(self.source, target_node)
+        if not target or target.split(".")[0] in {"if", "for", "while", "switch", "catch", "function", "return", "class", "import", "export"}:
+            return
+        caller = _call_owner(scope)
+        self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
+        self.calls.append(
+            CodeCall(
+                id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
+                artifact_id=self.artifact.id,
+                caller=caller,
+                target=target,
+                line=_line(node),
+                column=_column(node),
+            )
         )
 
     @abstractmethod
@@ -106,23 +140,20 @@ def _extractor_for(
 
 @lru_cache(maxsize=64)
 def _parser_for(language: str) -> Any:
+    """Build a cached parser with the supported Tree-sitter constructor."""
     tree_sitter = import_module("tree_sitter")
     language_obj = load_tree_sitter_language(tree_sitter, language)
-    parser_cls = getattr(tree_sitter, "Parser")
-    try:
-        return parser_cls(language_obj)
-    except TypeError:
-        parser = parser_cls()
-        try:
-            parser.language = language_obj
-        except AttributeError:
-            parser.set_language(language_obj)
-        return parser
+    return tree_sitter.Parser(language_obj)
 
 
 def _language(artifact: SourceArtifact) -> str:
     key = language_key(artifact.language or Path(artifact.path).suffix)
     return CODE_LANGUAGE_CATALOG.get(key, {}).get("display", key)
+
+
+def artifact_grammar(artifact: SourceArtifact, language: str | None = None) -> str:
+    """Use the same grammar key for parsing and cache invalidation."""
+    return tree_sitter_language_key(artifact.path, _language(artifact) if language is None else language)
 
 
 def _parser_unavailable_result(artifact: SourceArtifact, language: str, warning: str) -> CodeParseResult:
@@ -152,33 +183,25 @@ def _parser_unavailable_result(artifact: SourceArtifact, language: str, warning:
     )
 
 
-def _syntax_recovery_result(artifact: SourceArtifact, language: str) -> CodeParseResult:
-    error = f"Tree-sitter syntax error in {artifact.relative_path}"
-    module = CodeModule(
-        id=stable_id("module", artifact.id),
-        artifact_id=artifact.id,
-        name=_module_name(artifact.relative_path),
-        path=artifact.relative_path,
-        language=language,
-        metadata={
-            "tree_sitter": True,
-            "tree_sitter_has_error": True,
-            "parser_status": "partial",
-            "parser_warning": error,
-        },
+def _syntax_recovery_result(
+    artifact: SourceArtifact, language: str, result: CodeParseResult | None = None,
+) -> CodeParseResult:
+    """Keep partial-parse diagnostics even when an extractor can recover trusted subtrees."""
+    if result is None:
+        result = CodeParseResult(
+            module=CodeModule(
+                id=stable_id("module", artifact.id), artifact_id=artifact.id,
+                name=_module_name(artifact.relative_path), path=artifact.relative_path,
+                language=language, metadata={"tree_sitter": True},
+            ),
+            symbols=[], imports=[], calls=[], references=[], comments=[], docstrings=[], errors=[],
+            parser_name=TreeSitterCodeParser.parser_name, parser_version=TreeSitterCodeParser.parser_version,
+        )
+    result.module.metadata.update(
+        tree_sitter_has_error=True, parser_status="partial",
+        parser_warning=f"Tree-sitter syntax error in {artifact.relative_path}",
     )
-    return CodeParseResult(
-        module=module,
-        symbols=[],
-        imports=[],
-        calls=[],
-        references=[],
-        comments=[],
-        docstrings=[],
-        errors=[],
-        parser_name=TreeSitterCodeParser.parser_name,
-        parser_version=TreeSitterCodeParser.parser_version,
-    )
+    return result
 
 
 def _symbol(

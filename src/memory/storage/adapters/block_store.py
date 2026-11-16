@@ -11,8 +11,11 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
+import errno
 import hashlib
 import heapq
+from io import BytesIO
+from itertools import chain
 import mmap
 import os
 from pathlib import Path
@@ -53,6 +56,7 @@ DEFAULT_BLOCK_SIZE = 64 * 1024
 DEFAULT_PAGE_CACHE_BLOCKS = 128
 DEFAULT_DENSE_NODE_THRESHOLD = 1024
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+DEFAULT_LOCK_RELEASE_TIMEOUT_SECONDS = 1.0
 DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS = 30.0
 DEFAULT_AUTO_CHECKPOINT_WAL_BYTES = 8 * 1024 * 1024
 
@@ -86,7 +90,6 @@ _BINARY_ID_TO_KIND = {value: key for key, value in _BINARY_KIND_TO_ID.items()}
 _NULL_STRING_LENGTH = 0xFFFFFFFF
 _WAL_MAGIC = b"RQLWAL02"
 _WAL_FRAME_HEADER = struct.Struct("<I32s")
-_EncodedRecord = tuple[dict[str, Any], bytes]
 _Location = dict[str, int]
 _ScalarIndexValue = str | int | float | bool | None
 CURRENT_ROOT_INDEX_VERSION = 3
@@ -129,6 +132,14 @@ def _root_index_count(root_index: dict[str, Any], key: str) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _root_index_summary(root_index: dict[str, Any]) -> dict[str, int]:
+    """Retain only the persisted counters needed for storage inspection."""
+    return {
+        key: _root_index_count(root_index, key)
+        for key in ("nodes", "edges", "node_keys", "edge_patterns")
+    }
 
 
 def _compact_space_map(space_map: dict[str, Any]) -> dict[str, Any]:
@@ -296,9 +307,14 @@ def _lock_age_seconds(payload: dict[str, Any], lock_path: Path) -> float:
         return 0.0
 
 
-def _read_lock_payload(lock_path: Path) -> dict[str, Any]:
+def _read_lock_payload(lock_path: Path, *, missing_ok: bool = True) -> dict[str, Any]:
+    """Read lock metadata, preserving strict missing-file errors for lock owners."""
     try:
         raw = lock_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+        return {}
     except OSError:
         return {}
     try:
@@ -306,6 +322,29 @@ def _read_lock_payload(lock_path: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _is_windows_lock_creation_contention(error: OSError, lock_path: Path) -> bool:
+    """Recognize the CRT's access-denied result for a delete-pending sidecar."""
+    return os.name == "nt" and error.errno == errno.EACCES and error.filename == str(lock_path)
+
+
+def _release_owned_lock(lock_path: Path, token: str) -> None:
+    """Release an owned sidecar despite brief Windows metadata-reader handles."""
+    deadline = time.monotonic() + DEFAULT_LOCK_RELEASE_TIMEOUT_SECONDS
+    while True:
+        try:
+            if _read_lock_payload(lock_path, missing_ok=False).get("token") != token:
+                return
+            lock_path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
+                raise
+            # Recheck ownership after waiting; a replaced sidecar is not ours.
+            time.sleep(0.01)
 
 
 def _lock_process_alive(payload: dict[str, Any]) -> bool | None:
@@ -339,7 +378,6 @@ def _lock_diagnostic(payload: dict[str, Any], lock_path: Path, *, mode: str) -> 
         "command": command,
         "duration_seconds": round(_lock_age_seconds(payload, lock_path), 3),
         "process_alive": _lock_process_alive(payload),
-        "watcher": bool(payload.get("watcher")) or "--watch" in command.split(),
         "stale": _lock_is_stale(payload, lock_path),
         "created_at": payload.get("created_at"),
     }
@@ -353,7 +391,7 @@ def _format_locked_message(target_path: Path, diagnostic: dict[str, Any]) -> str
         f"REQL block store is locked for {diagnostic.get('mode', 'unknown')}: {target_path}; "
         f"command={command}; pid={diagnostic.get('pid')}; host={diagnostic.get('host')}; "
         f"duration={float(diagnostic.get('duration_seconds', 0.0)):.3f}s; "
-        f"process_alive={alive_text}; watcher={str(bool(diagnostic.get('watcher'))).lower()}; "
+        f"process_alive={alive_text}; "
         f"stale={str(bool(diagnostic.get('stale'))).lower()}. "
         "Wait for the active command to finish, or inspect and recover stale locks with "
         "`reql storage locks --recover-stale`."
@@ -436,6 +474,9 @@ class _StoreLock:
                 time.sleep(0.05)
                 continue
             except OSError as exc:
+                if _is_windows_lock_creation_contention(exc, self.lock_path) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
                 raise StorageError(f"Cannot acquire REQL write lock for {self.target_path}: {exc}") from exc
             try:
                 os.write(fd, json.dumps(self._payload(), sort_keys=True).encode("utf-8"))
@@ -448,11 +489,7 @@ class _StoreLock:
         if not self.acquired:
             return
         try:
-            payload = self._read_payload()
-            if payload.get("token") == self.token:
-                self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            _release_owned_lock(self.lock_path, self.token)
         finally:
             self.acquired = False
 
@@ -466,24 +503,14 @@ class _StoreLock:
             "token": self.token,
             "created_at": utcnow_iso(),
             "command": command,
-            "watcher": "--watch" in command.split(),
         }
 
-    def _read_payload(self) -> dict[str, Any]:
-        try:
-            raw = self.lock_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise
-        except OSError:
-            return {}
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
     def _remove_stale_lock(self) -> bool:
-        payload = self._read_payload()
+        try:
+            payload = _read_lock_payload(self.lock_path, missing_ok=False)
+        except FileNotFoundError:
+            # The owner released after our existence check; retry acquisition.
+            return True
         if not _lock_is_stale(payload, self.lock_path):
             return False
         try:
@@ -495,7 +522,7 @@ class _StoreLock:
             return False
 
     def _locked_message(self) -> str:
-        diagnostic = _lock_diagnostic(self._read_payload(), self.lock_path, mode="write")
+        diagnostic = _lock_diagnostic(_read_lock_payload(self.lock_path), self.lock_path, mode="write")
         return _format_locked_message(self.target_path, diagnostic)
 
 
@@ -525,7 +552,7 @@ class _ReaderLock:
     def acquire(self, writer_lock: _StoreLock) -> None:
         deadline = time.monotonic() + self.timeout_seconds
         while True:
-            self._create_slot()
+            self._create_slot(deadline=deadline)
             if not writer_lock.lock_path.exists() or writer_lock._remove_stale_lock():
                 self.acquired = True
                 return
@@ -536,16 +563,13 @@ class _ReaderLock:
 
     def release(self) -> None:
         try:
-            payload = self._read_payload()
-            if payload.get("token") == self.token:
-                self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            _release_owned_lock(self.lock_path, self.token)
         finally:
             self.acquired = False
             self._remove_empty_readers_dir()
 
-    def _create_slot(self) -> None:
+    def _create_slot(self, *, deadline: float) -> None:
+        """Publish a reader slot while peers may remove its empty directory."""
         while True:
             try:
                 self.readers_path.mkdir(parents=True, exist_ok=True)
@@ -555,6 +579,11 @@ class _ReaderLock:
                 self.token = uuid.uuid4().hex
                 self.lock_path = self.readers_path / f"{os.getpid()}-{self.token}.lock"
             except OSError as exc:
+                if (
+                    isinstance(exc, FileNotFoundError) or _is_windows_lock_creation_contention(exc, self.lock_path)
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
                 raise StorageError(f"Cannot acquire REQL read lock for {self.target_path}: {exc}") from exc
         try:
             os.write(fd, json.dumps(self._payload(), sort_keys=True).encode("utf-8"))
@@ -571,21 +600,7 @@ class _ReaderLock:
             "token": self.token,
             "created_at": utcnow_iso(),
             "command": command,
-            "watcher": "--watch" in command.split(),
         }
-
-    def _read_payload(self) -> dict[str, Any]:
-        try:
-            raw = self.lock_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise
-        except OSError:
-            return {}
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
 
     def _remove_empty_readers_dir(self) -> None:
         with suppress(OSError):
@@ -637,9 +652,9 @@ class _StoreReadWriteLock:
             return []
         active: list[dict[str, Any]] = []
         for path in sorted(self.reader.readers_path.glob("*.lock")):
-            payload = self._read_payload(path)
+            payload = _read_lock_payload(path)
             payload["_lock_path"] = str(path)
-            if self._reader_is_stale(payload, path):
+            if _lock_is_stale(payload, path):
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -651,20 +666,6 @@ class _StoreReadWriteLock:
         with suppress(OSError):
             self.reader.readers_path.rmdir()
         return active
-
-    def _read_payload(self, path: Path) -> dict[str, Any]:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            return {}
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
-    def _reader_is_stale(self, payload: dict[str, Any], path: Path) -> bool:
-        return _lock_is_stale(payload, path)
 
 
 def _process_is_alive(pid: int) -> bool:
@@ -860,6 +861,26 @@ def _encode_record(record: dict[str, Any]) -> bytes:
         payload = _encode_node_payload(value)
     elif kind in {"edge", "dense_edge"}:
         payload = _encode_edge_payload(value)
+    elif kind in {"lexical_index", "root_index"}:
+        # Indexes can dwarf individual records. Stream bounded JSON batches into
+        # the existing compressed-record codec instead of retaining a full JSON
+        # string, its UTF-8 copy, and an uncompressed multi-block payload together.
+        with BytesIO() as output:
+            output.write(_BINARY_RECORD_HEADER.pack(_BINARY_RECORD_MAGIC, _BINARY_RECORD_VERSION, kind_id, _BINARY_FLAG_COMPRESSED))
+            compressor = zlib.compressobj()
+            pending: list[str] = []
+            pending_chars = 0
+            for chunk in json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":")).iterencode(value):
+                pending.append(chunk)
+                pending_chars += len(chunk)
+                if pending_chars >= DEFAULT_BLOCK_SIZE:
+                    output.write(compressor.compress("".join(pending).encode("utf-8")))
+                    pending.clear()
+                    pending_chars = 0
+            if pending:
+                output.write(compressor.compress("".join(pending).encode("utf-8")))
+            output.write(compressor.flush())
+            return output.getvalue()
     else:
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return _BINARY_RECORD_HEADER.pack(_BINARY_RECORD_MAGIC, _BINARY_RECORD_VERSION, kind_id, 0) + payload
@@ -944,6 +965,57 @@ def _decode_record_payload(payload: bytes) -> tuple[dict[str, Any], int, bool]:
             value = json.loads(body.decode("utf-8"))
         return {"kind": kind, "value": value}, len(body), compressed
     raise StorageError("Invalid REQL binary record magic")
+
+
+class _CheckpointPages:
+    """Pack records into pages while retaining only the current page and its locations."""
+
+    def __init__(self, block_size: int, *, block_id: int = 0, body: bytes = b"") -> None:
+        self.block_size = block_size
+        self.capacity = block_size - _HEADER_SIZE
+        self.block_id = block_id
+        self.body = bytearray(body)
+        self.used_sizes: list[int] = []
+        self.locations: dict[str, dict[str, _Location]] = defaultdict(dict)
+        self.digest = hashlib.sha256()
+
+    def append(self, record: dict[str, Any]) -> Iterator[bytes]:
+        """Emit completed pages and locate the first frame of the logical record."""
+        payload = _encode_record(record)
+        max_payload_size = self.capacity - _FRAME_HEADER.size
+        payloads = (
+            (payload,) if len(payload) <= max_payload_size
+            else _encode_record_parts(payload, max_payload_size=max_payload_size)
+        )
+        location: _Location | None = None
+        frame_length = 0
+        for part in payloads:
+            size = _FRAME_HEADER.size + len(part)
+            if self.body and len(self.body) + size > self.capacity:
+                yield self.finish_page()
+            if location is None:
+                location = {"block_id": self.block_id, "frame_offset": _HEADER_SIZE + len(self.body)}
+            self.body.extend(_FRAME_HEADER.pack(len(part)))
+            self.body.extend(part)
+            frame_length += size
+        kind = record["kind"]
+        record_id = "root_index" if kind == "root_index" else str(record["value"].get("id", ""))
+        if record_id and location is not None:
+            location["frame_length"] = frame_length
+            self.locations["edge" if kind == "dense_edge" else kind][record_id] = location
+
+    def finish_page(self) -> bytes:
+        """Seal one padded page, recording its used size and checksum contribution."""
+        used = len(self.body)
+        header = _HEADER_STRUCT.pack(
+            _BLOCK_MAGIC, SCHEMA_VERSION, self.block_size, self.block_id, used, b"\x00" * 12,
+        )
+        page = header + self.body + b"\x00" * (self.capacity - used)
+        self.digest.update(page)
+        self.used_sizes.append(used)
+        self.block_id += 1
+        self.body.clear()
+        return page
 
 
 class BlockGraphStore:
@@ -1258,7 +1330,9 @@ class BlockGraphStore:
         self._root_index = dict(journal.root_index)
         self._space_map = dict(journal.space_map)
         del self._pending_wal_records[journal.pending_wal_len :]
-        self._rebuild_indexes()
+        # A deferred journal needs the structural indexes and its saved overlay,
+        # not new lexical postings for the whole graph.
+        self._rebuild_indexes(lexical=journal.lexical_index_loaded)
         self._lexical_index_location = dict(journal.lexical_index_location) if journal.lexical_index_location else None
         self._deferred_lexical_changes = {
             node_id: (
@@ -1267,11 +1341,6 @@ class BlockGraphStore:
             )
             for node_id, (old, new) in journal.deferred_lexical_changes.items()
         }
-        if not journal.lexical_index_loaded:
-            self._node_terms = defaultdict(dict)
-            self._node_term_index = {}
-            self._node_lexical_fingerprints = {}
-            self._lexical_index_loaded = False
 
     def _journal_node_before_change(self, node_id: str) -> None:
         if not self._transaction_journals:
@@ -1366,9 +1435,9 @@ class BlockGraphStore:
             raise StorageError(f"Invalid REQL manifest JSON for {self.path}") from exc
         self._validate_manifest(manifest, file_size)
         self._manifest = dict(manifest)
-        self._generation_id = int(manifest["generation_id"])
-        self._root_index_offset = int(manifest["root_index_offset"])
-        self._data_offset = int(manifest.get("data_offset", self.block_size))
+        self._generation_id = manifest["generation_id"]
+        self._root_index_offset = manifest["root_index_offset"]
+        self._data_offset = manifest["data_offset"]
         self._open_mmap()
         self._load_root_index()
 
@@ -1383,11 +1452,15 @@ class BlockGraphStore:
             "generation_id",
             "data_block_count",
             "checksum",
+            "checksum_algorithm",
             "record_codec",
         }
         missing = sorted(required.difference(manifest))
         if missing:
-            raise StorageError(f"REQL manifest missing fields for {self.path}: {', '.join(missing)}")
+            raise StorageError(
+                f"REQL manifest missing fields for {self.path}: {', '.join(missing)}. "
+                "Rebuild the storage with the current REQL version."
+            )
         if manifest["format"] != _FORMAT_NAME:
             raise StorageError(f"Invalid REQL format in manifest for {self.path}")
         manifest_version = self._manifest_int(manifest, "manifest_version")
@@ -1415,19 +1488,20 @@ class BlockGraphStore:
             raise StorageError(f"Invalid REQL block store size for {self.path}")
         if generation_id < 0:
             raise StorageError(f"Invalid REQL generation id for {self.path}")
-        if manifest.get("checksum_algorithm", "sha256") != "sha256":
+        if manifest["checksum_algorithm"] != "sha256":
             raise StorageError(f"Unsupported REQL checksum algorithm for {self.path}")
-        if manifest.get("record_codec") != "binary-v2":
+        if manifest["record_codec"] != "binary-v2":
             raise StorageError(f"Unsupported REQL record codec for {self.path}")
         checksum = str(manifest["checksum"])
         if len(checksum) != 64 or any(ch not in "0123456789abcdef" for ch in checksum):
             raise StorageError(f"Invalid REQL data checksum for {self.path}")
 
     def _manifest_int(self, manifest: dict[str, Any], field: str) -> int:
-        try:
-            return int(manifest[field])
-        except (TypeError, ValueError) as exc:
-            raise StorageError(f"Invalid REQL manifest field {field} for {self.path}") from exc
+        """Require the integer representation emitted by the current manifest writer."""
+        value = manifest[field]
+        if type(value) is not int:
+            raise StorageError(f"Invalid REQL manifest field {field} for {self.path}; expected an integer")
+        return value
 
     def _validate_data_checksum(self, data_offset: int, expected: str) -> None:
         digest = hashlib.sha256()
@@ -1890,84 +1964,79 @@ class BlockGraphStore:
                 "record_codec": "binary-v2",
             }
         )
-        base_encoded = self._encode_records(self._ordered_records())
-        lexical_record = {
-            "kind": "lexical_index",
-            "value": {
-                "id": "lexical_index",
-                "node_terms": {
-                    term: dict(sorted(postings.items()))
-                    for term, postings in sorted(self._node_terms.items())
-                },
-            },
-        }
-        base_encoded.append((lexical_record, _encode_record(lexical_record)))
         generation_id = self._generation_id + 1
-        blocks, locations, space_map = self._pack_blocks(base_encoded)
-        root_index = self._build_root_index(locations=locations, space_map=space_map, generation_id=generation_id)
-        root_record = {"kind": "root_index", "value": root_index}
-        records = base_encoded
-        records.append((root_record, _encode_record(root_record)))
-        blocks, locations, space_map = self._pack_blocks(records)
-        root_index = self._build_root_index(locations=locations, space_map=space_map, generation_id=generation_id)
-        root_record = {"kind": "root_index", "value": root_index}
-        root_payload = _encode_record(root_record)
-        if root_payload != records[-1][1]:
-            records[-1] = (root_record, root_payload)
-            blocks, locations, space_map = self._pack_blocks(records)
-        root_location = locations.get("root_index", {}).get("root_index")
-        root_index_offset = self.block_size
-        if root_location:
-            root_index_offset = self.block_size + (int(root_location["block_id"]) * self.block_size) + int(root_location["frame_offset"])
-        self._root_index = root_index
-        self._space_map = space_map
-        lexical_location = root_index.get("lexical_index_location")
-        self._lexical_index_location = dict(lexical_location) if isinstance(lexical_location, dict) and lexical_location else None
+        pages = _CheckpointPages(self.block_size)
+        tmp = self.path.with_name(f"{self.path.name}.tmp")
+        try:
+            with tmp.open("wb") as fh:
+                # The manifest follows the data because it contains the final checksum.
+                fh.seek(self.block_size)
+                self._write_data_pages(fh, self._checkpoint_data_pages(pages))
+                root_index = self._build_root_index(
+                    locations=pages.locations,
+                    space_map=self._build_space_map(chain(pages.used_sizes, (len(pages.body),))),
+                    generation_id=generation_id,
+                )
+                root_record = {"kind": "root_index", "value": root_index}
+                # Root placement affects its own space map. Measure only that suffix.
+                preview = _CheckpointPages(self.block_size, block_id=pages.block_id, body=bytes(pages.body))
+                for _ in preview.append(root_record):
+                    pass
+                root_index["space_map"] = _compact_space_map(
+                    self._build_space_map(chain(pages.used_sizes, preview.used_sizes, (len(preview.body),)))
+                )
+                del preview
+                self._write_data_pages(fh, pages.append(root_record))
+                fh.write(pages.finish_page())
+                root_location = pages.locations["root_index"]["root_index"]
+                root_index_offset = (
+                    self.block_size * (1 + root_location["block_id"]) + root_location["frame_offset"]
+                )
+                manifest = self._build_manifest(
+                    data_checksum=pages.digest.hexdigest(),
+                    data_block_count=pages.block_id,
+                    data_offset=self.block_size,
+                    generation_id=generation_id,
+                    root_index_offset=root_index_offset,
+                )
+                fh.seek(0)
+                fh.write(self._pack_superblock(manifest))
+            self._close_mmap()
+            try:
+                tmp.replace(self.path)
+            except OSError:
+                self._open_mmap()
+                raise
+        except BaseException:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
+            raise
+
+        self._manifest = manifest
+        self._root_index = _root_index_summary(root_index)
+        self._space_map = self._build_space_map(pages.used_sizes)
+        self._node_locations = pages.locations.get("node", {})
+        self._edge_locations = pages.locations.get("edge", {})
+        self._lexical_index_location = pages.locations["lexical_index"]["lexical_index"]
         self._data_offset = self.block_size
-        data_pages = list(self._iter_data_pages(blocks))
-        data_checksum = self._checksum_data_pages(data_pages)
-        self._manifest = self._build_manifest(
-            data_checksum=data_checksum,
-            data_block_count=len(blocks),
-            data_offset=self._data_offset,
-            generation_id=generation_id,
-            root_index_offset=root_index_offset,
-        )
         self._generation_id = generation_id
         self._root_index_offset = root_index_offset
-        superblock = self._pack_superblock(self._manifest)
-        tmp = self.path.with_name(f"{self.path.name}.tmp")
-        self._close_mmap()
-        with tmp.open("wb") as fh:
-            fh.write(superblock)
-            self._write_data_pages(fh, data_pages)
-        tmp.replace(self.path)
-        if self._wal_path.exists():
-            self._wal_path.unlink()
         self._page_cache.clear()
         self._open_mmap()
+        self._wal_path.unlink(missing_ok=True)
         self._pending_wal_records = []
         self._dirty = False
 
-    def _iter_data_pages(self, blocks: Sequence[bytes]) -> Iterator[bytes]:
-        for block_id, body in enumerate(blocks):
-            header = _HEADER_STRUCT.pack(
-                _BLOCK_MAGIC,
-                SCHEMA_VERSION,
-                self.block_size,
-                block_id,
-                len(body),
-                b"\x00" * 12,
-            )
-            yield header + body + (b"\x00" * (self.block_size - _HEADER_SIZE - len(body)))
+    def _checkpoint_data_pages(self, pages: _CheckpointPages) -> Iterator[bytes]:
+        """Encode the graph and its lexical index directly into the checkpoint stream."""
+        for record in self._ordered_records():
+            yield from pages.append(record)
+        yield from pages.append({
+            "kind": "lexical_index",
+            "value": {"id": "lexical_index", "node_terms": self._node_terms},
+        })
 
-    def _checksum_data_pages(self, pages: Sequence[bytes]) -> str:
-        digest = hashlib.sha256()
-        for page in pages:
-            digest.update(page)
-        return digest.hexdigest()
-
-    def _write_data_pages(self, fh: Any, pages: Sequence[bytes]) -> None:
+    def _write_data_pages(self, fh: Any, pages: Iterable[bytes]) -> None:
         for page in pages:
             fh.write(page)
 
@@ -2041,74 +2110,15 @@ class BlockGraphStore:
         for item in self._operation_log:
             yield {"kind": "operation", "value": dict(item)}
 
-    def _encode_records(self, records: Iterable[dict[str, Any]]) -> list[_EncodedRecord]:
-        return [(record, _encode_record(record)) for record in records]
-
-    def _pack_blocks(self, records: Sequence[_EncodedRecord]) -> tuple[list[bytes], dict[str, dict[str, dict[str, int]]], dict[str, Any]]:
-        blocks: list[bytes] = []
-        current = bytearray()
-        locations: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
-        capacity = self.block_size - _HEADER_SIZE
-        max_payload_size = capacity - _FRAME_HEADER.size
-        for record, payload in records:
-            payloads: Iterable[bytes] = (
-                (payload,)
-                if len(payload) <= max_payload_size
-                else _encode_record_parts(payload, max_payload_size=max_payload_size)
-            )
-            first_location: tuple[int, int, int] | None = None
-            total_frame_length = 0
-            for part_payload in payloads:
-                frame = _FRAME_HEADER.pack(len(part_payload)) + part_payload
-                if len(frame) > capacity:
-                    raise StorageError(f"Record is too large for block size {self.block_size}")
-                if current and len(current) + len(frame) > capacity:
-                    blocks.append(bytes(current))
-                    current = bytearray()
-                block_id = len(blocks)
-                frame_offset = _HEADER_SIZE + len(current)
-                current.extend(frame)
-                total_frame_length += len(frame)
-                if first_location is None:
-                    first_location = (block_id, frame_offset, len(frame))
-            if first_location is not None:
-                block_id, frame_offset, frame_length = first_location
-                self._remember_record_location(locations, record, block_id=block_id, frame_offset=frame_offset, frame_length=max(frame_length, total_frame_length))
-        blocks.append(bytes(current))
-        space_map = self._build_space_map(blocks)
-        return blocks, {kind: dict(items) for kind, items in locations.items()}, space_map
-
-    def _remember_record_location(
-        self,
-        locations: dict[str, dict[str, dict[str, int]]],
-        record: dict[str, Any],
-        *,
-        block_id: int,
-        frame_offset: int,
-        frame_length: int,
-    ) -> None:
-        kind = str(record.get("kind", ""))
-        value = record.get("value", {})
-        if not isinstance(value, dict):
-            return
-        record_id = "root_index" if kind == "root_index" else str(value.get("id", ""))
-        if not record_id:
-            return
-        locations[kind][record_id] = {
-            "block_id": block_id,
-            "frame_offset": frame_offset,
-            "frame_length": frame_length,
-        }
-
-    def _build_space_map(self, blocks: Sequence[bytes]) -> dict[str, Any]:
+    def _build_space_map(self, used_sizes: Iterable[int]) -> dict[str, Any]:
         entries = []
         free_lists: dict[str, list[int]] = {"small": [], "medium": [], "large": []}
         total_free = 0
         capacity = self.block_size - _HEADER_SIZE
-        for block_id, body in enumerate(blocks):
-            free = max(0, capacity - len(body))
+        for block_id, used in enumerate(used_sizes):
+            free = max(0, capacity - used)
             total_free += free
-            entries.append({"block_id": block_id, "used": len(body), "free": free})
+            entries.append({"block_id": block_id, "used": used, "free": free})
             if free >= 4096:
                 free_lists["large"].append(block_id)
             elif free >= 1024:
@@ -2125,13 +2135,12 @@ class BlockGraphStore:
     def _build_root_index(
         self,
         *,
-        locations: dict[str, dict[str, dict[str, int]]],
+        locations: dict[str, dict[str, _Location]],
         space_map: dict[str, Any],
         generation_id: int,
     ) -> dict[str, Any]:
-        node_locations = dict(locations.get("node", {}))
-        edge_locations = dict(locations.get("edge", {}))
-        edge_locations.update(locations.get("dense_edge", {}))
+        node_locations = locations.get("node", {})
+        edge_locations = locations.get("edge", {})
         node_keys = sum(1 for node in self._nodes.values() if node.canonical_key)
         edge_patterns = len(self._edges)
         adjacency_nodes = len(self._nodes)
@@ -2165,10 +2174,12 @@ class BlockGraphStore:
         }
 
     def _apply_root_index(self, value: dict[str, Any]) -> None:
-        try:
-            self._loaded_lexical_schema_version = int(value.get("lexical_schema_version", 1) or 1)
-        except (TypeError, ValueError):
-            self._loaded_lexical_schema_version = 1
+        lexical_version = value.get("lexical_schema_version")
+        if type(lexical_version) is not int or lexical_version != LEXICAL_INDEX_SCHEMA_VERSION:
+            raise StorageError(
+                f"Unsupported REQL lexical index schema version {lexical_version!r} for {self.path}; "
+                f"expected {LEXICAL_INDEX_SCHEMA_VERSION}. Rebuild the storage with the current REQL version."
+            )
         version = int(value.get("version", 0) or 0)
         if version != CURRENT_ROOT_INDEX_VERSION:
             raise StorageError(
@@ -2178,7 +2189,7 @@ class BlockGraphStore:
         lexical_location = value.get("lexical_index_location")
         if not isinstance(lexical_location, dict) or not lexical_location:
             raise StorageError(f"REQL root index is missing the required split lexical index for {self.path}")
-        self._root_index = value
+        self._root_index = _root_index_summary(value)
         self._space_map = dict(value.get("space_map", {}))
         locations = dict(value.get("record_locations", {}))
         self._node_locations = {
@@ -2221,12 +2232,21 @@ class BlockGraphStore:
                 raise StorageError(f"REQL lexical index record was not found for {self.path}")
             raw_terms = dict(record.get("value", {})).get("node_terms", {})
         node_terms: dict[str, dict[str, float]] = defaultdict(dict)
+        node_term_index: dict[str, set[str]] = defaultdict(set)
         if isinstance(raw_terms, dict):
+            # The JSON decoder owns these dictionaries and gives them string
+            # keys. Adopt the postings instead of copying every entry at once.
             for term, postings in raw_terms.items():
                 if isinstance(postings, dict):
-                    node_terms[str(term)] = {str(node_id): float(weight) for node_id, weight in postings.items()}
-        self._node_terms = defaultdict(dict, node_terms)
-        self._node_term_index = self._build_node_term_index()
+                    for node_id, weight in postings.items():
+                        if not isinstance(weight, float):
+                            postings[node_id] = float(weight)
+                        node_term_index[node_id].add(term)
+                    node_terms[term] = postings
+        # Publish both directions only after conversion succeeds, then reconcile
+        # the existing deferred overlay against that same consistent snapshot.
+        self._node_terms = node_terms
+        self._node_term_index = dict(node_term_index)
         self._lexical_index_loaded = True
         for old, new in self._deferred_lexical_changes.values():
             if old is not None:
@@ -2234,25 +2254,9 @@ class BlockGraphStore:
             if new is not None:
                 self._reindex_node_terms(new)
         self._deferred_lexical_changes = {}
-        loaded_version = getattr(self, "_loaded_lexical_schema_version", LEXICAL_INDEX_SCHEMA_VERSION)
-        if loaded_version < LEXICAL_INDEX_SCHEMA_VERSION:
-            # Rebuild old head-only postings from all records, including cold nodes.
-            self._materialize_all_records()
-            self._rebuild_lexical_index()
-            self._loaded_lexical_schema_version = LEXICAL_INDEX_SCHEMA_VERSION
-            if not self.read_only:
-                self._dirty = True
 
-    def _rebuild_lexical_index(self) -> None:
-        self._node_terms = defaultdict(dict)
-        self._node_term_index = {}
-        self._node_lexical_fingerprints = {}
-        self._deferred_lexical_changes = {}
-        self._lexical_index_loaded = True
-        for node in self._nodes.values():
-            self._reindex_node_terms(node)
-
-    def _rebuild_indexes(self) -> None:
+    def _rebuild_indexes(self, *, lexical: bool = True) -> None:
+        """Rebuild structural indexes, retaining a deferred lexical snapshot when requested."""
         self._node_key_index = {}
         self._edge_pattern_index = {}
         self._out_edges = defaultdict(set)
@@ -2260,22 +2264,18 @@ class BlockGraphStore:
         self._node_terms = defaultdict(dict)
         self._node_term_index = {}
         self._node_lexical_fingerprints = {}
+        self._lexical_index_loaded = lexical
         self._node_type_index = defaultdict(set)
         self._node_status_index = defaultdict(set)
         self._edge_type_index = defaultdict(set)
         self._node_property_index = defaultdict(set)
         self._edge_property_index = defaultdict(set)
         for node in self._nodes.values():
-            self._index_node(node)
+            self._index_node_structural(node)
+            if lexical:
+                self._reindex_node_terms(node)
         for edge in self._edges.values():
             self._index_edge(edge)
-
-    def _build_node_term_index(self) -> dict[str, set[str]]:
-        node_term_index: dict[str, set[str]] = defaultdict(set)
-        for term, postings in self._node_terms.items():
-            for node_id in postings:
-                node_term_index[node_id].add(term)
-        return dict(node_term_index)
 
     def _replace_node(self, node: MemoryNode) -> None:
         self._journal_node_before_change(node.id)
@@ -2324,10 +2324,6 @@ class BlockGraphStore:
         if old:
             self._remove_edge_indexes(old)
         self._edge_locations.pop(edge_id, None)
-
-    def _index_node(self, node: MemoryNode) -> None:
-        self._index_node_structural(node)
-        self._reindex_node_terms(node)
 
     def _index_node_structural(self, node: MemoryNode) -> None:
         if node.canonical_key:
@@ -2875,7 +2871,7 @@ class BlockGraphStore:
             if edge_types and edge.type not in edge_types:
                 continue
             candidates.append(edge)
-        candidates.sort(key=lambda item: item.weight, reverse=True)
+        candidates.sort(key=lambda item: (-item.weight, item.id))
         results: list[tuple[MemoryEdge, MemoryNode]] = []
         for edge in candidates[:limit]:
             other_id = edge.to_id if outgoing else edge.from_id
@@ -3141,6 +3137,10 @@ class BlockGraphStore:
             and self._project_matches(edge.properties, project_id, include_global_project)
         )
 
+    def edge_type_counts(self) -> dict[str, int]:
+        """Expose structural edge types without loading graph records or lexical postings."""
+        return {edge_type: len(ids) for (edge_type,), ids in sorted(self._edge_type_index.items()) if ids}
+
     def node_type_counts(
         self,
         *,
@@ -3177,7 +3177,9 @@ class BlockGraphStore:
         ignored_edge_types: set[str] | None = None,
         project_id: str | None = None,
         include_global_project: bool = True,
+        clone: bool = True,
     ) -> list[tuple[MemoryNode, int, float]]:
+        """Rank stored nodes and copy only the returned rows at the public boundary."""
         if limit is not None and limit <= 0:
             return []
         rows: list[tuple[MemoryNode, int, float]] = []
@@ -3205,9 +3207,10 @@ class BlockGraphStore:
                     continue
                 degree += 1
                 weighted += edge.weight * edge.confidence
-            rows.append((self._clone_node(node), degree, weighted))
+            rows.append((node, degree, weighted))
         rows.sort(key=lambda item: (item[1], item[2], item[0].salience, item[0].updated_at), reverse=True)
-        return rows if limit is None else rows[:limit]
+        selected = rows if limit is None else rows[:limit]
+        return [(self._clone_node(node) if clone else node, degree, weighted) for node, degree, weighted in selected]
 
     @staticmethod
     def _project_matches(properties: dict[str, Any], project_id: str | None, include_global_project: bool) -> bool:

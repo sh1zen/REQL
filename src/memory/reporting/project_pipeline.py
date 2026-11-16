@@ -345,21 +345,66 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
         if (!stages.has(stage)) stages.set(stage,[]);
         stages.get(stage).push(node);
       });
-      const positions=new Map();
-      let cursorX=0;
-      [...stages.keys()].sort((left,right) => left-right).forEach(stage => {
-        const nodes=stages.get(stage).sort((left,right) =>
+      if (!stages.size) return [];
+      const orderedStages = [...stages.entries()].sort(([left], [right]) => left - right);
+      const rowSpacing = 88;
+      const columnSpacing = 250;
+      const stageSpacing = 150;
+      const bandSpacing = 120;
+      const targetAspect = 1.75;
+      const largestStage = orderedStages.reduce((largest, [, nodes]) => Math.max(largest, nodes.length), 0);
+      const stripWidth = rows => orderedStages.reduce(
+        (width, [, nodes]) => width + Math.ceil(nodes.length / rows) * columnSpacing,
+        (orderedStages.length - 1) * stageSpacing,
+      );
+
+      // Increase column capacity until the footprint is balanced or each stage fits one column.
+      let rowLimit = Math.min(10, largestStage);
+      let upperLimit = largestStage;
+      while (rowLimit < upperLimit) {
+        const rows = Math.floor((rowLimit + upperLimit) / 2);
+        if (stripWidth(rows) <= rows * rowSpacing * targetAspect) upperLimit = rows;
+        else rowLimit = rows + 1;
+      }
+
+      const columns = [];
+      orderedStages.forEach(([stage, nodes]) => {
+        nodes.sort((left, right) =>
           left.kind.localeCompare(right.kind) || left.label.localeCompare(right.label) || left.id.localeCompare(right.id));
-        const rowsPerColumn=10;
-        const columnCount=Math.max(1,Math.ceil(nodes.length/rowsPerColumn));
-        nodes.forEach((node,index) => {
-          const column=Math.floor(index/rowsPerColumn);
-          const row=index%rowsPerColumn;
-          const rowsInColumn=Math.min(rowsPerColumn,nodes.length-column*rowsPerColumn);
-          positions.set(node.id,{x:cursorX+column*250,y:(row-(rowsInColumn-1)/2)*88});
-        });
-        cursorX+=columnCount*250+150;
+        for (let start = 0; start < nodes.length; start += rowLimit) {
+          columns.push({stage, nodes:nodes.slice(start, start + rowLimit)});
+        }
       });
+
+      const width = stripWidth(rowLimit);
+      const bandHeight = rowLimit * rowSpacing + bandSpacing;
+      const bandCount = columns.length > 7 && width > 2.75 * bandHeight
+        ? Math.min(Math.ceil(columns.length / 4), Math.ceil(Math.sqrt(width / (targetAspect * bandHeight))))
+        : 1;
+
+      // Fold long strips back at their ends so consecutive columns stay adjacent.
+      const positions = new Map();
+      let firstColumn = 0;
+      let x = 0;
+      let top = 0;
+      for (let band = 0; band < bandCount; band += 1) {
+        const count = Math.ceil((columns.length - firstColumn) / (bandCount - band));
+        const bandColumns = columns.slice(firstColumn, firstColumn + count);
+        const height = bandColumns.reduce((tallest, {nodes}) => Math.max(tallest, nodes.length * rowSpacing), 0);
+        const direction = band % 2 ? -1 : 1;
+        bandColumns.forEach(({stage, nodes}, index) => {
+          if (index) {
+            const gap = stage === bandColumns[index - 1].stage ? columnSpacing : columnSpacing + stageSpacing;
+            x += direction * gap;
+          }
+          nodes.forEach((node, row) => {
+            const y = top + height / 2 + (row - (nodes.length - 1) / 2) * rowSpacing;
+            positions.set(node.id, {x, y});
+          });
+        });
+        firstColumn += count;
+        top += height + bandSpacing;
+      }
       return visibleNodes.map(node => ({...node,...positions.get(node.id),physics:false}));
     }
     function denseGraphFocus(visibleNodes,visibleEdges) {

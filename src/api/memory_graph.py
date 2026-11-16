@@ -1,8 +1,9 @@
 """Application facade for the graph-native memory layer."""
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator, TypeVar
+from typing import Any, TypeVar
 
 from memory.config import REQLConfig, default_config
 from memory.diagnostics import PerformanceLogger
@@ -30,16 +31,20 @@ from memory.reporting.html_graph import write_graph_html
 from memory.reporting.project_report import ProjectReportFiles, ProjectReportGenerator
 from memory.analysis.communities import CommunityResult
 from memory.analysis.hubs import HubReport
+from memory.artifacts.models import ScanError, ScanResult
 from memory.artifacts.project import ProjectRegistry
 from memory.artifacts.revision import ProjectRevision, RevisionRepository
+from memory.artifacts.scanner import ProjectScanner
 from memory.artifacts.fingerprint import normalize_relative_lookup_path
-from memory.artifacts.options import CompilationOptions, RawCompilationOptions
+from memory.artifacts.options import CompilationOptions
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
-from memory.services.project_watch import ProjectWatchEvent, ProjectWatchService
 from memory.services.query_context import QueryContextService
+from memory.services.coordination import CoordinationStore
+from memory.services.failure_context import FailureContextService
 from memory.services.retrieval import RetrievalEngine
 from memory.explanation import RepositoryExplanation, RepositoryExplanationService
 from memory.pipeline import ProjectPipeline, ProjectPipelineService
+from memory.testing import TestAssociation, TestIntelligenceService
 
 
 MemoryGraphT = TypeVar("MemoryGraphT", bound="MemoryGraph")
@@ -54,6 +59,31 @@ def _ensure_readable_storage_payload(path: Path) -> None:
         raise StorageError(f"Cannot inspect REQL storage at {path}: {exc}") from exc
     if not has_store_payload and not has_wal_payload:
         raise StorageError(f"Cannot open missing REQL storage in read-only mode: {path}")
+
+
+def _scan_workspace(
+    root: Path, revision: ProjectRevision | None, scanner: ProjectScanner | None,
+) -> tuple[dict[str, Any], ScanResult | None]:
+    """Compare a complete live scan with a revision and retain it for further checks."""
+    workspace: dict[str, Any] = {
+        "freshness": "unknown", "source_revision": revision.id if revision else None, "changes": [], "errors": [],
+    }
+    if scanner is None:
+        return workspace, None
+
+    try:
+        scan = scanner.scan(root)
+    except OSError as exc:
+        workspace["errors"] = [ScanError(str(root), "", str(exc)).to_dict()]
+        return workspace, None
+    if scan.errors:
+        workspace["errors"] = [error.to_dict() for error in scan.errors]
+        return workspace, None
+    if revision is not None:
+        changes = revision.compare(scan.artifacts)
+        workspace["freshness"] = "stale" if changes else "current"
+        workspace["changes"] = [change.to_dict() for change in changes]
+    return workspace, scan
 
 
 class MemoryGraph:
@@ -83,6 +113,7 @@ class MemoryGraph:
         self.salience = SalienceEngine(store)
         self.project_reporter = ProjectReportGenerator(store)
         self.projects = ProjectRegistry(store)
+        self.test_intelligence = TestIntelligenceService(store)
         self.revisions = RevisionRepository(store)
         self.repository_explainer = RepositoryExplanationService(store)
         self.project_pipeline_service = ProjectPipelineService(store)
@@ -92,7 +123,6 @@ class MemoryGraph:
             retention_commits=self.config.retention.commits,
             profile_logger=profile_logger,
         )
-        self.project_watcher = ProjectWatchService(self.incremental)
         from memory.analysis.communities import CommunityDetector
         from memory.analysis.hubs import HubAnalyzer
 
@@ -249,6 +279,8 @@ class MemoryGraph:
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        include_source: bool = False,
+        task_id: str | None = None,
     ) -> str:
         """Return the compact deterministic context block for a query."""
         result = self.query_context_result(
@@ -260,6 +292,8 @@ class MemoryGraph:
                 max_depth=max_depth,
                 max_items=max_items,
                 include_archived=include_archived,
+                include_source=include_source,
+                task_id=task_id,
             )
         )
         return self.query_context_service.render(result)
@@ -280,6 +314,8 @@ class MemoryGraph:
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        include_source: bool = False,
+        task_id: str | None = None,
     ) -> dict[str, Any]:
         """Return the versioned structured query-context envelope."""
         return self.query_context_result(
@@ -291,6 +327,8 @@ class MemoryGraph:
                 max_depth=max_depth,
                 max_items=max_items,
                 include_archived=include_archived,
+                include_source=include_source,
+                task_id=task_id,
             )
         ).to_dict()
 
@@ -380,8 +418,70 @@ class MemoryGraph:
                 return execute_reql(self, statement)
         return execute_reql(self, statement)
 
-    def project_status(self, path: str | Path) -> dict[str, Any] | None:
-        return self.projects.project_status(path)
+    def project_status(self, path: str | Path, *, config_path: Path | None = None) -> dict[str, Any] | None:
+        """Report compilation history and compare the live source with its revision."""
+        status = self.projects.project_status(path)
+        if status is not None:
+            status["workspace"] = self.workspace_status(path, config_path=config_path)
+        return status
+
+    def project_diagnostics(
+        self, path: str | Path, *, config_path: Path | None = None, max_file_size_mb: float | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, object] | None]:
+        """Read compilation, source freshness, and cache status using one live scan."""
+        root = Path(path).expanduser().resolve()
+        project = self.projects.project_status(root)
+        revision = self.revisions.latest(project["project"]["id"]) if project else None
+        scan_config = self.config.scan
+        if max_file_size_mb is not None:
+            scan_config = replace(scan_config, max_file_size_mb=max_file_size_mb)
+        scanner = ProjectScanner.from_config(scan_config, config_path=config_path)
+        workspace, scan = _scan_workspace(root, revision, scanner)
+        cache = (
+            self.incremental.cache_status_for_scan(scan, cache_enabled=self.config.cache.enabled)
+            if scan is not None else None
+        )
+        return project, workspace, cache
+
+    def list_workspaces(self) -> list[dict[str, str | None]]:
+        """List registered project roots and their head revisions without scanning source."""
+        workspaces = []
+        for project in self.store.find_nodes_by_types(("Project",), clone=False):
+            root = project.properties.get("root_path")
+            if isinstance(root, str) and root:
+                workspaces.append({
+                    "project_id": project.id,
+                    "root_path": root,
+                    "name": project.label,
+                    "source_revision": self.revisions.latest_id(project.id),
+                })
+        return sorted(workspaces, key=lambda workspace: workspace["root_path"] or "")
+
+    def workspace_status(self, path: str | Path = ".", *, config_path: Path | None = None) -> dict[str, Any]:
+        """Compare this folder with the latest committed REQL manifest."""
+        root = Path(path).expanduser().resolve()
+        project = self.store.get_node_by_key("Project", root.as_posix())
+        latest = self.revisions.latest(project.id) if project else None
+        scanner = ProjectScanner.from_config(self.config.scan, config_path=config_path) if latest else None
+        workspace, _ = _scan_workspace(root, latest, scanner)
+        return workspace
+
+    def find_tests_for(self, *, symbol_id: str | None = None, file: str | None = None,
+                       include_candidates: bool = False, limit: int = 20) -> list[TestAssociation]:
+        """Find runtime and static test evidence for a symbol or relative file."""
+        return self.test_intelligence.find(symbol_id=symbol_id, file=file,
+                                           include_candidates=include_candidates, limit=limit)
+
+    def failure_context(self, query: str = "", *, files: list[str] | None = None,
+                        symbol_ids: list[str] | None = None, record_id: str | None = None,
+                        workstream: str | None = None, limit: int = 5) -> dict[str, Any]:
+        """Recover scoped failure records from the associated engineering store."""
+        storage = getattr(self.store, "path", None)
+        if storage is None:
+            raise ValueError("Failure context requires a persistent engineering store")
+        work = CoordinationStore(Path(storage).with_name("agent-dashboard.reql"))
+        return FailureContextService(work, self.store).context(query, files=files, symbol_ids=symbol_ids,
+                                                               record_id=record_id, workstream=workstream, limit=limit)
 
     def explain_project(
         self,
@@ -438,7 +538,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         return self.incremental.compile_path(
             path,
@@ -460,62 +560,10 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         """Incrementally update a project through the compile pipeline."""
         return self.compile_project(
-            path,
-
-            max_file_size_bytes=max_file_size_bytes,
-            include_patterns=include_patterns,
-            exclude_patterns=exclude_patterns,
-            config_path=config_path,
-            cache_enabled=cache_enabled,
-            parsing_options=parsing_options,
-        )
-
-    def watch_project(
-        self,
-        path: str | Path,
-        *,
-        max_file_size_bytes: int = 10 * 1024 * 1024,
-        include_patterns: list[str] | None = None,
-        exclude_patterns: list[str] | None = None,
-        config_path: str | Path | None = None,
-        cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
-        interval_seconds: float = 0.5,
-        debounce_seconds: float = 0.1,
-        max_iterations: int | None = None,
-    ) -> Iterator[ProjectWatchEvent]:
-        """Yield project watch events and compile dirty files automatically."""
-        return self.project_watcher.watch_path(
-            path,
-
-            max_file_size_bytes=max_file_size_bytes,
-            include_patterns=include_patterns,
-            exclude_patterns=exclude_patterns,
-            config_path=config_path,
-            cache_enabled=cache_enabled,
-            parsing_options=parsing_options,
-            interval_seconds=interval_seconds,
-            debounce_seconds=debounce_seconds,
-            max_iterations=max_iterations,
-        )
-
-    def watch_project_once(
-        self,
-        path: str | Path,
-        *,
-        max_file_size_bytes: int = 10 * 1024 * 1024,
-        include_patterns: list[str] | None = None,
-        exclude_patterns: list[str] | None = None,
-        config_path: str | Path | None = None,
-        cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
-    ) -> ProjectWatchEvent:
-        """Poll once and compile dirty project artifacts when needed."""
-        return self.project_watcher.poll_once(
             path,
 
             max_file_size_bytes=max_file_size_bytes,
@@ -535,7 +583,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> dict[str, object]:
         return self.incremental.cache_status(
             path,
@@ -623,133 +671,3 @@ class MemoryGraph:
                 }
             )
         return {"query": path, "normalized_path": normalized, "matches": rows}
-
-    def inspect_node(
-        self,
-        node_id: str,
-        *,
-        limit: int = 30,
-    ) -> dict[str, Any]:
-        """Return a node, its local graph context, and source/location hints."""
-        node = self.store.get_node(node_id)
-        if node is None:
-            return {"id": node_id, "found": False, "node": None, "location": None, "sources": [], "neighbors": [], "outgoing": [], "incoming": []}
-
-        limit = max(1, int(limit))
-        outgoing = self.store.get_edges(from_id=node_id, limit=limit)
-        incoming = self.store.get_edges(to_id=node_id, limit=limit)
-        adjacent_ids = {edge.to_id for edge in outgoing}
-        adjacent_ids.update(edge.from_id for edge in incoming)
-        adjacent = {item.id: item for item in self.store.get_nodes(sorted(adjacent_ids))}
-        sources = self._inspect_sources(node, outgoing, incoming, adjacent)
-        neighbors = [
-            self._inspect_neighbor_payload(edge, adjacent.get(edge.to_id), direction="outgoing")
-            for edge in outgoing
-        ]
-        neighbors.extend(
-            self._inspect_neighbor_payload(edge, adjacent.get(edge.from_id), direction="incoming")
-            for edge in incoming
-        )
-        return {
-            "id": node_id,
-            "found": True,
-            "node": node.to_dict(),
-            "location": self._location_payload(node),
-            "sources": sources,
-            "neighbors": neighbors,
-            "outgoing": [edge.to_dict() for edge in outgoing],
-            "incoming": [edge.to_dict() for edge in incoming],
-        }
-
-    def _inspect_sources(
-        self,
-        node: MemoryNode,
-        outgoing: list[MemoryEdge],
-        incoming: list[MemoryEdge],
-        adjacent: dict[str, MemoryNode],
-    ) -> list[dict[str, Any]]:
-        sources: dict[str, dict[str, Any]] = {}
-        for item in (node, *adjacent.values()):
-            location = self._location_payload(item)
-            if location is None:
-                continue
-            key = str(location.get("artifact_id") or location.get("path") or location.get("relative_path") or item.id)
-            sources.setdefault(
-                key,
-                {
-                    "node_id": item.id,
-                    "node_type": item.type,
-                    "label": item.label,
-                    "location": location,
-                    "via_edges": [],
-                },
-            )
-        for edge in [*outgoing, *incoming]:
-            location = self._location_payload(edge)
-            if location is None:
-                continue
-            key = str(location.get("artifact_id") or location.get("path") or location.get("relative_path") or edge.id)
-            sources.setdefault(
-                key,
-                {
-                    "node_id": None,
-                    "node_type": None,
-                    "label": location.get("relative_path") or location.get("path"),
-                    "location": location,
-                    "via_edges": [],
-                },
-            )
-            sources[key]["via_edges"].append(edge.id)
-        return list(sources.values())
-
-    def _inspect_neighbor_payload(
-        self,
-        edge: MemoryEdge,
-        other: MemoryNode | None,
-        *,
-        direction: str,
-    ) -> dict[str, Any]:
-        return {
-            "edge_id": edge.id,
-            "edge_type": edge.type,
-            "direction": direction,
-            "from_id": edge.from_id,
-            "to_id": edge.to_id,
-            "other_id": edge.to_id if direction == "outgoing" else edge.from_id,
-            "other_type": other.type if other is not None else None,
-            "other_label": (other.label or other.text or other.canonical_key or other.id) if other is not None else None,
-            "weight": edge.weight,
-            "confidence": edge.confidence,
-            "location": self._location_payload(edge),
-        }
-
-    @staticmethod
-    def _location_payload(item: MemoryNode | MemoryEdge) -> dict[str, Any] | None:
-        props = dict(item.properties)
-        metadata = props.get("metadata")
-        if isinstance(metadata, dict):
-            for key in ("source_path", "path", "relative_path", "source_file", "source_url", "url"):
-                if key not in props and metadata.get(key) is not None:
-                    props[key] = metadata.get(key)
-            for key in ("line_start", "start_line", "line_end", "end_line"):
-                if key not in props and metadata.get(key) is not None:
-                    props[key] = metadata.get(key)
-        path = props.get("path") or props.get("source_path")
-        relative_path = props.get("relative_path") or props.get("source_file")
-        source_url = props.get("source_url") or props.get("url")
-        line_start = props.get("line_start", props.get("start_line"))
-        line_end = props.get("line_end", props.get("end_line"))
-        section = props.get("section_path") or props.get("section")
-        artifact_id = props.get("artifact_id")
-        if not any(value is not None and value != "" for value in (path, relative_path, source_url, line_start, line_end, section, artifact_id)):
-            return None
-        return {
-            "path": path,
-            "relative_path": relative_path,
-            "source_url": source_url,
-            "line_start": line_start,
-            "line_end": line_end,
-            "section": section,
-            "artifact_id": artifact_id,
-        }
-

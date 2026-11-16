@@ -16,27 +16,23 @@ class AgentCommandProgress:
         self,
         label: str,
         *,
-        enabled: bool = True,
         initial_delay_seconds: float = 2.0,
         interval_seconds: float = 5.0,
         late_threshold_seconds: float = 8.0,
         stream: TextIO | None = None,
     ) -> None:
         self.label = label
-        self.enabled = enabled
         self.initial_delay_seconds = max(0.0, initial_delay_seconds)
         self.interval_seconds = max(0.01, interval_seconds)
         self.late_threshold_seconds = max(0.0, late_threshold_seconds)
         self.stream = stream
         self._started_at = 0.0
         self._done = threading.Event()
+        self._reported = False
         self._thread: threading.Thread | None = None
 
     def __enter__(self) -> "AgentCommandProgress":
         self._started_at = time.perf_counter()
-        if not self.enabled:
-            return self
-        self._write("started")
         self._thread = threading.Thread(target=self._report_while_running, name="reql-agent-progress", daemon=True)
         self._thread.start()
         return self
@@ -52,22 +48,27 @@ class AgentCommandProgress:
         self._done.set()
         if self._thread is not None:
             self._thread.join(timeout=0.2)
-        if self.enabled:
-            if exc_type is None:
-                suffix = " (late completion; result is final)" if elapsed >= self.late_threshold_seconds else ""
-                self._write(f"completed in {elapsed:.1f}s{suffix}")
-            else:
-                self._write(f"failed after {elapsed:.1f}s; no successful completion was reported")
+        if not self._reported:
+            return False
+        if exc_type is None:
+            suffix = " (late completion; result is final)" if elapsed >= self.late_threshold_seconds else ""
+            self._write(f"completed in {elapsed:.1f}s{suffix}")
+        else:
+            self._write(f"failed after {elapsed:.1f}s; no successful completion was reported")
         return False
 
     def _report_while_running(self) -> None:
+        """Report liveness with decreasing frequency while the same process works."""
         if self._done.wait(self.initial_delay_seconds):
             return
+        interval = self.interval_seconds
         while not self._done.is_set():
             elapsed = max(0.0, time.perf_counter() - self._started_at)
-            self._write(f"still running after {elapsed:.1f}s; waiting for workspace storage or locks")
-            if self._done.wait(self.interval_seconds):
+            self._reported = True
+            self._write(f"still running after {elapsed:.1f}s; wait on this process")
+            if self._done.wait(interval):
                 return
+            interval = max(self.interval_seconds, min(60.0, interval * 2.0))
 
     def _write(self, message: str) -> None:
         stream = self.stream or sys.stderr
@@ -77,10 +78,9 @@ class AgentCommandProgress:
 class ProgressingAgentWorkspace:
     """Wrap one CLI workspace call in a progress lifecycle."""
 
-    def __init__(self, workspace: Any, *, label: str, enabled: bool = True) -> None:
+    def __init__(self, workspace: Any, *, label: str) -> None:
         self._workspace = workspace
         self._label = label
-        self._enabled = enabled
 
     def __getattr__(self, name: str) -> Any:
         target = getattr(self._workspace, name)
@@ -89,7 +89,7 @@ class ProgressingAgentWorkspace:
 
         @wraps(target)
         def invoke(*args: Any, **kwargs: Any) -> Any:
-            with AgentCommandProgress(self._label, enabled=self._enabled):
+            with AgentCommandProgress(self._label):
                 return target(*args, **kwargs)
 
         return invoke

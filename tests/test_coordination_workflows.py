@@ -2,19 +2,25 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from threading import Barrier
 import unittest
+from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.agent import AgentWorkspace
+from memory.cli import main
 from memory.config import default_config, merge_config
 from memory.domain.models import MemoryNode
 from memory.services.coordination import CoordinationStore, MAX_REVISIONS, render_work_context
-from mcp.tools import query_context as mcp_context
+from mcp.tools import call_tool, list_tools, query_context as mcp_context
 
 
 class CoordinationWorkflowTests(unittest.TestCase):
@@ -39,6 +45,252 @@ class CoordinationWorkflowTests(unittest.TestCase):
         """Reconcile an observed revision, as a resumed coding agent would."""
         return agent.record(item["kind"], item["content"], record_id=item["id"],
                             expected_revision=item["revision"], **fields)["node"]
+
+    def _claim_cli(self, task_id: str, query: str | None = None, *, as_json: bool = True) -> tuple[int, str]:
+        """Run the public assignment command from the fixture project."""
+        previous = Path.cwd()
+        output = StringIO()
+        try:
+            os.chdir(self.root)
+            with redirect_stdout(output), redirect_stderr(StringIO()):
+                args = ["agent", "--agent", "agent:worker", "--activity", "worker", "init", "--task", task_id]
+                if query is not None:
+                    args.append(f"--query={query}")
+                code = main([*args, "--json"] if as_json else args)
+        finally:
+            os.chdir(previous)
+        return code, output.getvalue()
+
+    def test_next_prefers_disjoint_work_then_reports_an_overlap(self) -> None:
+        """Keep assignments flowing and report shared files without turning them into locks."""
+        author = {"agent_id": "agent:planner", "session_id": "session:plan"}
+        active = self.work.put("task", "Existing checkout edit", status="in_progress",
+                               files=["shared.py"], **author)["node"]
+        shared = self.work.put("task", "Follow-on shared edit", files=["shared.py"],
+                               importance=3, workstream="changes", **author)["node"]
+        free = self.work.put("task", "Independent edit", files=["free.py"],
+                             importance=1, workstream="changes", **author)["node"]
+        blocked = self.work.put("task", "Run after the independent edit", depends_on=[free["id"]],
+                                importance=3, workstream="changes", **author)["node"]
+        worker = {"agent_id": "agent:a", "session_id": "session:a", "workstream": "changes"}
+        first = self.work.claim_next(**worker)
+        self.assertEqual(first["claimed_task"]["id"], free["id"])
+        again = self.work.claim_next(**worker)
+        self.assertEqual(again["status"], "resumed")
+        self.assertEqual(again["claimed_task"], first["claimed_task"])
+
+        args = {"storage_path": str(self.storage), "agent_id": "agent:b", "session_id": "session:b",
+                "workstream": "changes"}
+        self.assertNotIn("reql_work_claim_next", {tool["name"] for tool in list_tools(include_write=False)})
+        second = call_tool("reql_work_claim_next", args)
+        self.assertEqual(second["claimed_task"]["id"], shared["id"])
+        self.assertEqual(second["file_overlaps"]["files"],
+                         [{"path": "shared.py", "tasks": [active["id"]], "omitted": 0}])
+        waiting = self.work.claim_next(agent_id="agent:c", session_id="session:c", workstream="changes")
+        self.assertEqual(waiting["status"], "blocked")
+        self.assertEqual(waiting["blockers"][0]["id"], blocked["id"])
+        self.assertEqual(waiting["blockers"][0]["waiting_on"], [free["id"]])
+
+    def test_concurrent_next_claims_distinct_tasks_and_retries_are_idempotent(self) -> None:
+        """Share the on-disk queue between independently initialized agent activities."""
+        planner = self.agent("planner")
+        tasks = {planner.add_task(f"Implement independent change {index}")["node"]["id"] for index in range(2)}
+        barrier = Barrier(2, timeout=10)
+
+        def claim(index: int) -> tuple[dict, dict]:
+            workspace = AgentWorkspace(self.storage, agent_id=f"agent:worker{index}", activity_id=f"worker{index}")
+            barrier.wait()
+            first = workspace.init(next_task=True)
+            return first, workspace.init(next_task=True)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(claim, range(2)))
+        self.assertEqual({first["claimed_task"]["id"] for first, _ in outcomes}, tasks)
+        for first, resumed in outcomes:
+            self.assertEqual(first["assignment_status"], "claimed")
+            self.assertEqual(resumed["assignment_status"], "resumed")
+            self.assertEqual(first["claimed_task"]["revision"], resumed["claimed_task"]["revision"])
+
+    def test_cli_processes_share_the_queue_without_duplicate_claims(self) -> None:
+        """Claim and resume work from two CLI processes sharing on-disk state."""
+        planner = self.agent("planner")
+        tasks = {}
+        for symbol in ("calculate_total", "parse_invoice"):
+            path = f"{symbol}.py"
+            (self.root / path).write_text(f"def {symbol}():\n    return 1\n", encoding="utf-8")
+            tasks[planner.add_task(symbol, files=[path])["node"]["id"]] = path
+        graph = MemoryGraph.open(self.storage)
+        try:
+            self.assertFalse(graph.compile_project(self.root).run.errors)
+        finally:
+            graph.close()
+
+        launcher = Path(__file__).resolve().parents[1] / "cli.py"
+        barrier = Barrier(2, timeout=10)
+
+        def worker(index: int) -> tuple[dict, dict]:
+            command = [sys.executable, str(launcher), "agent", "--agent", f"agent:worker{index}",
+                       "--activity", f"worker{index}", "init", "--next", "--json"]
+            barrier.wait()
+            outcomes = []
+            for _ in range(2):
+                result = subprocess.run(command, cwd=self.root, capture_output=True, encoding="utf-8", timeout=40)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                outcomes.append(json.loads(result.stdout))
+            return outcomes[0], outcomes[1]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            workers = list(executor.map(worker, range(2)))
+        self.assertEqual({claimed["claimed_task"]["id"] for claimed, _ in workers}, tasks.keys())
+        for claimed, resumed in workers:
+            task = claimed["claimed_task"]
+            source = claimed["source_context"]["payload"]
+            self.assertIn(tasks[task["id"]], {row["path"] for row in source["snippets"]})
+            self.assertEqual(claimed["assignment_status"], "claimed")
+            self.assertEqual(resumed["assignment_status"], "resumed")
+            self.assertEqual(resumed["claimed_task"], task)
+            self.assertEqual(claimed["file_overlaps"]["files"], [])
+
+    def test_explicit_claim_reports_overlaps_without_a_source_lookup(self) -> None:
+        """Return shared evidence and file scopes even when the graph has not been built."""
+        planner = self.agent("planner")
+        active = planner.add_task("Existing edit", status="in_progress", files=["shared.py"])["node"]
+        pending = planner.add_task("Follow-up edit", files=["shared.py"], next_action="Check affected callers")["node"]
+
+        code, output = self._claim_cli(pending["id"])
+        self.assertEqual(code, 0, output)
+        result = json.loads(output)
+        self.assertEqual(result["claimed_task"]["revision"], 2)
+        self.assertEqual(result["work_context"]["records"][0]["next_action"], "Check affected callers")
+        self.assertEqual(result["file_overlaps"]["files"],
+                         [{"path": "shared.py", "tasks": [active["id"]], "omitted": 0}])
+
+        code, output = self._claim_cli(pending["id"], as_json=False)
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"Resumed task: {pending['id']}\tr2", output)
+        self.assertIn("Coordinate edits with their owners", output)
+        self.assertIn(active["id"], output)
+
+    def test_next_cli_returns_scoped_code_in_the_claim_response(self) -> None:
+        """Use the saved title to recover source without another discovery command."""
+        (self.root / "invoice.py").write_text("def calculate_invoice_total():\n    return 7\n", encoding="utf-8")
+        graph = MemoryGraph.open(self.storage)
+        try:
+            self.assertFalse(graph.compile_project(self.root).run.errors)
+        finally:
+            graph.close()
+        task = self.agent("planner").add_task("calculate_invoice_total", files=["invoice.py"])["node"]
+        args = ["agent", "--agent", "agent:worker", "--activity", "next", "init", "--next"]
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(main(args), 0)
+            text = output.getvalue()
+        finally:
+            os.chdir(previous)
+        self.assertIn(f"Claimed task: {task['id']}\tr2", text)
+        self.assertEqual(text.count("## Engineering context"), 1)
+        self.assertIn("return 7", text)
+
+    def test_next_cli_recovers_a_claim_when_the_graph_is_unavailable(self) -> None:
+        """A source failure leaves the new claim usable by ID and revision."""
+        task = self.agent("planner").add_task("Update invoice totals", files=["invoice.py"])["node"]
+        args = ["agent", "--agent", "agent:worker", "--activity", "next", "init", "--next", "--json"]
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(main(args), 2)
+            result = json.loads(output.getvalue())
+        finally:
+            os.chdir(previous)
+        self.assertEqual(result["claimed_task"]["revision"], 2)
+        self.assertEqual(self.work.show(task["id"])["status"], "in_progress")
+        self.assertTrue(result["source_context_retry"].startswith(f"reql query_context --task {task['id']} "))
+        self.assertEqual(result["work_context"]["records"][0]["id"], task["id"])
+
+    def test_claim_with_source_recovers_work_once_and_preserves_revision_guards(self) -> None:
+        """Claim through the public CLI and recover linked failure and current source together."""
+        planner = self.agent("planner")
+        failure = planner.record("failure", "Avoid truncating fractional totals",
+                                 rationale="Fractional amounts must survive calculation", files=["invoice.py"])["node"]
+        task = planner.add_task("Keep the invoice total precise", files=["invoice.py"],
+                                depends_on=[failure["id"]])["node"]
+        code, missing = self._claim_cli(task["id"], "calculate_invoice_total")
+        self.assertEqual(code, 2)
+        self.assertIn("indexed project", json.loads(missing)["error"]["message"])
+        self.assertEqual(self.work.show(task["id"])["revision"], task["revision"])
+
+        (self.root / "invoice.py").write_text("def calculate_invoice_total(amounts):\n    return sum(amounts)\n",
+                                              encoding="utf-8")
+        graph = MemoryGraph.open(self.storage)
+        try:
+            self.assertFalse(graph.compile_project(self.root).run.errors)
+        finally:
+            graph.close()
+        show = CoordinationStore.show
+
+        def changed_after_read(store: CoordinationStore, record_id: str) -> dict:
+            snapshot = show(store, record_id)
+            self.update(planner, snapshot, next_action="Check fractional totals")
+            return snapshot
+
+        with patch.object(CoordinationStore, "show", changed_after_read):
+            code, rejected = self._claim_cli(task["id"], "calculate_invoice_total")
+        self.assertEqual(code, 2)
+        self.assertIn("revision changed", json.loads(rejected)["error"]["message"])
+        current = self.work.show(task["id"])
+        self.assertEqual(current["next_action"], "Check fractional totals")
+
+        code, output = self._claim_cli(task["id"], "calculate_invoice_total")
+        self.assertEqual(code, 0, output)
+        result = json.loads(output)
+        claimed = result["claimed_task"]
+        self.assertEqual(claimed["revision"], current["revision"] + 1)
+        self.assertEqual(claimed["agent_id"], "agent:worker")
+        self.assertNotIn("work_context", result)
+        source = result["source_context"]["payload"]
+        self.assertIn(failure["id"], {row["id"] for row in source["engineering_context"]["records"]})
+        self.assertIn("return sum(amounts)", source["snippets"][0]["text"])
+        code, repeated = self._claim_cli(task["id"], "calculate_invoice_total")
+        self.assertEqual(code, 0, repeated)
+        self.assertEqual(json.loads(repeated)["claimed_task"], claimed)
+        self.assertEqual(self.work.show(task["id"])["revision"], claimed["revision"])
+        code, text = self._claim_cli(task["id"], "calculate_invoice_total", as_json=False)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(text.count("## Engineering context"), 1)
+        self.assertIn("Saved task and direct prerequisites shown in full.", text)
+        self.assertEqual(text.count(failure["id"]), 2)  # Dependency link and its work record.
+        self.assertIn("evidence unknown", text)
+        self.assertNotIn("## Relevant failures", text)
+        self.assertIn("def calculate_invoice_total(amounts)", text)
+        self.assertEqual(self.work.show(task["id"])["revision"], claimed["revision"])
+
+    def test_claim_with_source_reports_committed_revision_if_graph_becomes_unavailable(self) -> None:
+        """Return the durable claim receipt on a partial failure so agents can recover safely."""
+        planner = self.agent("planner")
+        active = planner.add_task("Existing edit", status="in_progress", files=["invoice.py"])["node"]
+        task = planner.add_task("Add total regression", files=["invoice.py"], next_action="Run invoice checks")["node"]
+        self.storage.write_bytes(b"invalid store contents")
+        code, output = self._claim_cli(task["id"], "-total")
+        self.assertEqual(code, 2)
+        result = json.loads(output)
+        self.assertIn("source_context_error", result)
+        self.assertEqual(result["claimed_task"]["revision"], self.work.show(task["id"])["revision"])
+        self.assertEqual(self.work.show(task["id"])["agent_id"], "agent:worker")
+        self.assertEqual(result["work_context"]["records"][0]["next_action"], "Run invoice checks")
+        self.assertEqual(result["file_overlaps"]["files"][0]["tasks"], [active["id"]])
+        self.assertEqual(result["source_context_retry"],
+                         f"reql query_context --task {task['id']} --query=-total --code --brief")
+
+        with patch.object(CoordinationStore, "assignment_context", side_effect=ValueError("Shared read failed")):
+            code, output = self._claim_cli(task["id"], "-total")
+        self.assertEqual(code, 2)
+        retry = json.loads(output)
+        self.assertEqual(retry["claimed_task"], result["claimed_task"])
+        self.assertEqual(retry["source_context_retry"], result["source_context_retry"])
+        self.assertIn("Shared read failed", retry["source_context_error"])
 
     def test_A_session_continuation_survives_private_cleanup_and_zero_message_retention(self) -> None:
         first = self.agent("A")
@@ -119,22 +371,6 @@ class CoordinationWorkflowTests(unittest.TestCase):
             agent.add_decision("Use yet another parser", rationale="Competing stale plan", supersedes=[old["id"]])
         updated = self.update(agent, self.work.show(task["id"]), depends_on=[new["id"]], rationale="Reconcile with direct parser")
         agent.complete_task(updated["id"], "Direct parser integration verified")
-
-    def test_D_file_anchors_and_causal_links_beat_unrelated_recent_history(self) -> None:
-        agent = self.agent("focus")
-        constraint = agent.record("constraint", "Keep wire format stable", files=["src/codec.py"])["node"]
-        failure = agent.record("failure", "Memoization dropped fields", rationale="Snapshot differs from current input")["node"]
-        task = agent.add_task("Fix encoding", files=["src/codec.py"], depends_on=[constraint["id"], failure["id"]])["node"]
-        decision = agent.add_decision("Preserve empty values", rationale="Wire contract requires round trips", parent=task["id"])["node"]
-        for number in range(15):
-            agent.record("change", f"UI styling improvement {number}", status="done", files=["src/ui.py"])
-        result = self.work.context(files=["src/codec.py"], limit=6)
-        ids = {item["id"] for item in result["records"]}
-        self.assertTrue({constraint["id"], failure["id"], task["id"], decision["id"]}.issubset(ids))
-        self.assertFalse(any("UI styling" in item["content"] for item in result["records"]))
-        self.assertLessEqual(len(result["records"]), 6)
-        self.assertLessEqual(len(render_work_context(result, max_chars=1700)), 1700)
-        self.assertEqual(self.work.context("nonexistent-component")["records"], [])
 
     def test_E_overview_derives_next_steps_from_current_execution(self) -> None:
         agent = self.agent("overview")
@@ -236,29 +472,6 @@ class CoordinationWorkflowTests(unittest.TestCase):
         ids = {record["id"] for record in self.work.records()}
         self.assertTrue({item["id"], old["id"], active["id"]}.issubset(ids))
 
-    def test_legacy_private_work_migrates_without_publishing_scratch(self) -> None:
-        agent = self.agent("legacy")
-        graph = MemoryGraph.open(agent.paths.agent_storage)
-        try:
-            graph.add_node(MemoryNode(id="legacy-task", type="task", label="Legacy outcome", text="Legacy outcome",
-                                     status="active", properties={"content": "Legacy outcome", "session_id": "legacy"}))
-            graph.add_node(MemoryNode(id="legacy-failure", type="rejected_approach", text="Rejected cache",
-                                     properties={"content": "Rejected cache", "metadata": {"reason": "Stale snapshot"}}))
-        finally:
-            graph.close()
-        agent.add_note("Private scratch")
-        agent.init("Resume migration")
-        self.assertEqual(self.work.show("legacy-failure")["rationale"], "Stale snapshot")
-        self.assertEqual(self.work.show("legacy-task")["origin_agent_id"], agent.agent_id)
-        graph = MemoryGraph.open(agent.paths.agent_storage, read_only=True)
-        try:
-            self.assertIsNone(graph.get_node("legacy-task"))
-        finally:
-            graph.close()
-        agent.finish("Legacy work retained")
-        self.assertNotIn("Private scratch", json.dumps(self.work.records()))
-        self.assertEqual(self.work.show("legacy-task")["content"], "Legacy outcome")
-
     def test_compiled_code_context_and_mcp_share_scoped_engineering_evidence(self) -> None:
         agent = self.agent("integration")
         decision = agent.add_decision("Preserve payload field", rationale="Client contract", files=["src/codec.py"])["node"]
@@ -274,21 +487,6 @@ class CoordinationWorkflowTests(unittest.TestCase):
             graph.close()
         mcp = mcp_context(storage_path=str(self.storage), query="encode payload", code=True)
         self.assertEqual(mcp["payload"]["engineering_context"], work)
-
-    def test_cli_handoff_works_across_processes_without_canonical_graph(self) -> None:
-        cli = [sys.executable, str(Path("cli.py").resolve())]
-
-        def run(*args: str) -> dict:
-            """Use independent processes to prove persistence, not in-memory reuse."""
-            result = subprocess.run([*cli, *args], cwd=self.root, capture_output=True, text=True, encoding="utf-8", check=True)
-            return json.loads(result.stdout)
-        run("agent", "--agent", "agent:cli-A", "--no-progress", "init", "--name", "CLI handoff", "--json")
-        task = run("agent", "--agent", "agent:cli-A", "--no-progress", "record", "task", "Complete codec", "--file", "src/codec.py", "--next", "Verify consumer", "--json")["node"]
-        run("agent", "--agent", "agent:cli-A", "--no-progress", "finish", "Handoff pending", "--json")
-        recovered = run("project", "context", "--file", "src/codec.py", "--json")
-        self.assertIn(task["id"], {item["id"] for item in recovered["records"]})
-        self.assertEqual(run("agent", "show", task["id"], "--json")["node"]["next_action"], "Verify consumer")
-        self.assertFalse(self.storage.exists())
 
     def test_mcp_work_tools_support_sessions_reconciliation_and_read_only_discovery(self) -> None:
         from mcp.tools import call_tool, list_tools, MCPToolError
@@ -313,45 +511,3 @@ class CoordinationWorkflowTests(unittest.TestCase):
                                          "agent_id": "agent:stale", "session_id": "stale",
                                          "fields": {"record_id": created["id"], "expected_revision": 1, "status": "done"}})
         self.assertFalse(self.storage.exists())
-
-    def test_compatibility_views_and_reset_preserve_shared_owner(self) -> None:
-        agent = self.agent("views")
-        task = agent.add_task("Retained outcome")["node"]
-        failure = agent.reject_approach("Rejected idea", "Breaks callers")["node"]
-        completed = agent.add_task("Try direct parsing")["node"]
-        agent.complete_task(completed["id"], "Parsing works")
-        self.assertEqual(failure["reason"], "Breaks callers")
-        self.assertEqual(failure["session_title"], "views")
-        dashboard = agent.dashboard()["private"]
-        self.assertEqual(dashboard["rejected"][0]["id"], failure["id"])
-        self.assertEqual(dashboard["done"][0]["id"], completed["id"])
-        self.assertEqual(dashboard["done"][0]["completion_message"], "Parsing works")
-        self.assertEqual(agent.operational_overview()["rejected_approaches"][0]["reason"], failure["reason"])
-        self.assertIn(task["id"], {item["id"] for item in agent.list_items(node_type="task")["nodes"]})
-        self.assertIn(task["id"], {item["node"]["id"] for item in agent.search("Retained outcome")["results"]})
-        self.assertIn(failure["id"], {item["id"] for item in agent.export(include_metadata=True)["nodes"]})
-        # Noncontiguous content/reason words must match the shared search view.
-        self.assertTrue(any(item.get("id") == failure["id"]
-                            for item in AgentWorkspace.search_dashboards(self.storage, "Rejected callers")["results"]))
-        agent.reset()
-        self.assertEqual(self.work.show(task["id"])["status"], "open")
-        self.assertEqual(self.work.show(failure["id"])["rationale"], "Breaks callers")
-        agent.init("After reset")
-        agent.finish("Shared work retained")
-        self.assertFalse(agent.exists())
-        self.assertTrue(any(item.get("id") == failure["id"]
-                            for item in AgentWorkspace.search_dashboards(self.storage, "Rejected callers")["results"]))
-        self.assertTrue(AgentWorkspace.search_dashboards(self.storage, "Parsing works")["results"])
-        agent.init("Resumed views")
-        self.assertEqual(agent.dashboard()["private"]["rejected"][0]["id"], failure["id"])
-        self.assertEqual(agent.dashboard()["private"]["done"][0]["id"], completed["id"])
-        agent.finish("Resumed work ended")
-
-    def test_mid_session_checkpoint_does_not_close_work_or_replace_other_checkpoints(self) -> None:
-        agent = self.agent("checkpoint")
-        task = agent.add_task("Continue integration")["node"]
-        manual = agent.record("checkpoint", "Decision milestone", status="done", key="milestone")["node"]
-        self.assertEqual(agent.public_dashboard()["active_tasks"][0]["id"], task["id"])
-        agent.finish("Integration handoff")
-        self.assertEqual(self.work.show(manual["id"])["content"], "Decision milestone")
-        self.assertEqual(len([item for item in self.work.records() if item["kind"] == "checkpoint"]), 2)

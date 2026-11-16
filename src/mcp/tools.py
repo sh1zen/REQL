@@ -11,7 +11,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from threading import Event
 from typing import Any
 
 from api.memory_graph import MemoryGraph
@@ -53,15 +52,7 @@ from memory.domain.query_context import (
 from memory.domain.query_context import (
     QueryContextRequest,
 )
-from memory.domain.timeutils import utcnow_iso
-from memory.freshness import write_watch_state
 from memory.security import SecurityError, sanitize_agent_text, validate_mcp_path
-from memory.services.project_watch import (
-    Observer,
-    ProjectWatchEvent,
-    _WatchdogChangeHandler,
-)
-from memory.storage import StoreLease
 from memory.services.coordination import CoordinationStore, KINDS
 
 MAX_TOP_K = 50
@@ -82,7 +73,7 @@ ToolHandler = Callable[..., dict[str, Any]]
 
 
 READ_ONLY_TOOLS = {
-    "inspect_node",
+    "reql_tests_for",
     "query_context",
     "query_explore",
     "query_graph",
@@ -94,27 +85,38 @@ READ_ONLY_TOOLS = {
 }
 
 WRITE_TOOLS = {
+    "reql_tests_import",
     "reql_compile_project",
     "reql_hubs",
-    "reql_watch_project",
     "reql_work_record",
+    "reql_work_claim_next",
 }
 
 
 def _work_store(storage_path: str) -> CoordinationStore:
     """Validate both the project boundary and its derived engineering store."""
-    path = validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path")
-    dashboard = validate_mcp_path(Path(path).with_name("agent-dashboard.reql"), name="dashboard_storage")
+    selected = _tool_storage(storage_path)
+    dashboard = validate_mcp_path(selected.with_name("agent-dashboard.reql"), name="dashboard_storage")
     return CoordinationStore(dashboard)
 
 
 def reql_work_context(*, storage_path: str, query: str = "", files: list[str] | None = None,
                       workstream: str | None = None, record_id: str | None = None,
-                      limit: int = 8, include_history: bool = False) -> dict[str, Any]:
+                      limit: int = 8, include_history: bool = False, kinds: list[str] | None = None) -> dict[str, Any]:
     """Read focused causal work without opening the canonical graph or a session."""
     try:
-        return _work_store(storage_path).context(query, files=files, workstream=workstream,
-                                                record_id=record_id, limit=limit, include_history=include_history)
+        work = _work_store(storage_path)
+        if kinds == ["failure"] and not include_history:
+            from memory.services.failure_context import FailureContextService
+
+            path = work.path.with_name(Path(storage_path).name)
+            arguments = {"files": files, "workstream": workstream, "record_id": record_id, "limit": limit}
+            if path.is_file() or path.with_name(f"{path.name}.wal").is_file():
+                with _open_graph(str(path), _load_tool_config(None, None), read_only=True) as graph:
+                    return graph.failure_context(query, **arguments)
+            return FailureContextService(work).context(query, **arguments)
+        return work.context(query, files=files, workstream=workstream, record_id=record_id, limit=limit,
+                            include_history=include_history, kinds=kinds)
     except ValueError as exc:
         raise MCPToolError(str(exc)) from exc
 
@@ -127,6 +129,32 @@ def reql_work_overview(*, storage_path: str, limit: int = 5) -> dict[str, Any]:
         raise MCPToolError(str(exc)) from exc
 
 
+def reql_tests_for(*, storage_path: str, symbol_id: str | None = None, file: str | None = None,
+                   include_candidates: bool = False, limit: int = 20) -> dict[str, Any]:
+    """Return the same association rows exposed by the Python API."""
+    config = _load_tool_config(None, None, start_dir=_project_root_for_storage(Path(storage_path)))
+    with _open_graph(storage_path, config, read_only=True) as graph:
+        rows = graph.find_tests_for(symbol_id=symbol_id, file=file, include_candidates=include_candidates, limit=limit)
+        return {"schema_version": 1, "associations": [asdict(row) for row in rows]}
+
+
+def reql_tests_import(*, storage_path: str, path: str, input: str, format: str = "coverage-json",
+                      confirm: bool = False) -> dict[str, Any]:
+    """Import a report after the caller explicitly authorizes the sidecar write."""
+    if confirm is not True:
+        raise MCPToolError("Test evidence import requires confirm=true")
+    if format != "coverage-json":
+        raise MCPToolError("Test evidence import supports coverage-json")
+    root = validate_mcp_path(_required_path_text(path, "path"), name="path")
+    report = validate_mcp_path(Path(root) / _required_path_text(input, "input"), name="input")
+    config = _load_tool_config(None, None, start_dir=root)
+    with _open_graph(storage_path, config, read_only=True) as graph:
+        evidence = graph.test_intelligence.evidence
+        if evidence is not None:
+            validate_mcp_path(evidence.path, name="test_evidence_storage")
+        return graph.test_intelligence.import_coverage(report, project_path=root)
+
+
 def reql_work_record(*, storage_path: str, kind: str, content: str, agent_id: str,
                      session_id: str, fields: dict[str, Any] | None = None) -> dict[str, Any]:
     """Reconcile one shared record with explicit caller provenance and revision."""
@@ -136,6 +164,20 @@ def reql_work_record(*, storage_path: str, kind: str, content: str, agent_id: st
         return _work_store(storage_path).put(kind, content, agent_id=_required_text(agent_id, "agent_id"),
                                              session_id=_required_text(session_id, "session_id"), **(fields or {}))
     except (TypeError, ValueError) as exc:
+        raise MCPToolError(str(exc)) from exc
+
+
+def reql_work_claim_next(*, storage_path: str, agent_id: str, session_id: str,
+                         workstream: str | None = None) -> dict[str, Any]:
+    """Claim ready work with host-supplied provenance and return a causal handoff."""
+    try:
+        work = _work_store(storage_path)
+        result = work.claim_next(agent_id=_required_text(agent_id, "agent_id"),
+                                 session_id=_required_text(session_id, "session_id"), workstream=workstream)
+        if task := result.get("claimed_task"):
+            result["work_context"] = work.context(record_id=task["id"], limit=6)
+        return result
+    except ValueError as exc:
         raise MCPToolError(str(exc)) from exc
 
 
@@ -190,11 +232,14 @@ def query_context(
     max_depth: int = DEFAULT_CONTEXT_MAX_DEPTH,
     max_items: int = DEFAULT_CONTEXT_MAX_ITEMS,
     include_archived: bool = False,
+    include_source: bool = False,
+    task_id: str | None = None,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a bounded deterministic context block for a task/query."""
-    config = _load_tool_config(config_path, config_overrides)
+    storage_path = str(validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path"))
+    config = _load_tool_config(config_path, config_overrides, start_dir=_project_root_for_storage(Path(storage_path)))
     query = _required_text(query, "query")
     selected_scopes = _optional_string_list(scopes, "scopes") or []
     for enabled, scope in ((code, "code"), (docs, "docs"), (test, "test")):
@@ -209,6 +254,8 @@ def query_context(
             max_depth=max_depth,
             max_items=max_items,
             include_archived=include_archived,
+            include_source=include_source,
+            task_id=task_id,
         )
     except (TypeError, ValueError) as exc:
         raise MCPToolError(str(exc)) from exc
@@ -284,25 +331,6 @@ def query_memories(
         )
 
 
-def inspect_node(
-    *,
-    storage_path: str,
-    node_id: str,
-    limit: int = 30,
-    config_path: str | None = None,
-    config_overrides: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Resolve a node id to its node payload, local edges, and source locations."""
-    config = _load_tool_config(config_path, config_overrides)
-    node_id = _required_text(node_id, "node_id")
-    limit = _bounded_int(limit, "limit", minimum=1, maximum=MAX_ITEMS)
-    with _open_graph(storage_path, config, read_only=True) as graph:
-        result = graph.inspect_node(node_id, limit=limit)
-    if not result["found"]:
-        raise MCPToolError(f"Node not found: {node_id}")
-    return result
-
-
 def reql_query(
     *,
     storage_path: str,
@@ -350,7 +378,7 @@ def reql_project_status(
     path = str(validate_mcp_path(_required_path_text(path, "path"), name="path"))
     config = _load_tool_config(config_path, config_overrides, start_dir=path)
     with _open_graph(storage_path, config, read_only=True) as graph:
-        status = graph.project_status(path)
+        status = graph.project_status(path, config_path=resolve_config_path(config_path, start_dir=path))
         if status is None:
             return {"found": False, "path": path}
         payload = _jsonable(status)
@@ -437,137 +465,13 @@ def reql_compile_project(
         }
 
 
-def reql_watch_project(
-    *,
-    storage_path: str,
-    path: str,
-    cache_enabled: bool | None = None,
-    interval_seconds: float = 0.0,
-    debounce_seconds: float = 0.0,
-    max_iterations: int = 1,
-    config_path: str | None = None,
-    config_overrides: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Poll a project for changes and compile dirty artifacts into the graph."""
-    path = str(validate_mcp_path(_required_path_text(path, "path"), name="path"))
-    config = _load_tool_config(config_path, config_overrides, start_dir=path)
-    iterations = _bounded_int(max_iterations, "max_iterations", minimum=1, maximum=100)
-    interval = _bounded_float(interval_seconds, "interval_seconds", minimum=0.0, maximum=3600.0)
-    debounce = _bounded_float(debounce_seconds, "debounce_seconds", minimum=0.0, maximum=60.0)
-    if Observer is None:
-        raise MCPToolError("watchdog is required for monitor mode; install the watchdog package")
-    storage = Path(storage_path)
-    root = Path(path)
-    changed = Event()
-
-    def mark_stale() -> None:
-        write_watch_state(storage, status="stale", pending_paths=1)
-
-    observer = Observer()
-    observer.schedule(
-        _WatchdogChangeHandler(changed, ignored_paths=(root / ".reql",), on_change=mark_stale),
-        str(root),
-        recursive=True,
-    )
-    events: list[dict[str, Any]] = []
-    lease_target = storage.with_name(f"{storage.name}.watch")
-    with StoreLease(lease_target, timeout_seconds=0.0):
-        observer.start()
-        try:
-            for iteration in range(1, iterations + 1):
-                if iteration > 1:
-                    changed.wait(interval)
-                    if changed.is_set() and debounce:
-                        changed.clear()
-                        changed.wait(debounce)
-                    changed.clear()
-                write_watch_state(storage, status="refreshing", pending_paths=1)
-                with _open_graph(str(storage), config) as graph:
-                    result = graph.compile_project(
-                        root,
-                        max_file_size_bytes=config.scan.max_file_size_bytes,
-                        include_patterns=config.scan.include,
-                        exclude_patterns=config.scan.exclude,
-                        config_path=resolve_config_path(config_path, start_dir=path),
-                        cache_enabled=config.cache.enabled if cache_enabled is None else bool(cache_enabled),
-                        parsing_options=CompilationOptions.from_config(config),
-                    )
-                    committed = result.revision or graph.revisions.latest(result.scan.project.id)
-                write_watch_state(
-                    storage,
-                    status="stale" if result.run.errors or changed.is_set() else "current",
-                    pending_paths=(len(result.dirty_set.changed_artifact_ids) or 1) if result.run.errors or changed.is_set() else 0,
-                    source_revision_id=committed.id if committed else None,
-                )
-                events.append(
-                    _watch_event_payload(
-                        ProjectWatchEvent(
-                            iteration=iteration,
-                            checked_at=utcnow_iso(),
-                            project_path=str(root.resolve(strict=False)),
-                            total_artifacts=len(result.scan.artifacts),
-                            dirty_artifacts=len(result.dirty_set.changed_artifact_ids),
-                            deleted_artifacts=len(result.dirty_set.deleted_artifact_ids),
-                            compiled=bool(result.dirty_set.changed_artifact_ids or result.dirty_set.deleted_artifact_ids),
-                            result=result,
-                            errors=tuple(result.run.errors),
-                        )
-                    )
-                )
-        finally:
-            observer.stop()
-            observer.join(timeout=5)
-    errors = [error for event in events for error in event["errors"]]
-    return {
-        "summary": {
-            "path": path,
-            "polls": len(events),
-            "compiled_polls": sum(event["compiled"] for event in events),
-            "errors": errors,
-        },
-        "events": events,
-    }
-
-
-def _watch_event_payload(event: Any) -> dict[str, Any]:
-    result = event.result
-    payload: dict[str, Any] = {
-        "iteration": event.iteration,
-        "checked_at": event.checked_at,
-        "project_path": event.project_path,
-        "total_artifacts": event.total_artifacts,
-        "dirty_artifacts": event.dirty_artifacts,
-        "deleted_artifacts": event.deleted_artifacts,
-        "compiled": event.compiled,
-        "errors": list(event.errors),
-        "result": None,
-    }
-    if result is not None:
-        run = result.run
-        payload["result"] = {
-            "project_id": result.scan.project.id,
-            "run_id": run.id,
-            "status": run.status,
-            "delta_id": result.delta.id,
-            "files_seen": run.files_seen,
-            "files_changed": run.files_changed,
-            "files_skipped": run.files_skipped,
-            "files_deleted": run.files_deleted,
-            "created": {"nodes": run.nodes_created, "edges": run.edges_created},
-            "updated": {"nodes": run.nodes_updated, "edges": run.edges_updated},
-            "archived": {
-                "nodes": len(result.delta.archived_nodes),
-                "edges": len(result.delta.archived_edges),
-            },
-        }
-    return payload
-
-
 TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "reql_tests_for": reql_tests_for,
+    "reql_tests_import": reql_tests_import,
     "reql_work_context": reql_work_context,
     "reql_work_overview": reql_work_overview,
     "reql_work_record": reql_work_record,
-    "inspect_node": inspect_node,
+    "reql_work_claim_next": reql_work_claim_next,
     "query_graph": query_graph,
     "query_context": query_context,
     "query_explore": query_explore,
@@ -576,11 +480,34 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "reql_project_status": reql_project_status,
     "reql_hubs": reql_hubs,
     "reql_compile_project": reql_compile_project,
-    "reql_watch_project": reql_watch_project,
 }
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "reql_tests_for",
+        "description": "Read-only: observed, static and optional candidate test associations.",
+        "inputSchema": {
+            "type": "object", "required": ["storage_path"],
+            "oneOf": [{"required": ["symbol_id"]}, {"required": ["file"]}],
+            "properties": {
+                "storage_path": {"type": "string"}, "symbol_id": {"type": "string"},
+                "file": {"type": "string"}, "include_candidates": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        },
+    },
+    {
+        "name": "reql_tests_import",
+        "description": "Write: import project-local coverage JSON into the test evidence store after explicit approval.",
+        "inputSchema": {
+            "type": "object", "required": ["storage_path", "path", "input", "confirm"],
+            "properties": {
+                "storage_path": {"type": "string"}, "path": {"type": "string"}, "input": {"type": "string"},
+                "format": {"const": "coverage-json"}, "confirm": {"const": True},
+            },
+        },
+    },
     {
         "name": "reql_work_context",
         "description": "Read-only: focused engineering work, decisions, constraints, failures and dependencies across sessions.",
@@ -588,6 +515,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "storage_path": {"type": "string"}, "query": {"type": "string", "default": ""},
             "files": {"type": "array", "items": {"type": "string"}},
             "workstream": {"type": "string"}, "record_id": {"type": "string"},
+            "kinds": {"type": "array", "items": {"type": "string", "enum": sorted(KINDS)}},
             "limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 8},
             "include_history": {"type": "boolean", "default": False}}},
     },
@@ -608,32 +536,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "key": {"type": "string"}, "record_id": {"type": "string"}, "expected_revision": {"type": "integer"},
                 "status": {"type": "string"}, "rationale": {"type": "string"}, "workstream": {"type": "string"},
                 "parent": {"type": "string"}, "next_action": {"type": "string"}, "importance": {"type": "integer"},
+                "failure_evidence": {"type": "object", "additionalProperties": False, "properties": {
+                    "source_revision": {"type": "string"},
+                    **{name: {"type": "array", "items": {"type": "string"}}
+                       for name in ("symbol_ids", "test_ids", "observed_checks")},
+                }},
                 **{name: {"type": "array", "items": {"type": "string"}} for name in ("files", "depends_on", "contradicts", "supersedes", "summarizes")}}}}},
     },
     {
-        "name": "inspect_node",
-        "description": "Read-only: resolve a REQL node id to its node payload, adjacent edges, neighbors, and source/location hints.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "node_id"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "node_id": {"type": "string"},
-                "limit": {"type": "integer", "default": 30, "maximum": MAX_ITEMS},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
-            },
-        },
+        "name": "reql_work_claim_next",
+        "description": "Write: atomically claim a ready task or resume this session's current claim. Returns scoped work and overlapping assignments.",
+        "inputSchema": {"type": "object", "required": ["storage_path", "agent_id", "session_id"], "properties": {
+            "storage_path": {"type": "string"}, "agent_id": {"type": "string"},
+            "session_id": {"type": "string"}, "workstream": {"type": "string"}}},
     },
     {
         "name": "query_context",
-        "description": "Read-only: retrieve a compact deterministic context block from REQL.",
+        "description": "Read-only: source owners, tests, impact and scoped work, with optional verified source excerpts.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
             "properties": {
                 "storage_path": {"type": "string"},
                 "query": {"type": "string"},
+                "task_id": {"type": ["string", "null"], "default": None, "description": "Attach this work record and its causal context."},
                 "mode": {"type": "string", "enum": ["informative", "cleanup"], "default": "informative"},
                 "scopes": {
                     "type": ["array", "null"],
@@ -641,6 +567,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "uniqueItems": True,
                     "default": None,
                 },
+                "include_source": {"type": "boolean", "default": False, "description": "Embed bounded current source verified against the committed graph. Requires code or test scopes without docs."},
                 "code": {"type": "boolean", "default": False},
                 "docs": {"type": "boolean", "default": False},
                 "test": {"type": "boolean", "default": False},
@@ -670,7 +597,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_graph",
-        "description": "Read-only: retrieve a structured query-centered REQL subgraph with seed nodes, edges, sources, and compact agent context.",
+        "description": "Read-only: nodes, edges and sources for graph debugging. Prefer query_context for coding tasks.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -692,7 +619,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_explore",
-        "description": "Read-only: retrieve dependency-oriented REQL slices plus structural template duplicates for coding agents.",
+        "description": "Read-only: missing dependency/refactor evidence or template duplicates. Select views; reuse existing query_context impact.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -716,7 +643,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_memories",
-        "description": "Read-only: return a compact ranked list of relevant REQL memory/source texts for clients that do not need graph debugging details.",
+        "description": "Read-only: short ranked memory/source texts without graph-debug fields.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -794,24 +721,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "name": "reql_watch_project",
-        "description": "Write/update: monitor a project with watchdog and incrementally compile dirty artifacts. Defaults to one bounded check for MCP clients.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "path"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "path": {"type": "string"},
-                "cache_enabled": {"type": ["boolean", "null"], "default": None},
-                "interval_seconds": {"type": "number", "default": 0.0, "maximum": 3600.0},
-                "debounce_seconds": {"type": "number", "default": 0.0, "maximum": 60.0},
-                "max_iterations": {"type": "integer", "default": 1, "maximum": 100},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
-            },
-        },
-    },
 ]
 
 
@@ -859,13 +768,24 @@ def _reql_statement_requires_write(statement: str) -> bool:
     return first in MUTATING_REQL_COMMANDS
 
 
+def _project_root_for_storage(storage: Path) -> Path:
+    """Infer the project directory for stores in the default .reql location."""
+    directory = storage.expanduser().resolve().parent
+    return directory.parent if directory.name == ".reql" else Path.cwd()
+
+
+def _tool_storage(storage_path: str) -> Path:
+    return validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path")
+
+
 @contextmanager
 def _open_graph(storage_path: str, config: REQLConfig, *, read_only: bool = False) -> Iterator[MemoryGraph]:
-    storage_path = str(validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path"))
+    storage = _tool_storage(storage_path)
     graph = MemoryGraph.open(
-        Path(storage_path),
+        storage,
         config=config,
         read_only=read_only,
+        defer_lexical_index=read_only,
         lock_timeout_seconds=0.05 if read_only else None,
     )
     try:
@@ -918,20 +838,6 @@ def _bounded_optional_int(value: Any, name: str, *, minimum: int, maximum: int) 
     if value is None:
         return None
     return _bounded_int(value, name, minimum=minimum, maximum=maximum)
-
-
-def _bounded_float(value: Any, name: str, *, minimum: float, maximum: float) -> float:
-    if isinstance(value, bool):
-        raise MCPToolError(f"{name} must be a number")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise MCPToolError(f"{name} must be a number") from exc
-    if parsed < minimum:
-        return minimum
-    if parsed > maximum:
-        return maximum
-    return parsed
 
 
 def _jsonable(value: Any) -> Any:

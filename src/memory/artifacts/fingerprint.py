@@ -3,14 +3,43 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
+from importlib.metadata import distributions
+from os import fstat
 from pathlib import Path
 from typing import Any
 
 from ..domain.ids import stable_id
-from .models import ArtifactFingerprint
 
-DEFAULT_PARSER_VERSION = "project-scan-v10"
+# Advance this revision for project-wide changes to persisted facts.
+# Language-specific revisions belong to the extractor that produces the facts.
+PARSER_FACTS_VERSION = 15
+DEFAULT_PARSER_VERSION = f"project-scan-v{PARSER_FACTS_VERSION}"
 DEFAULT_CHUNKING_VERSION = "uncompiled-v1"
+
+
+def read_bounded_file(path: Path, limit: int) -> bytes | None:
+    """Read through EOF within a byte ceiling without allocating the full ceiling up front."""
+    with path.open("rb") as stream:
+        size = fstat(stream.fileno()).st_size
+        if size > limit:
+            return None
+        content = stream.read(size + 1)
+        if len(content) > size and len(content) <= limit:
+            # A file grew between stat and read. Keep the same bound for the remainder.
+            content += stream.read(limit + 1 - len(content))
+    return content if len(content) <= limit else None
+
+
+@lru_cache(maxsize=1)
+def tree_sitter_versions() -> dict[str, str]:
+    """Snapshot installed Tree-sitter runtime and grammar package versions."""
+    installed = {}
+    for distribution in distributions():
+        name = (distribution.metadata.get("Name") or "").casefold().replace("_", "-")
+        if name == "tree-sitter" or name.startswith("tree-sitter-"):
+            installed.setdefault(name, distribution.version)
+    return installed
 
 
 def normalize_path(path: str | Path) -> str:
@@ -45,52 +74,16 @@ def relative_path(root: str | Path, path: str | Path) -> str:
     return target.relative_to(root_path).as_posix()
 
 
-def file_uri(path: str | Path) -> str:
-    return Path(path).expanduser().resolve(strict=False).as_uri()
-
-
-def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as fh:
-        for chunk in iter(lambda: fh.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def options_hash(options: dict[str, Any] | None = None) -> str:
     payload = json.dumps(options or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def project_id(*parts: str) -> str:
-    root_path = parts[-1]
+def project_id(root_path: str) -> str:
+    """Identify a project by its normalized filesystem root."""
     return stable_id("project", normalize_path(root_path))
 
 
-def artifact_id(*parts: str) -> str:
-    project_id_, relative_path_ = parts[-2], parts[-1]
+def artifact_id(project_id_: str, relative_path_: str) -> str:
+    """Identify an artifact within its owning project."""
     return stable_id("artifact", project_id_, relative_path_)
-
-
-def fingerprint_file(
-    root: str | Path,
-    path: str | Path,
-    *,
-    parser_version: str = DEFAULT_PARSER_VERSION,
-    chunking_version: str = DEFAULT_CHUNKING_VERSION,
-    options: dict[str, Any] | None = None,
-) -> ArtifactFingerprint:
-    target = Path(path)
-    stat = target.stat()
-    normalized = normalize_path(target)
-    rel = relative_path(root, target)
-    return ArtifactFingerprint(
-        path=normalized,
-        relative_path=rel,
-        size_bytes=int(stat.st_size),
-        mtime=float(stat.st_mtime),
-        sha256=sha256_file(target),
-        parser_version=parser_version,
-        chunking_version=chunking_version,
-        options_hash=options_hash(options),
-    )

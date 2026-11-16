@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +13,9 @@ from uuid import uuid4
 
 from api.memory_graph import MemoryGraph
 from memory.config import REQLConfig, default_config
-from memory.services.coordination import CoordinationStore, KINDS, TERMINAL
+from memory.services.coordination import (
+    CoordinationStore, KINDS, MAX_WORK_RECORD_TEXT, TERMINAL, require_task_claim, task_claim,
+)
 from memory.domain.exceptions import StorageError
 from memory.domain.ids import stable_id
 from memory.domain.models import MemoryNode
@@ -144,23 +146,72 @@ class AgentWorkspace:
         )
         return reader.public_dashboard(limit=limit)
 
-    def init(self, name: str | None = None) -> dict[str, Any]:
+    def init(self, name: str | None = None, *, task_id: str | None = None,
+             expected_revision: int | None = None, include_work_context: bool = True,
+             next_task: bool = False, workstream: str | None = None) -> dict[str, Any]:
         """Initialize this workspace and optionally begin a named current session."""
 
+        if next_task and (task_id is not None or expected_revision is not None):
+            raise ValueError("Choose either the next task or an explicit task and revision")
+        if workstream is not None and (not next_task or not isinstance(workstream, str) or not workstream.strip()
+                                       or len(workstream) > MAX_WORK_RECORD_TEXT):
+            raise ValueError("A nonempty workstream can only filter the next task")
+        task = self._assigned_task(task_id, expected_revision)
         session_name = name.strip() if name is not None else None
         if session_name == "":
             raise ValueError("Agent session name must not be empty")
         init_lease = self.paths.agent_storage.with_name(f"{self.paths.agent_storage.name}.init")
         with self._lifecycle_lease(), StoreLease(init_lease, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
             already_initialized = self.exists()
+            session_id = self._active_session_id() if already_initialized else None
+            if task is not None:
+                if task["status"] == "blocked":
+                    raise ValueError("Assigned task is blocked; reopen it when the blocker is resolved")
+                if task_claim(task):
+                    require_task_claim(task, self.agent_id, session_id)
             result = self._initialized_workspace() if already_initialized else self._recreate(remove_existing=False)
             result["already_initialized"] = already_initialized
-            self._migrate_work()
             self._register_agent(status="active")
-            if not self._active_session_id():
+            if not session_id:
                 result["session"] = self.start_session(session_name or "Agent session")["session"]
             result["retention"] = self._prune_completed_agents()
+            if next_task:
+                session_id, title = self._record_session()
+                assignment = self.coordination.claim_next(agent_id=self.agent_id, session_id=session_id,
+                                                          session_title=title, workstream=workstream)
+                result["assignment_status"] = assignment.pop("status")
+                result.update(assignment)
+                if result["assignment_status"] == "claimed":
+                    self._touch_agent()
+            elif task is not None:
+                session_id, title = self._record_session()
+                result.update(self.coordination.claim_task(
+                    task["id"], task["revision"], agent_id=self.agent_id,
+                    session_id=session_id, session_title=title,
+                ))
+            if include_work_context and (claimed := result.get("claimed_task")):
+                if next_task:
+                    result["work_context"] = self.coordination.context(record_id=claimed["id"], limit=6)
+                else:
+                    result.update(self.coordination.assignment_context(claimed["id"]))
         return result
+
+    def _assigned_task(self, task_id: str | None, expected_revision: int | None) -> dict[str, Any] | None:
+        """Capture the assigned task before session changes; writes recheck its revision."""
+        if task_id is None:
+            if expected_revision is not None:
+                raise ValueError("Task revision requires a task id")
+            return None
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1):
+            raise ValueError("Assigned task needs its observed positive revision")
+        task = self.coordination.show(task_id)
+        if task["kind"] != "task":
+            raise ValueError("Assigned work must be a task")
+        if expected_revision is not None and task["revision"] != expected_revision:
+            raise ValueError("Work revision changed; read agent show and reconcile before updating")
+        if task["status"] in TERMINAL:
+            raise ValueError("Assigned task is terminal; explicitly reopen it with a rationale first")
+        return task
 
     def reset(self) -> dict[str, Any]:
         with self._lifecycle_lease():
@@ -176,6 +227,8 @@ class AgentWorkspace:
             workspace = agent.get_node(WORKSPACE_NODE_ID)
             if workspace is None or workspace.properties.get("format") != "reql-agent-memory-v1":
                 raise ValueError("Agent workspace format is unsupported. Run `reql agent reset` to recreate it.")
+            if set(agent.store.node_type_counts()) - AGENT_NODE_TYPES - {workspace.type}:
+                raise ValueError("Agent workspace contains unsupported record types. Run `reql agent reset` to recreate it.")
             return {
                 "initialized": True,
                 "agent_id": self.agent_id,
@@ -347,8 +400,18 @@ class AgentWorkspace:
         """Access the authoritative project work store without opening it."""
         return CoordinationStore(self.paths.dashboard_storage)
 
-    def record(self, kind: str, content: str, **fields: Any) -> dict[str, Any]:
-        """Persist engineering state with the current agent/session provenance."""
+    def record(self, kind: str | None = None, content: str | None = None, **fields: Any) -> dict[str, Any]:
+        """Persist session-authored work, retaining omitted text on revision-checked updates."""
+        with self._lifecycle_lease():
+            session_id, title = self._record_session()
+            result = self.coordination.put(kind, content, agent_id=self.agent_id,
+                                           session_id=session_id, session_title=title, **fields)
+            if result["changed"]:
+                self._touch_agent()
+            return result
+
+    def _record_session(self) -> tuple[str, str]:
+        """Resolve the active session provenance for shared work writes."""
         session_id = self._active_session_id()
         if not session_id:
             raise ValueError("No active session. Run `reql agent init` first.")
@@ -358,26 +421,7 @@ class AgentWorkspace:
             title = str(session.label or "") if session else ""
         finally:
             graph.close()
-        result = self.coordination.put(kind, content, agent_id=self.agent_id,
-                                       session_id=session_id, session_title=title, **fields)
-        if result["changed"]:
-            self._touch_agent()
-        return result
-
-    def _migrate_work(self) -> None:
-        """Move old tasks/decisions/failures out of private scratch on resume."""
-        source = self._require_agent()
-        try:
-            target = self._ensure_public_dashboard()
-            try:
-                moved = CoordinationStore.migrate(target.store, source.store.all_nodes(), self.agent_id)
-            finally:
-                target.close()
-            with source.store.transaction():
-                for item_id in moved:
-                    source.store.remove_node(item_id)
-        finally:
-            source.close()
+        return session_id, title
 
     def add_task(self, description: str, **fields: Any) -> dict[str, Any]:
         """Create a durable outcome; identical requests reuse the same record."""
@@ -390,7 +434,7 @@ class AgentWorkspace:
         task = self.coordination.show(node_id)
         if task["kind"] != "task":
             raise ValueError(f"Agent node is not a task: {node_id}")
-        result = self.record("task", task["content"], record_id=node_id,
+        result = self.record("task", record_id=node_id,
                              expected_revision=task["revision"], status="done", rationale=message)
         context = self._publish(message, kind="task_completion", target="public", task_id=node_id)
         return {"task": self._work_payload(result["node"]), "context": context["context"]}
@@ -398,7 +442,7 @@ class AgentWorkspace:
     def list_tasks(self, *, include_all: bool = False) -> dict[str, Any]:
         """Return owned work, including unfinished outcomes from previous sessions."""
         return {"tasks": [self._work_payload(item) for item in self.coordination.records()
-                          if item["kind"] == "task" and item["agent_id"] == self.agent_id
+                          if item["kind"] == "task" and (task_claim(item) or item)["agent_id"] == self.agent_id
                           and (include_all or item["status"] not in TERMINAL)]}
 
     def add_decision(self, text: str, *, rationale: str, **fields: Any) -> dict[str, Any]:
@@ -428,9 +472,8 @@ class AgentWorkspace:
         status: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if node_type in KINDS or node_type in {"finding", "rejected_approach"}:
-            kind = {"finding": "observation", "rejected_approach": "failure"}.get(node_type, node_type)
-            return self.record(kind, content, status=status, rationale=(metadata or {}).get("reason"))
+        if node_type in KINDS:
+            return self.record(node_type, content, status=status, rationale=(metadata or {}).get("reason"))
         graph = self._require_agent()
         try:
             return self._create_agent_node(graph, node_type, content, title=title, status=status, metadata=metadata)
@@ -470,9 +513,8 @@ class AgentWorkspace:
             graph.close()
 
     def show(self, item_id: str) -> dict[str, Any]:
-        for item in self.coordination.records():
-            if item["id"] == item_id:
-                return {"kind": "node", "node": self._work_payload(item)}
+        if (item := self.coordination.find(item_id)) is not None:
+            return {"kind": "node", "node": self._work_payload(item)}
         graph = self._require_agent(read_only=True)
         try:
             node = graph.get_node(item_id)
@@ -513,25 +555,6 @@ class AgentWorkspace:
         finally:
             graph.close()
 
-    def export(self, *, include_metadata: bool = False) -> dict[str, Any]:
-        if not include_metadata:
-            return self.operational_overview()
-        shared = [self._work_payload(item) for item in self.coordination.records() if item["agent_id"] == self.agent_id]
-        graph = self._require_agent(read_only=True)
-        try:
-            payload = graph.export_json()
-            workspace = graph.get_node(WORKSPACE_NODE_ID)
-            return {
-                "format": "reql-agent-memory-v1",
-                "agent_id": self.agent_id,
-                "agent_storage": str(self.paths.agent_storage),
-                "dashboard_storage": str(self.paths.dashboard_storage),
-                "initialized_at": workspace.properties.get("initialized_at") if workspace else None,
-                "nodes": [self._node_payload(MemoryNode.from_dict(item), include_metadata=True) for item in payload["nodes"]] + shared,
-            }
-        finally:
-            graph.close()
-
     def public_dashboard(self, *, limit: int = 50) -> dict[str, Any]:
         """Return the shared dashboard: agents, active task summaries, and context."""
         if not self.paths.dashboard_storage.exists() or self.paths.dashboard_storage.stat().st_size == 0:
@@ -552,7 +575,8 @@ class AgentWorkspace:
                                for session_id in node.properties.get("active_session_ids", [])}
             tasks = [self._work_payload(CoordinationStore._payload(node)) for node in nodes if node.type == "work_record"
                      and (item := node.properties)["kind"] == "task" and item["status"] not in TERMINAL
-                     and item["agent_id"] in active_agents and item["session_id"] in active_sessions]
+                     and (owner := task_claim(item) or item)["agent_id"] in active_agents
+                     and owner["session_id"] in active_sessions]
             context = [self._dashboard_context_payload(node) for node in nodes if node.type == "context"]
             agents.sort(key=lambda item: (str(item.get("last_activity_at") or ""), str(item["agent_id"])), reverse=True)
             tasks.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
@@ -637,9 +661,6 @@ class AgentWorkspace:
                     if node.id == WORKSPACE_NODE_ID:
                         continue
                     content = str(node.properties.get("content") or node.text or "")
-                    if node.type == "rejected_approach":
-                        reason = str((node.properties.get("metadata") or {}).get("reason") or "")
-                        content = f"{content} — {reason}"
                     if cls._dashboard_search_matches(content, needle):
                         results.append({
                             "timestamp": node.updated_at or node.created_at,
@@ -701,14 +722,15 @@ class AgentWorkspace:
 
     def operational_overview(self) -> dict[str, Any]:
         """Return complete private task and rejection history for project overview."""
-        shared = [self._work_payload(item) for item in self.coordination.records() if item["agent_id"] == self.agent_id]
+        shared = [self._work_payload(item) for item in self.coordination.records()
+                  if (task_claim(item) or item)["agent_id"] == self.agent_id]
         agent_status = self._agent_status()
         graph = self._require_agent(read_only=True)
         try:
             workspace = graph.get_node(WORKSPACE_NODE_ID)
             nodes = [node for node in graph.store.all_nodes() if node.id != WORKSPACE_NODE_ID]
             tasks = [item for item in shared if item["kind"] == "task"]
-            private_notes = [self._node_payload(node) for node in nodes if node.type in {"private_note", "note"}]
+            private_notes = [self._node_payload(node) for node in nodes if node.type == "private_note"]
             external_notes = [self._node_payload(node) for node in nodes if node.type == "external_note"]
             rejected_approaches = [item for item in shared if item["kind"] == "failure"]
             for section in (tasks, private_notes, external_notes, rejected_approaches):
@@ -740,25 +762,51 @@ class AgentWorkspace:
         work = CoordinationStore(dashboard_storage).overview(limit=limit)
         return {"agents": agents, "context": dashboard["context"], "work": work}
 
-    def finish(self, summary: str | None = None) -> dict[str, Any]:
-        """Close the current session and publish its final message as shared context."""
+    def finish(self, summary: str | None = None, *, task_id: str | None = None,
+               expected_revision: int | None = None,
+               before_finish: Callable[[], dict[str, Any]] | None = None,
+               prepare_verification: Callable[[list[str]], None] | None = None,
+               completion_guard: Callable[[], AbstractContextManager[object]] | None = None) -> dict[str, Any]:
+        """Close the session, publish its outcome and return its saved checkpoint receipt."""
 
         if not self.exists():
             raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
         summary_text = (summary or "").strip()
         if not summary_text:
             raise ValueError("Finish message must not be empty")
+        if len(summary_text) > MAX_WORK_RECORD_TEXT:
+            raise ValueError(f"Finish message must fit {MAX_WORK_RECORD_TEXT} characters")
+        if prepare_verification is not None and before_finish is None:
+            raise ValueError("Preparing changes for completion requires verification")
+        checked_session = self._active_session_id() if task_id is not None else None
+        committed = checked_session is not None and self.coordination.finish_committed(checked_session)
+        task = None if committed else self._assigned_task(task_id, expected_revision)
+        verification = None
+        if before_finish is not None and not committed:
+            if task is None:
+                raise ValueError("Verified completion requires an assigned task")
+            with self._lifecycle_lease() if prepare_verification is not None else nullcontext():
+                if checked_session is None:
+                    raise ValueError("No current agent session. Run `reql agent init --name \"...\"` first.")
+                require_task_claim(task, self.agent_id, checked_session)
+                if prepare_verification is not None:
+                    with self.coordination.claimed_edit(
+                        task["id"], task["revision"], agent_id=self.agent_id, session_id=checked_session,
+                    ) as files:
+                        prepare_verification(files)
+            # Tests can run for minutes. Recheck this session and the task's
+            # revision at completion without holding the workspace lease here.
+            verification = before_finish()
         with self._lifecycle_lease():
-            session_id = self._active_session_id()
-            work = [item for item in self.coordination.records() if item["session_id"] == session_id]
-            work.sort(key=lambda item: item["updated_at"], reverse=True)
-            work.sort(key=lambda item: item["status"] in TERMINAL)
-            existing_checkpoint = next((item for item in work if item["id"] == stable_id("work", "checkpoint", "", session_id or "")), None)
-            checkpoint_fields = {"record_id": existing_checkpoint["id"], "expected_revision": existing_checkpoint["revision"]} if existing_checkpoint else {}
-            self.record("checkpoint", summary_text, key=session_id, **checkpoint_fields,
-                        status="done", files=sorted({path for item in work for path in item["files"]})[:64],
-                        summarizes=[item["id"] for item in work if item["kind"] != "checkpoint"][:32],
-                        next_action="; ".join(item["next_action"] or item["content"] for item in work if item["kind"] == "task" and item["status"] not in TERMINAL)[:4000])
+            session_id, title = self._record_session()
+            if checked_session is not None and session_id != checked_session:
+                raise ValueError("Agent session changed during verification; reconcile before completing the task")
+            with completion_guard() if completion_guard is not None and not committed else nullcontext():
+                handoff = self.coordination.finish_session(
+                    summary_text, agent_id=self.agent_id, session_id=session_id, session_title=title,
+                    task_id=task_id, task_revision=task["revision"] if task is not None else None,
+                )
+            checkpoint = handoff["checkpoint"]
             graph = self._require_agent()
             closed_session = None
             remaining_sessions: dict[str, str] = {}
@@ -788,13 +836,20 @@ class AgentWorkspace:
             self._register_agent(status=status, session_id=closed_session)
             retention = self._prune_completed_agents()
             retention["work_records_removed"] = self.coordination.prune()
-        return {
+        result = {
             "agent_id": self.agent_id,
             "status": status,
             "closed_session_id": closed_session,
+            "checkpoint": {key: checkpoint[key] for key in ("id", "revision", "status")},
+            "released_claims": handoff["released_claims"],
             "context": context["context"],
             "retention": retention,
         }
+        if handoff["completed_task"] is not None:
+            result["completed_task"] = handoff["completed_task"]
+        if verification is not None:
+            result["verification"] = verification
+        return result
 
     def _publish(
         self, text: str, *, kind: str, target: str, task_id: str | None = None, session_id: str | None = None
@@ -998,11 +1053,6 @@ class AgentWorkspace:
                 if not any(path.exists() for path in self._agent_store_files(base)):
                     continue
                 try:
-                    legacy = MemoryGraph.open(base, read_only=True)
-                    try:
-                        CoordinationStore.migrate(graph.store, legacy.store.all_nodes(), agent_id)
-                    finally:
-                        legacy.close()
                     removed = self._remove_agent_store_path(base)
                 except StorageError as exc:
                     if "locked" not in str(exc).casefold():
@@ -1035,9 +1085,7 @@ class AgentWorkspace:
                 owner = str(node.properties.get("agent_id") or "")
                 identity = identities.get(owner)
                 inactive = identity is not None and identity.status in {"finished", "terminated"}
-                if node.type == "active_task" and (inactive or node.status != "active" or completion_key(node) in completed):
-                    removed_ids.add(node.id)
-                elif node.type in {"agent", "context"}:
+                if node.type in {"agent", "context"}:
                     if owner in deferred:
                         continue
                     if node.type == "agent" and owner in protected:
@@ -1147,13 +1195,10 @@ class AgentWorkspace:
         dashboard_node = self._public_dashboard_node(graph, now)
         dashboard_props = dict(dashboard_node.properties)
         dashboard_props.update({"updated_at": now})
-        dashboard_props.pop("standard_storage", None)
-        dashboard_props.pop("current_agent_id", None)
         graph.store.update_node_fields(dashboard_node.id, updated_at=now, properties=dashboard_props)
         node_id = stable_id("agent-identity", self.agent_id)
         existing = graph.get_node(node_id)
         props = dict(existing.properties) if existing is not None else {}
-        props.pop("standard_storage", None)
         props.pop("session_id", None)
         props.update(
             {
@@ -1297,7 +1342,6 @@ class AgentWorkspace:
                 "dashboard_storage": str(self.paths.dashboard_storage),
             }
         )
-        props.pop("standard_storage", None)
         node = MemoryNode(
             id=PUBLIC_DASHBOARD_NODE_ID,
             type="PublicDashboard",
@@ -1330,11 +1374,6 @@ class AgentWorkspace:
             "session_id": node.properties.get("session_id"),
             "session_title": node.properties.get("session_title"),
         }
-        if node.type == "rejected_approach":
-            payload["reason"] = payload["metadata"].get("reason")
-        if node.type == "task" and node.status == "done":
-            payload["completion_message"] = node.properties.get("completion_message")
-            payload["completed_at"] = node.properties.get("completed_at")
         return payload
 
     def _compact_node_payload(self, node: MemoryNode) -> dict[str, Any]:
@@ -1360,7 +1399,7 @@ class AgentWorkspace:
             "agent_id": str(properties.get("agent_id") or node.label),
             "status": node.status,
             "session_started_at": properties.get("session_started_at"),
-            "last_activity_at": properties.get("last_activity_at") or properties.get("last_seen_at") or node.updated_at,
+            "last_activity_at": properties.get("last_activity_at") or node.updated_at,
             "completed_at": properties.get("completed_at"),
             "terminated_at": properties.get("terminated_at"),
         }
@@ -1373,6 +1412,7 @@ class AgentWorkspace:
             "updated_at": node.updated_at or node.created_at,
             "agent_id": properties.get("agent_id"),
             "message_type": properties.get("message_type") or node.type,
+            "session_id": properties.get("session_id"),
             "content": properties.get("content") or node.text,
             "task_id": properties.get("task_id"),
             "status": node.status,

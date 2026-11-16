@@ -39,6 +39,10 @@ class ProjectRevision:
     changes: list[FileChange] = field(default_factory=list)
     created_at: str = field(default_factory=utcnow_iso)
 
+    def compare(self, artifacts: Iterable[SourceArtifact]) -> list[FileChange]:
+        """Compare scanned files with the committed manifest."""
+        return _changes(self.manifest, _manifest(artifacts))
+
     def to_dict(self, *, include_manifest: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "id": self.id,
@@ -56,7 +60,7 @@ class ProjectRevision:
 
 
 class RevisionRepository:
-    """Persist and retrieve Git-like project revisions in any graph store."""
+    """Persist and compare content-addressed project revisions."""
 
     def __init__(self, store: GraphStore) -> None:
         self.store = store
@@ -109,30 +113,39 @@ class RevisionRepository:
         return revision
 
     def latest(self, project_id: str) -> ProjectRevision | None:
-        revisions = self.list(project_id=project_id, limit=1)
-        return revisions[0] if revisions else None
+        """Materialize only the head revision for the project."""
+        node = max(self._committed_nodes(project_id), key=_revision_order, default=None)
+        return _revision_from_node(node) if node is not None else None
+
+    def latest_id(self, project_id: str) -> str | None:
+        """Read the head revision ID without copying the manifest."""
+        node = max(self._committed_nodes(project_id), key=_revision_order, default=None)
+        return _revision_id(node) if node is not None else None
 
     def list(self, *, project_id: str | None = None, limit: int = 20) -> list[ProjectRevision]:
+        """Select the newest committed sequences before applying the caller's limit."""
         limit = max(0, limit)
+        if not limit:
+            return []
+        committed = sorted(self._committed_nodes(project_id), key=_revision_order, reverse=True)
+        return [_revision_from_node(node) for node in committed[:limit]]
+
+    def _committed_nodes(self, project_id: str | None) -> Iterable[MemoryNode]:
+        """Borrow indexed revision rows without reconstructing their contents."""
         property_name = "project_id" if project_id is not None else "kind"
         property_value = project_id if project_id is not None else "project_revision"
         nodes = self.store.find_nodes_by_property(
             property_name,
             property_value,
             type_="ProjectRevision",
-            limit=max(limit * 5, 100),
+            limit=None,
             clone=False,
         )
-        revisions = [
-            _revision_from_node(node)
-            for node in nodes
-            if node.properties.get("kind") == "project_revision"
-        ]
-        revisions.sort(key=lambda item: (item.sequence, item.created_at, item.id), reverse=True)
-        return revisions[:limit]
+        return (node for node in nodes if node.properties.get("kind") == "project_revision")
 
     def get(self, revision_id: str) -> ProjectRevision | None:
-        node = self.store.get_node(revision_id)
+        """Build a detached revision from a borrowed graph record."""
+        node = self.store.get_node(revision_id, clone=False)
         if node is None or node.type != "ProjectRevision" or node.properties.get("kind") != "project_revision":
             return None
         return _revision_from_node(node)
@@ -215,11 +228,22 @@ def _revision_edge(
     )
 
 
+def _revision_id(node: MemoryNode) -> str:
+    """Use the persisted revision identity with the existing node-id fallback."""
+    return str(node.properties.get("id") or node.id)
+
+
+def _revision_order(node: MemoryNode) -> tuple[int, str, str]:
+    """Read chronology from scalar properties rather than copying a manifest."""
+    return (int(node.properties.get("sequence") or 0),
+            str(node.properties.get("created_at") or node.created_at), _revision_id(node))
+
+
 def _revision_from_node(node: MemoryNode) -> ProjectRevision:
     data: dict[str, Any] = dict(node.properties)
     raw_manifest = data.get("manifest") or {}
     return ProjectRevision(
-        id=str(data.get("id") or node.id),
+        id=_revision_id(node),
         project_id=str(data["project_id"]),
         run_id=str(data["run_id"]),
         tree_hash=str(data["tree_hash"]),

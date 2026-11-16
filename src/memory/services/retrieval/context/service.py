@@ -5,6 +5,7 @@ from collections import OrderedDict
 from dataclasses import replace
 from typing import Any, Sequence
 
+from ....artifacts.revision import ProjectRevision
 from ....domain.constants import INACTIVE_STATUSES
 from ....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from ..common import (
@@ -39,9 +40,9 @@ class ContextServiceMixin:
         )
         return self.render_context_payload(payload)
 
-    def render_context_payload(self, payload: dict[str, Any]) -> str:
+    def render_context_payload(self, payload: dict[str, Any], *, brief: bool = False) -> str:
         """Render an already projected query-context payload."""
-        return self._render_query_context_payload(payload)
+        return self._render_query_context_payload(payload, brief=brief)
 
     def query_context_payload(
         self,
@@ -50,8 +51,12 @@ class ContextServiceMixin:
         max_items: int = 20,
         query_mode: str = "informative",
         query_scopes: Sequence[str] | None = None,
+        include_source: bool = False,
+        brief: bool = False,
+        source_snapshots: dict[str, dict[str, Any]] | None = None,
+        source_revisions: dict[str, ProjectRevision | None] | None = None,
     ) -> dict[str, Any]:
-        """Return compact structured agent context without duplicated rendered Markdown."""
+        """Project the requested evidence, with optional complete brief source."""
         query_mode = self._normalize_query_context_mode(query_mode)
         scopes = self._normalize_query_context_scopes(query_scopes)
         subgraph = self._filter_query_context_subgraph(subgraph, scopes)
@@ -65,7 +70,10 @@ class ContextServiceMixin:
         if not document_scope and not exact_document_path and (
             explicit_code_scope or self._should_render_code_context(subgraph, max_items=max_items)
         ):
-            payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
+            payload = self._code_agent_context_payload(
+                subgraph, query_mode=query_mode, max_items=max_items, include_source=include_source,
+                brief=brief, source_snapshots=source_snapshots, source_revisions=source_revisions,
+            )
         else:
             payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
         visible_scores = (
@@ -76,7 +84,9 @@ class ContextServiceMixin:
         payload["confidence"] = self._query_context_confidence_payload(subgraph, visible_scores=visible_scores)
         payload["scopes"] = sorted(scopes)
         if query_mode == "informative" and not scopes:
-            related_files = self._related_file_payload(subgraph, max_items=max_items)
+            related_files = self._related_file_payload(
+                subgraph, max_items=max_items,
+            )
             payload["related_files"] = related_files
             if related_files:
                 payload["counts"]["related_files"] = len(related_files)
@@ -287,7 +297,7 @@ class ContextServiceMixin:
             list(seed_ids),
             edge_types=QUERY_EXPLORE_EDGE_TYPES,
             limit=max(1000, limit * 120),
-        )
+        ) if seed_ids else []
         for edge in incident_edges:
             for node_id in (edge.from_id, edge.to_id):
                 if node_id not in nodes:
@@ -311,7 +321,9 @@ class ContextServiceMixin:
         if "serialization_paths" in requested_views:
             sections["serialization_paths"] = self._query_explore_serialization_paths(query, seed_ids, nodes, incident_edges, limit=limit)
         if "docs_mentions" in requested_views:
-            sections["docs_mentions"] = self._query_explore_docs_mentions(query, seed_ids, nodes, incident_edges, limit=limit)
+            sections["docs_mentions"] = self._query_explore_docs_mentions(
+                query, seed_ids, nodes, incident_edges, limit=limit,
+            )
         if "structural_duplicates" in requested_views:
             structural_seeds = [
                 node
@@ -339,7 +351,7 @@ class ContextServiceMixin:
             "views": list(requested_views),
             "seed_nodes": [self._query_explore_node_payload(node, ranked_payloads.get(node.id)) for node in seed_nodes.values()],
             "sections": sections,
-            "followups": self._query_explore_followups(query.text, requested_views, seed_nodes),
+            "followups": self._query_explore_followups(query.text, requested_views),
             "counts": {
                 "seed_nodes": len(seed_nodes),
                 "incident_edges": len(incident_edges),

@@ -10,6 +10,7 @@ from ..domain.ids import stable_id
 from ..domain.models import MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
+from .compile_identity import ArtifactCompileIdentity
 from .fingerprint import DEFAULT_CHUNKING_VERSION, DEFAULT_PARSER_VERSION, options_hash
 from .models import ScanResult, SourceArtifact
 
@@ -65,12 +66,16 @@ class ArtifactCache:
         parser_version: str = DEFAULT_PARSER_VERSION,
         chunking_version: str = DEFAULT_CHUNKING_VERSION,
         compile_options: dict[str, object] | None = None,
+        identity: ArtifactCompileIdentity | None = None,
     ) -> None:
         self.store = store
         self.disk = DiskArtifactCache(cache_path) if cache_path is not None else None
-        self.parser_version = parser_version
-        self.chunking_version = chunking_version
-        self.options_hash = options_hash(compile_options)
+        self.identity = identity if identity is not None else ArtifactCompileIdentity(
+            parser_version, chunking_version, options_hash(compile_options),
+        )
+        self.parser_version = self.identity.parser_version
+        self.chunking_version = self.identity.chunking_version
+        self.options_hash = self.identity.options_digest
 
     def entry_id(self, project_id: str, artifact_id: str) -> str:
         return stable_id("artifact-cache", project_id, artifact_id)
@@ -103,10 +108,6 @@ class ArtifactCache:
             entries.setdefault(entry.artifact_id, entry)
         return entries
 
-    def is_cached(self, artifact: SourceArtifact) -> bool:
-        entry = self.get_entry(artifact.project_id, artifact.id)
-        return entry is not None and self.entry_matches_artifact(entry, artifact)
-
     def entry_matches_artifact(self, entry: ArtifactCacheEntry, artifact: SourceArtifact) -> bool:
         return artifact_cache_entry_matches(
             entry,
@@ -114,6 +115,26 @@ class ArtifactCache:
             parser_version=self.parser_version,
             chunking_version=self.chunking_version,
             expected_options_hash=self.options_hash,
+        ) and self._compiled_artifact_matches(artifact)
+
+    def _compiled_artifact_matches(self, artifact: SourceArtifact) -> bool:
+        """Verify cached or recoverable work against the graph's completed compilation."""
+        node = self.store.get_node(artifact.id, clone=False)
+        if node is None or node.status != "active":
+            return False
+        props = node.properties
+        return bool(
+            props.get("last_compiled_at")
+            and not props.get("parser_errors")
+            # An unavailable code parser did not establish a reusable symbol graph.
+            # Retry on the next compile so explicit grammar setup can take effect.
+            and props.get("parser_metadata", {}).get("module", {}).get("metadata", {}).get("parser_status") != "skipped"
+            and props.get("project_id") == artifact.project_id
+            and props.get("relative_path") == artifact.relative_path
+            and props.get("sha256") == artifact.sha256
+            and props.get("compiled_sha256") == artifact.sha256
+            and props.get("size_bytes") == artifact.size_bytes
+            and props.get("compilation_fingerprint") == self.identity.current(artifact)
         )
 
     def dirty_set(self, scan: ScanResult, entries: dict[str, ArtifactCacheEntry] | None = None) -> DirtySet:
@@ -140,25 +161,15 @@ class ArtifactCache:
         for artifact in scan.artifacts:
             if artifact.id not in artifact_ids or artifact.id in entry_map:
                 continue
-            node = self.store.get_node(artifact.id, clone=False)
-            if node is None or node.status != "active":
-                continue
-            props = node.properties
-            if (
-                props.get("last_compiled_at")
-                and str(props.get("project_id")) == artifact.project_id
-                and str(props.get("relative_path")) == artifact.relative_path
-                and str(props.get("sha256")) == artifact.sha256
-                and int(props.get("size_bytes", -1)) == artifact.size_bytes
-            ):
+            if self._compiled_artifact_matches(artifact):
                 recoverable.add(artifact.id)
         return recoverable
 
     def deleted_project_artifact_ids(self, scan: ScanResult) -> set[str]:
         current_artifact_ids = {artifact.id for artifact in scan.artifacts}
         deleted: set[str] = set()
-        for node in self.store.find_nodes_by_property("project_id", scan.project.id, type_="SourceArtifact", limit=100000, clone=False):
-            if node.status != "active" or not node.properties.get("last_compiled_at"):
+        for node in self.store.find_nodes_by_property("project_id", scan.project.id, type_="SourceArtifact", limit=None, clone=False):
+            if node.status != "active":
                 continue
             if node.id not in current_artifact_ids:
                 deleted.add(node.id)

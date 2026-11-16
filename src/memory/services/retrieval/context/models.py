@@ -69,6 +69,7 @@ class ExpansionComponent(Protocol):
         *,
         edge_types: set[str],
         code_context: bool,
+        scopes: set[str],
         metrics_cache: MutableMapping[str, NodeMatchMetrics] | None = None,
     ) -> tuple[OrderedDict[str, PathCandidate], OrderedDict[str, MemoryEdge]]: ...
 
@@ -94,4 +95,4 @@ class ContextServiceComponent(Protocol):
 
 
 class ContextRendererComponent(Protocol):
-    def _render_query_context_payload(self, payload: ContextPayload) -> str: ...
+    def _render_query_context_payload(self, payload: ContextPayload, *, brief: bool = False) -> str: ...
