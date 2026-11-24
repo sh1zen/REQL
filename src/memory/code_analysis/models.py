@@ -105,6 +105,15 @@ class CodeReference:
 
 
 @dataclass(slots=True)
+class CodeRoute:
+    """A statically identified route and the decorator that declares it."""
+
+    method: str
+    path: str
+    decorator: str
+
+
+@dataclass(slots=True)
 class CodeParseResult:
     module: CodeModule
     symbols: list[CodeSymbol]
@@ -116,6 +125,7 @@ class CodeParseResult:
     errors: list[str]
     parser_name: str
     parser_version: str
+    routes: dict[str, list[CodeRoute]] = field(default_factory=dict)
 
     @property
     def classes(self) -> list[CodeSymbol]:

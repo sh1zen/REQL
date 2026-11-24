@@ -1,9 +1,10 @@
 """Domain objects for scanned projects and source artifacts."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Literal
 
+from ..config.policies import TestDiscoveryPolicy
 from ..domain.timeutils import utcnow_iso
 
 ArtifactType = Literal[
@@ -48,24 +49,10 @@ class SourceArtifact:
     updated_at: str = field(default_factory=utcnow_iso)
     last_seen_at: str = field(default_factory=utcnow_iso)
     last_compiled_at: str | None = None
+    test_discovery: TestDiscoveryPolicy | None = field(default=None, repr=False, compare=False, kw_only=True)
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactFingerprint:
-    path: str
-    relative_path: str
-    size_bytes: int
-    mtime: float
-    sha256: str
-    parser_version: str
-    chunking_version: str
-    options_hash: str
-
-    def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        return {item.name: getattr(self, item.name) for item in fields(self) if item.name != "test_discovery"}
 
 
 @dataclass(frozen=True, slots=True)

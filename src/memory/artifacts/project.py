@@ -25,7 +25,7 @@ class ProjectRegistry:
         path: str | Path,
         *,
 
-        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+        max_file_size_bytes: int | None = DEFAULT_MAX_FILE_SIZE_BYTES,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
     ) -> ScanResult:
@@ -253,7 +253,7 @@ class ProjectRegistry:
         project = self.store.get_node_by_key("Project", root)
         if project is None:
             return None
-        artifacts = self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=100000, clone=False)
+        artifacts = self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=None, clone=False)
         counts_by_type: dict[str, int] = {}
         status_counts: dict[str, int] = {}
         for artifact in artifacts:
@@ -261,7 +261,7 @@ class ProjectRegistry:
             counts_by_type[artifact_type] = counts_by_type.get(artifact_type, 0) + 1
             status_counts[artifact.status] = status_counts.get(artifact.status, 0) + 1
         runs = self.store.find_nodes_by_property(
-            "project_id", project.id, type_="CompilationRun", limit=100000, clone=False,
+            "project_id", project.id, type_="CompilationRun", limit=None, clone=False,
         )
         latest = max(runs, key=lambda node: (str(node.properties.get("started_at") or ""), node.id), default=None)
         last_compilation = None
@@ -287,7 +287,7 @@ class ProjectRegistry:
     def _archive_missing(self, project: Project, seen_paths: set[str]) -> int:
         now = utcnow_iso()
         archived = 0
-        for node in self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=100000, clone=False):
+        for node in self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=None, clone=False):
             if node.properties.get("relative_path") in seen_paths:
                 continue
             if node.status in {"archived", "deleted"}:

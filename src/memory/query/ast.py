@@ -4,8 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from ..config.loader import default_config
+
 
 Scalar = str | int | float | bool | None
+
+
+DEFAULT_QUERY_DEFAULTS = default_config().query.defaults
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +62,7 @@ class FindNodes:
     where: Condition | None = None
     returns: ReturnSpec = field(default_factory=ReturnSpec)
     order_by: SortSpec | None = None
-    limit: int = 50
+    limit: int | None = None
     include_archived: bool = False
 
 
@@ -67,7 +72,7 @@ class FindEdges:
     where: Condition | None = None
     returns: ReturnSpec = field(default_factory=ReturnSpec)
     order_by: SortSpec | None = None
-    limit: int = 50
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +80,8 @@ class Search:
     text: str
     node_types: tuple[str, ...] = ()
     returns: ReturnSpec = field(default_factory=ReturnSpec)
-    top_k: int = 20
-    max_depth: int = 3
+    top_k: int | None = None
+    max_depth: int | None = None
     include_archived: bool = False
     context: bool = False
 
@@ -86,22 +91,22 @@ class Retrieve:
     text: str
     node_types: tuple[str, ...] = ()
     returns: ReturnSpec = field(default_factory=ReturnSpec)
-    top_k: int = 12
-    max_depth: int = 2
-    limit: int = 12
+    top_k: int | None = None
+    max_depth: int | None = None
+    limit: int | None = None
     include_sources: bool = True
     include_archived: bool = False
     filter_generic: bool = True
-    max_text_chars: int = 600
+    max_text_chars: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Activate:
     node_ids: tuple[str, ...]
     returns: ReturnSpec = field(default_factory=ReturnSpec)
-    max_depth: int = 3
-    min_activation: float = 0.03
-    limit: int = 50
+    max_depth: int | None = None
+    min_activation: float = DEFAULT_QUERY_DEFAULTS.activate_min
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +130,7 @@ class Match:
     where: Condition | None = None
     returns: ReturnSpec = field(default_factory=ReturnSpec)
     order_by: SortSpec | None = None
-    limit: int = 50
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,17 +146,17 @@ class PathQuery:
     end: NodeSelector
     edge_types: tuple[str, ...] = ()
     returns: ReturnSpec = field(default_factory=ReturnSpec)
-    max_depth: int = 4
-    limit: int = 10
+    max_depth: int | None = None
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Explain:
     mode: Literal["node", "search", "hub"]
     target: str
-    top_k: int = 10
-    max_depth: int = 2
-    limit: int = 30
+    top_k: int | None = None
+    max_depth: int | None = None
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +169,7 @@ class Stats:
 class Communities:
     where: Condition | None = None
     order_by: SortSpec | None = None
-    limit: int = 20
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +177,7 @@ class Hubs:
     node_types: tuple[str, ...] = ()
     where: Condition | None = None
     order_by: SortSpec | None = None
-    limit: int = 20
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,12 +187,12 @@ class TypedNodeList:
     where: Condition | None = None
     returns: ReturnSpec = field(default_factory=ReturnSpec)
     order_by: SortSpec | None = None
-    limit: int = 20
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CacheStatus:
-    limit: int = 20
+    limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

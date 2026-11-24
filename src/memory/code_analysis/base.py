@@ -7,7 +7,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from ..artifacts.fingerprint import PARSER_FACTS_VERSION
+from config import VERSION
+
 from ..artifacts.models import SourceArtifact
 from ..domain.ids import stable_id
 from .models import (
@@ -16,6 +17,7 @@ from .models import (
     CodeModule,
     CodeParseResult,
     CodeReference,
+    CodeRoute,
     CodeSymbol,
     CodeText,
     CodeTextKind,
@@ -26,7 +28,7 @@ from .catalog import CODE_LANGUAGE_CATALOG, language_key, load_tree_sitter_langu
 
 class TreeSitterCodeParser:
     parser_name = "tree_sitter"
-    parser_version = f"tree-sitter-code-v{PARSER_FACTS_VERSION}"
+    parser_version = VERSION
 
     def supports(self, language: str) -> bool:
         return language_key(language) in CODE_LANGUAGE_CATALOG
@@ -55,17 +57,7 @@ class TreeSitterExtractorBase(ABC):
 
     parser_name = TreeSitterCodeParser.parser_name
     parser_version = TreeSitterCodeParser.parser_version
-    facts_revision = 0
     syntax_recovery_containers: frozenset[str] = frozenset()
-
-    @classmethod
-    def facts_revisions(cls) -> tuple[tuple[str, int], ...]:
-        """Include independent revisions of the derived and shared extractors."""
-        return tuple(
-            (f"{owner.__module__}.{owner.__qualname__}", revision)
-            for owner in cls.__mro__
-            if (revision := owner.__dict__.get("facts_revision", 0))
-        )
 
     def __init__(self, artifact: SourceArtifact, source: bytes, language: str, language_key: str) -> None:
         self.artifact = artifact
@@ -75,7 +67,7 @@ class TreeSitterExtractorBase(ABC):
         self.module = CodeModule(
             id=stable_id("module", artifact.id),
             artifact_id=artifact.id,
-            name=_module_name(artifact.relative_path),
+            name=_module_name(artifact.relative_path, language_key),
             path=artifact.relative_path,
             language=language,
             metadata={"tree_sitter": True},
@@ -86,10 +78,10 @@ class TreeSitterExtractorBase(ABC):
         self.references: list[CodeReference] = []
         self.comments: list[CodeText] = []
         self.docstrings: list[CodeText] = []
+        self.routes: dict[str, list[CodeRoute]] = {}
 
     def extract(self, root: Any) -> CodeParseResult:
         self._walk_root(root)
-        revisions = self.facts_revisions()
         return CodeParseResult(
             module=self.module,
             symbols=self.symbols,
@@ -100,7 +92,8 @@ class TreeSitterExtractorBase(ABC):
             docstrings=self.docstrings,
             errors=[],
             parser_name=self.parser_name,
-            parser_version=stable_id(self.parser_version, revisions) if revisions else self.parser_version,
+            parser_version=self.parser_version,
+            routes=self.routes,
         )
 
     def _record_call(self, node: Any, scope: list[CodeSymbol], *, function_field: str) -> None:
@@ -160,7 +153,7 @@ def _parser_unavailable_result(artifact: SourceArtifact, language: str, warning:
     module = CodeModule(
         id=stable_id("module", artifact.id),
         artifact_id=artifact.id,
-        name=_module_name(artifact.relative_path),
+        name=_module_name(artifact.relative_path, language_key(language)),
         path=artifact.relative_path,
         language=language,
         metadata={
@@ -191,7 +184,7 @@ def _syntax_recovery_result(
         result = CodeParseResult(
             module=CodeModule(
                 id=stable_id("module", artifact.id), artifact_id=artifact.id,
-                name=_module_name(artifact.relative_path), path=artifact.relative_path,
+                name=_module_name(artifact.relative_path, language_key(language)), path=artifact.relative_path,
                 language=language, metadata={"tree_sitter": True},
             ),
             symbols=[], imports=[], calls=[], references=[], comments=[], docstrings=[], errors=[],
@@ -274,10 +267,7 @@ def _field(node: Any | None, name: str) -> Any | None:
     child_by_field_name = getattr(node, "child_by_field_name", None)
     if child_by_field_name is None:
         return None
-    try:
-        return child_by_field_name(name)
-    except Exception:
-        return None
+    return child_by_field_name(name)
 
 
 def _node_text(source: bytes, node: Any | None) -> str:
@@ -391,32 +381,14 @@ def _last_quoted(raw: str) -> str | None:
     return None
 
 
-_SYMBOL_NAME_STOP_WORDS = {
-    "class",
-    "def",
-    "enum",
-    "fn",
-    "func",
-    "function",
-    "import",
-    "include",
-    "interface",
-    "package",
-    "struct",
-    "trait",
-    "type",
-    "use",
-}
-
-
 def _valid_symbol_name(name: str) -> bool:
-    value = name.strip()
-    return bool(value) and value.casefold() not in _SYMBOL_NAME_STOP_WORDS and any(char.isalpha() or char == "_" for char in value)
+    """Reject punctuation-only names while trusting grammar-specific identifier nodes."""
+    return any(char.isalpha() or char == "_" for char in name)
 
 
-def _module_name(relative_path: str) -> str:
+def _module_name(relative_path: str, language: str) -> str:
     path = Path(relative_path)
     parts = list(path.with_suffix("").parts)
-    if parts and parts[-1] == "__init__":
+    if language == "python" and parts and parts[-1] == "__init__":
         parts.pop()
     return ".".join(parts) or path.stem

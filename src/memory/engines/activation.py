@@ -4,6 +4,8 @@ from __future__ import annotations
 import heapq
 from collections import defaultdict
 
+from ..config import default_config
+from ..config.models import ActivationPolicy
 from ..domain.constants import INACTIVE_STATUSES
 from ..domain.models import ActivationOptions, ActivationResult, MemoryEdge, MemoryNode
 from ..extraction.normalization import clamp
@@ -14,21 +16,21 @@ from ..storage.graph_store import GraphStore
 class ActivationEngine:
     """Propagates activation through the property graph.
 
-    The engine is intentionally local: it starts from seed nodes, traverses only
-    the strongest adjacent edges within a bounded depth, applies inhibition via
-    negative polarity, then stores the resulting activation values.
+    The engine visits eligible adjacent edges from the seeds, applies inhibition
+    via negative polarity and stores the resulting activation values.
     """
 
-    BLOCKED_BY_DEFAULT = {"EXTRACTED_FROM", "COMPILED_IN", "AFFECTED_BY_DELTA"}
-
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, policy: ActivationPolicy | None = None) -> None:
         self.store = store
+        self.policy = policy if policy is not None else default_config().analysis.activation
 
     def activate(self, seed_node_ids: list[str], options: ActivationOptions) -> ActivationResult:
+        """Propagate activation across every eligible relationship at the requested depth."""
         if not seed_node_ids:
             return ActivationResult(active_nodes=[], fired_edges=[], activation_by_node={})
 
-        blocked = set(options.blocked_edge_types or ()) | self.BLOCKED_BY_DEFAULT
+        policy = self.policy
+        blocked = set(options.blocked_edge_types or ()).union(policy.blocked_edge_types)
         activation: dict[str, float] = defaultdict(float)
         best_depth: dict[str, int] = {}
         fired_edges: dict[str, MemoryEdge] = {}
@@ -46,20 +48,21 @@ class ActivationEngine:
         while heap:
             neg_value, depth, current_id = heapq.heappop(heap)
             current_value = -neg_value
-            if depth >= options.max_depth:
+            if options.max_depth is not None and depth >= options.max_depth:
                 continue
             if current_value < options.min_activation:
                 continue
-            if current_value + 1e-9 < activation[current_id]:
+            if abs(current_value - activation[current_id]) > 1e-9:
                 continue
 
             neighbors = self.store.neighbors(
                 current_id,
                 direction="both" if options.traverse_incoming else "out",
                 edge_types=options.allowed_edge_types,
-                min_weight=0.01,
-                limit=120,
+                min_weight=policy.min_edge_weight,
+                limit=None,
             )
+            depth_factor = options.depth_decay ** (depth + 1)
             for edge, neighbor in neighbors:
                 if edge.type in blocked:
                     continue
@@ -67,13 +70,13 @@ class ActivationEngine:
                     continue
                 if options.allowed_edge_types and edge.type not in options.allowed_edge_types:
                     continue
-                depth_factor = options.depth_decay ** (depth + 1)
-                status_factor = 0.35 if neighbor.status in {"latent", "candidate"} else 1.0
+                status_factor = policy.latent_factor if neighbor.status in {"latent", "candidate"} else 1.0
                 signal = current_value * edge.weight * edge.confidence * depth_factor * status_factor
-                if edge.polarity < 0 or edge.type in {"INHIBITS", "SUPPRESSES", "BLOCKS", "WEAKENS"}:
-                    signal *= -0.75
-                new_value = clamp(activation[neighbor.id] + signal)
-                if new_value <= activation[neighbor.id] + 1e-9:
+                if edge.polarity < 0 or edge.type in policy.negative_edge_types:
+                    signal *= -policy.negative_factor
+                previous = activation.get(neighbor.id, 0.0)
+                new_value = clamp(previous + signal)
+                if abs(new_value - previous) <= 1e-9:
                     continue
                 activation[neighbor.id] = new_value
                 fired_edges[edge.id] = edge
@@ -87,25 +90,27 @@ class ActivationEngine:
         active_nodes: list[MemoryNode] = []
         now = utcnow_iso()
         if options.update_store:
-            for node_id, value in active_items:
-                node = self.store.get_node(node_id)
-                if not node:
-                    continue
-                blended = clamp(max(value, node.activation * options.persistence))
-                updated = self.store.update_node_fields(
-                    node_id,
-                    activation=blended,
-                    last_activated_at=now,
-                    usage_count=node.usage_count + 1,
-                )
-                if updated:
-                    active_nodes.append(updated)
-            for edge in fired_edges.values():
-                self.store.update_edge_fields(
-                    edge.id,
-                    co_activation_count=edge.co_activation_count + 1,
-                    last_fired_at=now,
-                )
+            if active_items:
+                with self.store.transaction():
+                    for node_id, value in active_items:
+                        node = self.store.get_node(node_id)
+                        if not node:
+                            continue
+                        blended = clamp(max(value, node.activation * options.persistence))
+                        updated = self.store.update_node_fields(
+                            node_id,
+                            activation=blended,
+                            last_activated_at=now,
+                            usage_count=node.usage_count + 1,
+                        )
+                        if updated:
+                            active_nodes.append(updated)
+                    for edge in fired_edges.values():
+                        self.store.update_edge_fields(
+                            edge.id,
+                            co_activation_count=edge.co_activation_count + 1,
+                            last_fired_at=now,
+                        )
         else:
             active_nodes = [n for n in self.store.get_nodes([node_id for node_id, _ in active_items]) if n]
 

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
 
+from ..config import default_config
+from ..config.models import CentralityPolicy
 from ..domain.models import MemoryEdge, MemoryNode
 from ..storage.graph_store import GraphStore
 
@@ -24,8 +25,9 @@ class CentralityMetrics:
 class CentralityCalculator:
     """Computes dependency-light graph centrality approximations."""
 
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, policy: CentralityPolicy | None = None) -> None:
         self.store = store
+        self.policy = policy if policy is not None else default_config().analysis.centrality
 
     def calculate(
         self,
@@ -33,22 +35,27 @@ class CentralityCalculator:
         project_id: str | None = None,
         community_by_node: dict[str, str] | None = None,
         candidate_nodes: list[MemoryNode] | None = None,
-        edge_limit: int = 20000,
+        edge_limit: int | None = None,
     ) -> dict[str, CentralityMetrics]:
-        nodes = candidate_nodes if candidate_nodes is not None else _candidate_nodes(self.store.all_nodes(), project_id)
+        """Calculate centrality from the scoped edges unless the caller sets an edge limit."""
+        policy = self.policy
+        ignored_edges = set(policy.ignored_edge_types)
+        nodes = candidate_nodes if candidate_nodes is not None else _candidate_nodes(
+            self.store.all_nodes(), project_id, policy.excluded_node_types,
+        )
         node_ids = {node.id for node in nodes}
-        if candidate_nodes is not None:
-            edges = [
-                edge
-                for edge in self.store.incident_edges(sorted(node_ids), ignored_edge_types=IGNORED_EDGE_TYPES, limit=edge_limit)
-                if edge.from_id in node_ids and edge.to_id in node_ids
-            ]
+        if edge_limit is None and candidate_nodes is None:
+            edge_records = self.store.all_edges()
         else:
-            edges = [edge for edge in self.store.all_edges() if edge.from_id in node_ids and edge.to_id in node_ids and edge.type not in IGNORED_EDGE_TYPES]
+            edge_records = self.store.incident_edges(
+                sorted(node_ids), ignored_edge_types=ignored_edges, limit=edge_limit, clone=False,
+            )
         in_edges: dict[str, list[MemoryEdge]] = {node_id: [] for node_id in node_ids}
         out_edges: dict[str, list[MemoryEdge]] = {node_id: [] for node_id in node_ids}
         neighbors: dict[str, set[str]] = {node_id: set() for node_id in node_ids}
-        for edge in edges:
+        for edge in edge_records:
+            if edge.from_id not in node_ids or edge.to_id not in node_ids or edge.type in ignored_edges:
+                continue
             out_edges[edge.from_id].append(edge)
             in_edges[edge.to_id].append(edge)
             neighbors[edge.from_id].add(edge.to_id)
@@ -73,32 +80,31 @@ class CentralityCalculator:
                 out_degree=len(out_edges[node.id]),
                 bridge_score=self._bridge_score(node.id, neighbors),
                 community_bridge_score=self._community_bridge_score(node.id, neighbors, community_by_node),
-                activation_frequency=_activation_frequency(node),
+                activation_frequency=_activation_frequency(node, policy.activation_saturation),
                 retrieval_usefulness=_retrieval_usefulness(node),
             )
         return out
 
     def _bridge_score(self, node_id: str, neighbors: dict[str, set[str]]) -> float:
-        """Measure disconnected neighbor pairs without materializing list slices."""
-        adjacent = neighbors.get(node_id, set())
+        """Count connected neighbor pairs directly, including in sparse neighborhoods."""
+        adjacent = neighbors[node_id]
         if len(adjacent) < 2:
             return 0.0
-        disconnected_pairs = sum(
-            1 for left, right in combinations(adjacent, 2)
-            if right not in neighbors.get(left, ())
-        )
+        connected_pairs = sum(len(adjacent & neighbors[left]) - (left in neighbors[left]) for left in adjacent) // 2
         total_pairs = len(adjacent) * (len(adjacent) - 1) // 2
-        return disconnected_pairs / total_pairs
+        return (total_pairs - connected_pairs) / total_pairs
 
     def _community_bridge_score(self, node_id: str, neighbors: dict[str, set[str]], community_by_node: dict[str, str]) -> float:
         communities = {community_by_node.get(neighbor) for neighbor in neighbors.get(node_id, set()) if community_by_node.get(neighbor)}
         if not communities:
             return 0.0
-        return min(1.0, (len(communities) - 1) / 3)
+        return min(1.0, (len(communities) - 1) / self.policy.community_saturation)
 
 
-def _candidate_nodes(nodes: list[MemoryNode], project_id: str | None) -> list[MemoryNode]:
-    blocked = {"CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace"}
+def _candidate_nodes(
+    nodes: list[MemoryNode], project_id: str | None, excluded_types: tuple[str, ...],
+) -> list[MemoryNode]:
+    blocked = set(excluded_types)
     out = []
     for node in nodes:
         if node.status in {"archived", "deleted", "rejected"} or node.type in blocked:
@@ -109,12 +115,9 @@ def _candidate_nodes(nodes: list[MemoryNode], project_id: str | None) -> list[Me
     return out
 
 
-IGNORED_EDGE_TYPES = {"BELONGS_TO_COMMUNITY", "BRIDGES_COMMUNITY"}
-
-
-def _activation_frequency(node: MemoryNode) -> float:
+def _activation_frequency(node: MemoryNode, saturation: float) -> float:
     raw = float(node.usage_count or 0) + float(node.properties.get("activation_count") or 0)
-    return min(1.0, raw / 20.0)
+    return min(1.0, raw / saturation)
 
 
 def _retrieval_usefulness(node: MemoryNode) -> float:

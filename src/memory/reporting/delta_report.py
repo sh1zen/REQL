@@ -3,8 +3,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..config import default_config
+from ..config.models import MarkdownReportPolicy
+from .presentation import omitted_items
+
 
 class DeltaReportBuilder:
+    def __init__(self, *, policy: MarkdownReportPolicy | None = None) -> None:
+        self.policy = policy if policy is not None else default_config().reporting.markdown
+
     def render(self, context: dict[str, Any]) -> str:
         lines = [
             "# REQL Delta Report",
@@ -18,7 +25,7 @@ class DeltaReportBuilder:
         if not deltas:
             lines.append("- No data yet.")
             return "\n".join(lines).rstrip() + "\n"
-        for node in deltas[:50]:
+        for node in deltas[:self.policy.delta_limit or None]:
             props = node.properties
             lines.append(f"### {node.id}")
             lines.append("")
@@ -32,6 +39,9 @@ class DeltaReportBuilder:
             lines.append(f"- Updated edges: {len(props.get('updated_edges') or [])}")
             lines.append(f"- Archived edges: {len(props.get('archived_edges') or [])}")
             affected = props.get("affected_node_ids") or []
-            lines.append(f"- Affected node ids: {', '.join(affected[:10]) if affected else 'No data yet'}")
+            visible = affected[:self.policy.section_limit or None]
+            lines.append(f"- Affected node ids: {', '.join(visible) if affected else 'No data yet'}")
+            lines.extend(omitted_items(len(affected), self.policy.section_limit))
             lines.append("")
+        lines.extend(omitted_items(len(deltas), self.policy.delta_limit))
         return "\n".join(lines).rstrip() + "\n"

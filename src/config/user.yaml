@@ -1,8 +1,10 @@
+# Project defaults. Override these settings in reql.conf.
+
 project:
   id: default
 
 scan:
-  max_file_size_mb: 10
+  max_file_size_mb: 0
   ignore_defaults: false
   include: []
   exclude:
@@ -21,19 +23,19 @@ scan:
     - .pytest_cache/
     - .ruff_cache/
     - .DS_Store
-    - *.pyc
-    - *.sqlite
-    - *.sqlite-journal
-    - *.sqlite-shm
-    - *.sqlite-wal
-    - *.sqlite3
-    - *.sqlite3-journal
-    - *.sqlite3-shm
-    - *.sqlite3-wal
-    - *.db
-    - *.db-journal
-    - *.db-shm
-    - *.db-wal
+    - "*.pyc"
+    - "*.sqlite"
+    - "*.sqlite-journal"
+    - "*.sqlite-shm"
+    - "*.sqlite-wal"
+    - "*.sqlite3"
+    - "*.sqlite3-journal"
+    - "*.sqlite3-shm"
+    - "*.sqlite3-wal"
+    - "*.db"
+    - "*.db-journal"
+    - "*.db-shm"
+    - "*.db-wal"
 
 compile:
   ingest_documents: true
@@ -68,20 +70,52 @@ compile:
     xml: {"extensions": [".xml"]}
     jsond: {"extensions": [".jsond"]}
 
+testing:
+  discovery:
+    directories: ["test", "tests", "spec", "specs", "__tests__"]
+  suggestions:
+    evidence_order: ["observed", "static", "candidate"]
+
 cache:
   enabled: true
-  fingerprint_strategy: sha256
-
-analysis:
-  enable_hubs: true
-  enable_communities: true
 
 reporting:
   output_dir: reports
+  markdown:
+    section_limit: 10
+    delta_limit: 50
+    cache_limit: 50
+    analysis_limit: 20
+  html:
+    graph_search_limit: 20
+    graph_detail_edge_limit: 40
+    graph_menu_edge_limit: 8
+    graph_label_chars: 180
+    graph_text_chars: 420
+    graph_property_chars: 180
+    graph_property_items: 8
+    pipeline_search_limit: 8
 
 diagnostics:
   enabled: false
   path: ""
+
+workspace:
+  default_agent_id: master
+  private_store_name: agent.reql
+  dashboard_store_name: agent-dashboard.reql
+  agents_dir: agents
+
+mcp:
+  host: 127.0.0.1
+  port: 8765
+  max_top_k: 50
+  max_depth: 5
+  max_items: 50
+  max_query_rows: 200
+  max_nodes: 200
+  max_edges: 400
+  max_text_chars: 2000
 
 retention:
   commits: 20

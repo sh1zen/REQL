@@ -39,7 +39,7 @@ class CommandParserMixin(ClauseParserMixin):
         where: Condition | None = None
         returns = ReturnSpec()
         order_by: SortSpec | None = None
-        limit = 50
+        limit = None
         include_archived = False
 
         while self.current.kind != "EOF":
@@ -73,8 +73,8 @@ class CommandParserMixin(ClauseParserMixin):
             raise REQLSyntaxError("SEARCH expects a string literal or text value")
         node_types: tuple[str, ...] = ()
         returns = ReturnSpec()
-        top_k = 20
-        depth = 3
+        top_k = None
+        depth = None
         include_archived = False
         context = False
         while self.current.kind != "EOF":
@@ -101,13 +101,13 @@ class CommandParserMixin(ClauseParserMixin):
             raise REQLSyntaxError("RETRIEVE expects a string literal or text value")
         node_types: tuple[str, ...] = ()
         returns = ReturnSpec()
-        top_k = 12
-        limit = 12
-        depth = 2
+        top_k = None
+        limit = None
+        depth = None
         include_sources = True
         include_archived = False
         filter_generic = True
-        max_text_chars = 600
+        max_text_chars = None
         while self.current.kind != "EOF":
             if self.match_keyword("TYPE") or self.match_keyword("TYPES"):
                 node_types = self._parse_ident_list()
@@ -156,9 +156,9 @@ class CommandParserMixin(ClauseParserMixin):
             pass
         node_ids = self._parse_value_list_as_strings()
         returns = ReturnSpec()
-        depth = 3
-        min_activation = 0.03
-        limit = 50
+        depth = None
+        min_activation = self.defaults.activate_min
+        limit = None
         while self.current.kind != "EOF":
             if self.match_keyword("DEPTH"):
                 depth = self._parse_positive_int("depth")
@@ -180,7 +180,7 @@ class CommandParserMixin(ClauseParserMixin):
         where: Condition | None = None
         returns = ReturnSpec()
         order_by: SortSpec | None = None
-        limit = 50
+        limit = None
         while self.current.kind != "EOF":
             if self.match_keyword("WHERE"):
                 where = self._parse_condition_until(RESERVED_EXPRESSION_ENDS)
@@ -202,8 +202,8 @@ class CommandParserMixin(ClauseParserMixin):
         end = self._parse_selector()
         edge_types: tuple[str, ...] = ()
         returns = ReturnSpec()
-        depth = 4
-        limit = 10
+        depth = None
+        limit = None
         while self.current.kind != "EOF":
             if self.match_keyword("DEPTH"):
                 depth = self._parse_positive_int("depth")
@@ -225,7 +225,7 @@ class CommandParserMixin(ClauseParserMixin):
             target = self.expect_value()
             if not isinstance(target, str):
                 target = str(target)
-            limit = 30
+            limit = None
             while self.current.kind != "EOF":
                 if self.match_keyword("LIMIT"):
                     limit = self._parse_positive_int("limit")
@@ -236,8 +236,8 @@ class CommandParserMixin(ClauseParserMixin):
             target = self.expect_value()
             if not isinstance(target, str):
                 raise REQLSyntaxError("EXPLAIN SEARCH expects text")
-            top_k = 10
-            depth = 2
+            top_k = None
+            depth = None
             while self.current.kind != "EOF":
                 if self.match_keyword("TOP") or self.match_keyword("LIMIT"):
                     top_k = self._parse_positive_int("top")
@@ -252,9 +252,9 @@ class CommandParserMixin(ClauseParserMixin):
         return Explain(mode="search", target=target)
 
     def _parse_communities(self) -> Communities:
-        limit = 20
         where: Condition | None = None
         order_by: SortSpec | None = None
+        limit = None
         while self.current.kind != "EOF":
             if self.match_keyword("WHERE"):
                 where = self._parse_condition_until({"ORDER", "LIMIT", "TOP"})
@@ -271,7 +271,7 @@ class CommandParserMixin(ClauseParserMixin):
         node_types: tuple[str, ...] = ()
         where: Condition | None = None
         order_by: SortSpec | None = None
-        limit = 20
+        limit = None
         while self.current.kind != "EOF":
             if self.match_keyword("TYPE") or self.match_keyword("TYPES"):
                 node_types = self._parse_ident_list()
@@ -292,12 +292,12 @@ class CommandParserMixin(ClauseParserMixin):
         default_types: tuple[str, ...],
         *,
         allow_type: bool,
-        limit: int = 20,
     ) -> TypedNodeList:
         node_types = default_types
         where: Condition | None = None
         returns = ReturnSpec()
         order_by: SortSpec | None = None
+        limit = None
         while self.current.kind != "EOF":
             if allow_type and (self.match_keyword("TYPE") or self.match_keyword("TYPES")):
                 node_types = self._parse_ident_list()
@@ -316,7 +316,7 @@ class CommandParserMixin(ClauseParserMixin):
 
     def _parse_cache(self) -> CacheStatus:
         if self.match_keyword("STATUS"):
-            limit = 20
+            limit = None
             while self.current.kind != "EOF":
                 if self.match_keyword("LIMIT") or self.match_keyword("TOP"):
                     limit = self._parse_positive_int("limit")

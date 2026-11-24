@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PurePosixPath, PureWindowsPath
+import re
 from typing import Any, Iterable, Literal
 
 
@@ -46,6 +48,36 @@ class RetrievalBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class SeenSourceRange:
+    """A verified range delivered by a previous brief."""
+
+    path: str
+    line_start: int
+    line_end: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        path = PurePosixPath(self.path)
+        if (not path.parts or path.is_absolute() or PureWindowsPath(self.path).drive or ".." in path.parts
+                or "\\" in self.path or any(char in self.path for char in "\x00\r\n")
+                or type(self.line_start) is not int or type(self.line_end) is not int
+                or not 1 <= self.line_start <= self.line_end
+                or re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None):
+            raise ValueError("seen source requires a project-relative path, ordered lines and a SHA-256 hash")
+
+    @classmethod
+    def parse(cls, value: str) -> "SeenSourceRange":
+        """Parse the range format used in follow-up commands."""
+        match = re.fullmatch(r"(.+)#L([1-9][0-9]{0,7})-L([1-9][0-9]{0,7})@([0-9a-f]{64})", value)
+        if match is None:
+            raise ValueError("use --seen-source PATH#LSTART-LEND@SHA256")
+        return cls(match[1], int(match[2]), int(match[3]), match[4])
+
+    def __str__(self) -> str:
+        return f"{self.path}#L{self.line_start}-L{self.line_end}@{self.sha256}"
+
+
+@dataclass(frozen=True, slots=True)
 class QueryContextRequest:
     """Canonical request accepted by the query-context application service."""
 
@@ -56,6 +88,7 @@ class QueryContextRequest:
     include_archived: bool = False
     include_source: bool = False
     task_id: str | None = None
+    seen_source: tuple[SeenSourceRange, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
@@ -77,6 +110,8 @@ class QueryContextRequest:
             raise ValueError("include_source requires explicit code or test scopes without docs")
         if self.task_id is not None and (not isinstance(self.task_id, str) or not self.task_id.strip()):
             raise ValueError("task_id must be a nonempty work record id")
+        if not isinstance(self.seen_source, tuple) or any(not isinstance(span, SeenSourceRange) for span in self.seen_source):
+            raise TypeError("seen_source must be a tuple of SeenSourceRange")
 
     @classmethod
     def from_raw(
@@ -91,6 +126,7 @@ class QueryContextRequest:
         include_archived: bool = False,
         include_source: bool = False,
         task_id: str | None = None,
+        seen_source: Iterable[SeenSourceRange] = (),
     ) -> "QueryContextRequest":
         """Normalize provider primitives into the canonical typed request."""
         try:
@@ -116,6 +152,7 @@ class QueryContextRequest:
             include_archived=include_archived,
             include_source=include_source,
             task_id=task_id,
+            seen_source=tuple(seen_source),
         )
 
 

@@ -5,20 +5,20 @@ from collections import OrderedDict
 from dataclasses import replace
 from typing import Any, Sequence
 
+from ....artifacts.context_scope import application_surface_kind
 from ....artifacts.revision import ProjectRevision
 from ....domain.constants import INACTIVE_STATUSES
 from ....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from ....domain.query_context import SeenSourceRange
 from ..common import (
     CODE_CONTEXT_NODE_TYPES,
     DEFAULT_CONTEXT_EDGE_TYPES,
     GRAPH_SEED_NODE_TYPES,
-    QUERY_CONTEXT_MIN_CONFIDENCE_SCORE,
     QUERY_EXPLORE_EDGE_TYPES,
     SOURCE_EDGE_TYPES,
     SOURCE_NODE_TYPES,
     TECHNICAL_EDGE_TYPES,
     TECHNICAL_NODE_TYPES,
-    _expanded_tokens,
 )
 
 
@@ -40,9 +40,11 @@ class ContextServiceMixin:
         )
         return self.render_context_payload(payload)
 
-    def render_context_payload(self, payload: dict[str, Any], *, brief: bool = False) -> str:
+    def render_context_payload(
+        self, payload: dict[str, Any], *, brief: bool = False, displayed_source: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Render an already projected query-context payload."""
-        return self._render_query_context_payload(payload, brief=brief)
+        return self._render_query_context_payload(payload, brief=brief, displayed_source=displayed_source)
 
     def query_context_payload(
         self,
@@ -52,9 +54,11 @@ class ContextServiceMixin:
         query_mode: str = "informative",
         query_scopes: Sequence[str] | None = None,
         include_source: bool = False,
+        include_previews: bool = True,
         brief: bool = False,
         source_snapshots: dict[str, dict[str, Any]] | None = None,
         source_revisions: dict[str, ProjectRevision | None] | None = None,
+        seen_source: Sequence[SeenSourceRange] = (),
     ) -> dict[str, Any]:
         """Project the requested evidence, with optional complete brief source."""
         query_mode = self._normalize_query_context_mode(query_mode)
@@ -72,7 +76,9 @@ class ContextServiceMixin:
         ):
             payload = self._code_agent_context_payload(
                 subgraph, query_mode=query_mode, max_items=max_items, include_source=include_source,
+                include_previews=include_previews,
                 brief=brief, source_snapshots=source_snapshots, source_revisions=source_revisions,
+                seen_source=seen_source,
             )
         else:
             payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
@@ -92,8 +98,8 @@ class ContextServiceMixin:
                 payload["counts"]["related_files"] = len(related_files)
         return payload
 
-    @staticmethod
     def _query_context_confidence_payload(
+        self,
         subgraph: MemorySubgraph,
         *,
         visible_scores: Sequence[float] | None = None,
@@ -102,16 +108,19 @@ class ContextServiceMixin:
             visible_scores if visible_scores is not None else (float(item.score) for item in subgraph.ranked_nodes),
             default=0.0,
         )
-        sufficient = max_score >= QUERY_CONTEXT_MIN_CONFIDENCE_SCORE
+        threshold = self.policy.context.min_confidence
+        has_matches = bool(subgraph.ranked_nodes if visible_scores is None else visible_scores)
+        sufficient = has_matches and max_score >= threshold
         return {
             "status": "sufficient" if sufficient else "insufficient",
             "max_score": round(max_score, 4),
-            "threshold": QUERY_CONTEXT_MIN_CONFIDENCE_SCORE,
+            "threshold": threshold,
             "targeted_rg_fallback_allowed": not sufficient,
             "reason": (
                 "top ranked result meets the minimum confidence threshold"
                 if sufficient
-                else "top ranked result is below the minimum confidence threshold"
+                else "top ranked result is below the minimum confidence threshold" if has_matches
+                else "retrieval returned no ranked results"
             ),
         }
 
@@ -132,6 +141,7 @@ class ContextServiceMixin:
         max_sources = max(0, max_sources)
         retrieval = self.retrieve(query)
 
+        seed_limit = max(query.top_k, 1) if query.top_k is not None else max_nodes
         seed_nodes: OrderedDict[str, MemoryNode] = OrderedDict()
         for node_id in retrieval.seed_node_ids:
             node = self.store.get_node(node_id)
@@ -142,14 +152,14 @@ class ContextServiceMixin:
             if not query.include_archived and node.status in INACTIVE_STATUSES:
                 continue
             seed_nodes[node.id] = node
-            if len(seed_nodes) >= max(query.top_k, 1):
+            if len(seed_nodes) >= seed_limit:
                 break
         if not seed_nodes:
             for item in retrieval.ranked_nodes:
                 if item.node.type not in GRAPH_SEED_NODE_TYPES or not self._is_graph_layer_node(item.node):
                     continue
                 seed_nodes[item.node.id] = item.node
-                if len(seed_nodes) >= max(query.top_k, 1):
+                if len(seed_nodes) >= seed_limit:
                     break
 
         nodes: OrderedDict[str, MemoryNode] = OrderedDict()
@@ -169,7 +179,7 @@ class ContextServiceMixin:
             expanded_nodes, expanded_edges = self.store.bounded_neighborhood(
                 seed_id,
 
-                max_depth=query.max_depth,
+                max_depth=query.max_depth if query.max_depth is not None else max_nodes,
                 edge_types=traversal_edge_types,
                 limit=max_nodes,
             )
@@ -272,6 +282,10 @@ class ContextServiceMixin:
         requested_views = self._normalize_query_explore_views(views)
         limit = max(1, int(limit))
         max_items = max(1, int(max_items))
+        policy = self.policy.explore
+        edge_types = QUERY_EXPLORE_EDGE_TYPES.union(
+            policy.owner_edges, policy.caller_edges, policy.public_surface_edges, policy.serialization_edges, policy.docs_edges,
+        )
         code_query = MemoryQuery(
             text=query.text,
             top_k=query.top_k,
@@ -279,7 +293,7 @@ class ContextServiceMixin:
             min_activation=query.min_activation,
             include_archived=query.include_archived,
             node_types=set(CODE_CONTEXT_NODE_TYPES),
-            edge_types=QUERY_EXPLORE_EDGE_TYPES,
+            edge_types=edge_types,
             store_trace=query.store_trace,
         )
         subgraph = self.retrieve(code_query)
@@ -295,7 +309,7 @@ class ContextServiceMixin:
 
         incident_edges = self.store.incident_edges(
             list(seed_ids),
-            edge_types=QUERY_EXPLORE_EDGE_TYPES,
+            edge_types=edge_types,
             limit=max(1000, limit * 120),
         ) if seed_ids else []
         for edge in incident_edges:
@@ -310,7 +324,6 @@ class ContextServiceMixin:
             for item in subgraph.ranked_nodes
             if self._is_code_context_node(item.node)
         }
-        code_payload = self._code_agent_context_payload(subgraph, query_mode="informative", max_items=max_items)
         sections: dict[str, Any] = {}
         if "owners" in requested_views:
             sections["owners"] = self._query_explore_owners(seed_ids, nodes, incident_edges, limit=limit)
@@ -330,10 +343,11 @@ class ContextServiceMixin:
                 for node_id in subgraph.seed_node_ids
                 if (node := self.store.get_node(node_id)) is not None
             ]
-            if not any(self._is_template_path(self._node_relative_path(node) or "") for node in structural_seeds):
+            if not any(application_surface_kind(self._node_relative_path(node) or "") == "template" for node in structural_seeds):
                 structural_seeds = list(seed_nodes.values())
             sections["structural_duplicates"] = self._query_explore_structural_duplicates(structural_seeds, limit=limit)
         if "code" in requested_views:
+            code_payload = self._code_agent_context_payload(subgraph, query_mode="informative", max_items=max_items)
             sections["code"] = {
                 "working_set": code_payload.get("working_set", [])[: min(max_items, limit)],
                 "read_plan": code_payload.get("read_plan", [])[: min(max_items, limit)],
@@ -382,19 +396,20 @@ class ContextServiceMixin:
         self,
         query: MemoryQuery,
         *,
-        limit: int = 12,
+        limit: int | None = 12,
         include_sources: bool = True,
         filter_generic: bool = True,
-        max_text_chars: int = 600,
+        max_text_chars: int | None = 600,
+        complete: bool = False,
     ) -> list[dict[str, Any]]:
         """Return a compact list of relevant memory texts for a query."""
-        return self.query_memories_payload(
-            query,
-            limit=limit,
+        return self._query_memory_rows(
+            self.retrieve(query, complete=complete),
+            limit=None if limit is None else max(0 if complete else 1, limit),
             include_sources=include_sources,
             filter_generic=filter_generic,
-            max_text_chars=max_text_chars,
-        )["memories"]
+            max_text_chars=None if max_text_chars is None else max(80, max_text_chars),
+        )
 
     def query_memories_payload(
         self,
@@ -493,13 +508,13 @@ class ContextServiceMixin:
         self,
         retrieval: MemorySubgraph,
         *,
-        limit: int,
+        limit: int | None,
         include_sources: bool,
         filter_generic: bool,
-        max_text_chars: int,
+        max_text_chars: int | None,
     ) -> list[dict[str, Any]]:
         query = retrieval.query
-        query_tokens = set(_expanded_tokens(query.text))
+        query_tokens = set(self._search_tokens(query.text))
         degree: dict[str, int] = {}
         for edge in retrieval.edges:
             degree[edge.from_id] = degree.get(edge.from_id, 0) + 1
@@ -507,6 +522,7 @@ class ContextServiceMixin:
 
         memories: list[dict[str, Any]] = []
         seen_texts: set[str] = set()
+        seed_ids = set(retrieval.seed_node_ids)
         rank_by_node_id = {item.node.id: index + 1 for index, item in enumerate(retrieval.ranked_nodes)}
         nodes_by_id = {node.id: node for node in retrieval.nodes}
 
@@ -520,7 +536,7 @@ class ContextServiceMixin:
             direction: str | None = None,
             edge_id: str | None = None,
         ) -> None:
-            if len(memories) >= limit:
+            if limit is not None and len(memories) >= limit:
                 return
             if not query.include_archived and node.status in INACTIVE_STATUSES:
                 return
@@ -555,7 +571,7 @@ class ContextServiceMixin:
                     "location": self._location_summary(node),
                     "score": score,
                     "rank": rank_by_node_id.get(node.id),
-                    "seed": node.id in retrieval.seed_node_ids,
+                    "seed": node.id in seed_ids,
                     "source_for": source_for,
                     "source_for_type": source_node.type if source_node else None,
                     "source_for_label": self._node_label(source_node) if source_node else None,
@@ -569,7 +585,7 @@ class ContextServiceMixin:
 
         for item in retrieval.ranked_nodes:
             add_memory(item.node, score=item.score, reasons=item.reasons)
-            if len(memories) >= limit:
+            if limit is not None and len(memories) >= limit:
                 break
             if not include_sources:
                 continue
@@ -577,7 +593,7 @@ class ContextServiceMixin:
                 item.node.id,
                 direction="both",
                 edge_types=SOURCE_EDGE_TYPES,
-                limit=20,
+                limit=None,
                 clone=False,
             ):
                 if edge.type in TECHNICAL_EDGE_TYPES or neighbor.type in TECHNICAL_NODE_TYPES:
@@ -588,27 +604,26 @@ class ContextServiceMixin:
                     continue
                 direction = "outgoing" if edge.from_id == item.node.id else "incoming"
                 add_memory(neighbor, score=item.score * 0.95, reasons=item.reasons, source_for=item.node.id, relation=edge.type, direction=direction, edge_id=edge.id)
-                if len(memories) >= limit:
+                if limit is not None and len(memories) >= limit:
                     break
 
-        if include_sources and len(memories) < limit:
-            node_ids = [item.node.id for item in retrieval.ranked_nodes]
+        if include_sources and (limit is None or len(memories) < limit):
+            ranked_seed_nodes = OrderedDict((item.node.id, item.node) for item in retrieval.ranked_nodes)
             for edge in retrieval.edges:
                 if edge.type not in SOURCE_EDGE_TYPES:
                     continue
                 if edge.type in TECHNICAL_EDGE_TYPES:
                     continue
-                source_id = edge.from_id if edge.from_id not in node_ids else edge.to_id
+                source_id = edge.from_id if edge.from_id not in ranked_seed_nodes else edge.to_id
                 source = self.store.get_node(source_id)
                 if source is None or source.type not in SOURCE_NODE_TYPES:
                     continue
-                ranked_seed_nodes = OrderedDict((item.node.id, item.node) for item in retrieval.ranked_nodes)
                 if not self._source_is_query_relevant(source, query=query, edges=OrderedDict([(edge.id, edge)]), seed_nodes=ranked_seed_nodes, query_tokens=query_tokens):
                     continue
                 context_node_id = edge.to_id if source_id == edge.from_id else edge.from_id
                 direction = "outgoing" if edge.from_id == context_node_id else "incoming"
                 add_memory(source, score=0.5 * edge.weight, source_for=context_node_id, relation=edge.type, direction=direction, edge_id=edge.id)
-                if len(memories) >= limit:
+                if limit is not None and len(memories) >= limit:
                     break
 
         return memories

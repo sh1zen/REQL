@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+from collections.abc import Iterator
 from dataclasses import asdict, is_dataclass
+from heapq import nlargest
 import re
 from typing import Any, Iterable, Sequence
 
+from ..config.policies import PathQueryPolicy
 from ..domain.constants import ACTIVE_STATUSES
 from ..domain.models import ActivationOptions, MemoryEdge, MemoryNode, MemoryQuery
 from ..extraction.normalization import canonicalize, clamp
@@ -37,16 +40,6 @@ from .parser import parse_reql
 from .result import QueryResult
 
 
-DEFAULT_NODE_COLUMNS = ["id", "type", "label", "text", "status", "salience", "confidence", "activation"]
-DEFAULT_EDGE_COLUMNS = ["id", "type", "from_id", "to_id", "weight", "confidence", "polarity", "origin"]
-DEFAULT_SEARCH_COLUMNS = ["rank", "score", "id", "type", "label", "text", "salience", "confidence", "activation"]
-DEFAULT_RETRIEVE_COLUMNS = ["rank", "score", "id", "type", "label", "text", "source_for", "relation", "direction", "relative_path", "line_start", "line_end"]
-DEFAULT_MATCH_COLUMNS = ["a.id", "a.type", "a.label", "r.type", "r.weight", "b.id", "b.type", "b.label"]
-DEFAULT_ACTIVATE_COLUMNS = ["id", "type", "label", "text", "activation", "salience", "confidence"]
-DEFAULT_PATH_COLUMNS = ["length", "score", "node_ids", "node_labels", "edge_types", "edge_ids"]
-DEFAULT_EXPLAIN_NODE_COLUMNS = ["node_id", "node_type", "direction", "edge_type", "weight", "confidence", "neighbor_id", "neighbor_type", "neighbor_label"]
-DEFAULT_EXPLAIN_SEARCH_COLUMNS = ["rank", "score", "id", "type", "label", "text", "reasons"]
-DEFAULT_VERIFY_FINDING_COLUMNS = ["finding", "minimal_snippet", "uses_found", "scopes_checked", "risks", "recommended_action"]
 _VERIFY_FINDING_USAGE_EDGE_TYPES = {
     "CALLS",
     "USES",
@@ -74,32 +67,6 @@ FIELD_ALIASES = {
     "line_end": ("line_end", "end_line"),
     "end_line": ("end_line", "line_end"),
 }
-DEFAULT_LIST_COLUMNS = {
-    "PROJECTS": ["id", "name", "root_path", "status", "updated_at"],
-    "ARTIFACTS": ["id", "relative_path", "path", "artifact_type", "language", "status", "size_bytes", "sha256"],
-    "FRAGMENTS": ["id", "artifact_id", "fragment_type", "section_path", "start_line", "end_line", "status", "text"],
-    "SYMBOLS": ["id", "type", "name", "qualified_name", "relative_path", "start_line", "end_line", "status"],
-    "FINDINGS": [
-        "id",
-        "finding_type",
-        "severity",
-        "symbol_type",
-        "symbol_name",
-        "qualified_name",
-        "relative_path",
-        "directory",
-        "file_count",
-        "files",
-        "line_start",
-        "cleanup_priority",
-        "cleanup_rank",
-        "evidence_scope",
-        "confidence",
-        "reason",
-        "status",
-    ],
-    "DELTAS": ["id", "run_id", "project_id", "artifact_id", "created_at", "added_nodes", "updated_nodes", "archived_nodes"],
-}
 
 
 class QueryEvaluator:
@@ -108,6 +75,8 @@ class QueryEvaluator:
     def __init__(self, graph: Any) -> None:
         self.graph = graph
         self.store = graph.store
+        self.defaults = graph.config.query.defaults
+        self.path_policy = graph.config.query.path
 
     @staticmethod
     def _is_graph_layer_node(node: MemoryNode | None) -> bool:
@@ -119,9 +88,9 @@ class QueryEvaluator:
             source = source_or_statement.strip()
             if profile:
                 with profile.span("query.parse", statement_length=len(source)):
-                    statement = parse_reql(source)
+                    statement = parse_reql(source, defaults=self.defaults)
             else:
-                statement = parse_reql(source)
+                statement = parse_reql(source, defaults=self.defaults)
         else:
             source = repr(source_or_statement)
             statement = source_or_statement
@@ -195,7 +164,7 @@ class QueryEvaluator:
             )
         else:
             row_objects.sort(key=lambda row: (row["node"].salience, row["node"].activation, row["node"].updated_at), reverse=True)
-        columns = _columns(statement.returns, DEFAULT_NODE_COLUMNS)
+        columns = _columns(statement.returns, self.defaults.node_columns)
         rows = [project_row(row, columns, default_alias="node") for row in row_objects[:statement.limit]]
         return QueryResult(source, "FIND NODES", columns, rows, {"matched": len(row_objects)})
 
@@ -218,7 +187,7 @@ class QueryEvaluator:
             )
         else:
             row_objects.sort(key=lambda row: (row["edge"].weight, row["edge"].confidence, row["edge"].updated_at), reverse=True)
-        columns = _columns(statement.returns, DEFAULT_EDGE_COLUMNS)
+        columns = _columns(statement.returns, self.defaults.edge_columns)
         rows = [project_row(row, columns, default_alias="edge") for row in row_objects[:statement.limit]]
         return QueryResult(source, "FIND EDGES", columns, rows, {"matched": len(row_objects)})
 
@@ -234,13 +203,14 @@ class QueryEvaluator:
                 max_depth=statement.max_depth,
                 include_archived=statement.include_archived,
                 node_types=set(statement.node_types) if statement.node_types else None,
-            )
+            ),
+            complete=True,
         )
         ranked_nodes = [item for item in subgraph.ranked_nodes if self._is_graph_layer_node(item.node)]
         if statement.context and statement.returns.is_default:
-            context = self.graph.retrieval.compose_context(subgraph, max_items=max(8, statement.top_k))
+            context = self.graph.retrieval.compose_context(subgraph, max_items=max(8, len(ranked_nodes)))
             return QueryResult(source, "SEARCH", ["context", "trace_id", "ranked_nodes"], [{"context": context, "trace_id": subgraph.trace_id, "ranked_nodes": len(ranked_nodes)}], {"seed_node_ids": subgraph.seed_node_ids})
-        columns = _columns(statement.returns, DEFAULT_SEARCH_COLUMNS)
+        columns = _columns(statement.returns, self.defaults.search_columns)
         rows: list[dict[str, Any]] = []
         for i, ranked in enumerate(ranked_nodes, start=1):
             row = {"node": ranked.node, "score": ranked.score, "rank": i, "reasons": ranked.reasons}
@@ -261,8 +231,9 @@ class QueryEvaluator:
             include_sources=statement.include_sources,
             filter_generic=statement.filter_generic,
             max_text_chars=statement.max_text_chars,
+            complete=True,
         )
-        columns = _columns(statement.returns, DEFAULT_RETRIEVE_COLUMNS)
+        columns = _columns(statement.returns, self.defaults.retrieve_columns)
         rows = []
         for rank, item in enumerate(memories, start=1):
             row = dict(item)
@@ -286,7 +257,7 @@ class QueryEvaluator:
             key=lambda n: result.activation_by_node.get(n.id, n.activation),
             reverse=True,
         )
-        columns = _columns(statement.returns, DEFAULT_ACTIVATE_COLUMNS)
+        columns = _columns(statement.returns, self.defaults.activate_columns)
         rows = []
         for node in ranked_nodes[: statement.limit]:
             row = {"node": node, "activation": result.activation_by_node.get(node.id, node.activation)}
@@ -337,53 +308,126 @@ class QueryEvaluator:
             rows_objects.sort(key=lambda row: (row[statement.edge.alias].weight, row[statement.left.alias].salience, row[statement.right.alias].salience), reverse=True)
         aliases = {"a": statement.left.alias, "r": statement.edge.alias, "b": statement.right.alias}
         defaults = []
-        for column in DEFAULT_MATCH_COLUMNS:
-            alias, field = column.split(".", 1)
-            defaults.append(f"{aliases[alias]}.{field}")
+        for column in self.defaults.match_columns:
+            alias, separator, field = column.partition(".")
+            defaults.append(f"{aliases.get(alias, alias)}.{field}" if separator else column)
         columns = _columns(statement.returns, defaults)
         rows = [project_row(row, columns, default_alias=statement.left.alias) for row in rows_objects[: statement.limit]]
         return QueryResult(source, "MATCH", columns, rows, {"matched": len(rows_objects), "left_alias": statement.left.alias, "edge_alias": statement.edge.alias, "right_alias": statement.right.alias})
 
     def _path(self, source: str, statement: PathQuery) -> QueryResult:
-        start_nodes = self._resolve_selector(statement.start, limit=5)
-        end_nodes = self._resolve_selector(statement.end, limit=5)
+        """Rank every eligible route before applying the requested row limit."""
+        start_nodes = self._resolve_selector(statement.start)
+        end_nodes = self._resolve_selector(statement.end)
         if not start_nodes:
             raise REQLEvaluationError(f"PATH start selector did not match any node: {statement.start}")
         if not end_nodes:
             raise REQLEvaluationError(f"PATH end selector did not match any node: {statement.end}")
-        end_ids = {node.id for node in end_nodes}
-        allowed_edges = set(statement.edge_types) if statement.edge_types else None
-        found: list[dict[str, Any]] = []
-        seen_paths: set[tuple[str, ...]] = set()
-        for start in start_nodes:
-            queue: deque[tuple[MemoryNode, list[MemoryNode], list[MemoryEdge], float]] = deque([(start, [start], [], 0.0)])
-            while queue and len(found) < statement.limit * 4:
-                current, path_nodes, path_edges, score = queue.popleft()
-                if len(path_edges) > statement.max_depth:
-                    continue
-                if current.id in end_ids and path_edges:
-                    key = tuple(node.id for node in path_nodes)
-                    if key not in seen_paths:
-                        seen_paths.add(key)
-                        found.append(_path_row(path_nodes, path_edges, score))
-                    continue
-                if len(path_edges) >= statement.max_depth:
-                    continue
-                for edge, neighbor in self.store.neighbors(current.id, direction="both", edge_types=allowed_edges, min_weight=0.0, limit=80):
-                    if neighbor.status in {"deleted", "rejected"}:
-                        continue
-                    if not self._is_graph_layer_node(neighbor):
-                        continue
-                    if neighbor.id in {n.id for n in path_nodes}:
-                        continue
-                    edge_score = edge.weight * edge.confidence * max(edge.polarity, 0)
-                    queue.append((neighbor, [*path_nodes, neighbor], [*path_edges, edge], score + edge_score))
-        found.sort(key=lambda row: (row["score"], -row["length"]), reverse=True)
-        columns = _columns(statement.returns, DEFAULT_PATH_COLUMNS)
-        rows = [{col: row.get(col) if col in row else resolve_field(row, col) for col in columns} for row in found[: statement.limit]]
-        return QueryResult(source, "PATH", columns, rows, {"start_matches": len(start_nodes), "end_matches": len(end_nodes), "candidate_paths": len(found)})
+        candidate_paths = 0
 
-    def _resolve_selector(self, selector: NodeSelector, *, limit: int) -> list[MemoryNode]:
+        def rank(row: dict[str, Any]) -> tuple[float, int]:
+            nonlocal candidate_paths
+            candidate_paths += 1
+            return row["score"], -row["length"]
+
+        candidates = self._path_rows(statement, start_nodes, {node.id for node in end_nodes})
+        if statement.limit is None:
+            found = sorted(candidates, key=rank, reverse=True)
+        else:
+            found = nlargest(statement.limit, candidates, key=rank)
+        columns = _columns(statement.returns, self.defaults.path_columns)
+        rows = [{col: row.get(col) if col in row else resolve_field(row, col) for col in columns} for row in found]
+        return QueryResult(source, "PATH", columns, rows, {
+            "start_matches": len(start_nodes), "end_matches": len(end_nodes),
+            "candidate_paths": candidate_paths, "traversal_truncated": False,
+        })
+
+    def _path_rows(
+        self, statement: PathQuery, start_nodes: list[MemoryNode], end_ids: set[str],
+    ) -> Iterator[dict[str, Any]]:
+        """Enumerate simple paths with a depth-first stack and shared adjacency reads."""
+        max_depth = statement.max_depth
+        allowed_edges = set(statement.edge_types) if statement.edge_types else None
+        adjacency: dict[str, list[tuple[MemoryEdge, MemoryNode]]] = {}
+
+        def neighbors(node_id: str) -> list[tuple[MemoryEdge, MemoryNode]]:
+            if node_id not in adjacency:
+                adjacency[node_id] = self.store.neighbors(
+                    node_id, edge_types=allowed_edges, limit=None, clone=False,
+                )
+            return adjacency[node_id]
+
+        only_start = start_nodes[0].id if len(start_nodes) == 1 else None
+
+        def distances_from_targets(
+            max_distance: int | None, blocked: set[str], targets_to_check: set[str] | None = None,
+        ) -> dict[str, int]:
+            distances = dict.fromkeys(end_ids - blocked, 0)
+            frontier = deque(distances)
+            pending = targets_to_check - distances.keys() if targets_to_check is not None else None
+            while frontier and (pending is None or pending):
+                node_id = frontier.popleft()
+                distance = distances[node_id]
+                if node_id == only_start or (max_distance is not None and distance >= max_distance):
+                    continue
+                for _, neighbor in neighbors(node_id):
+                    if neighbor.id in distances or neighbor.id in blocked:
+                        continue
+                    distances[neighbor.id] = distance + 1
+                    frontier.append(neighbor.id)
+                    if pending is not None:
+                        pending.discard(neighbor.id)
+            return distances
+
+        distances = distances_from_targets(max_depth, set())
+
+        for start in start_nodes:
+            if start.id not in distances or max_depth == 0:
+                continue
+            path_nodes = [start]
+            path_ids = {start.id}
+            path_edges: list[MemoryEdge] = []
+            path_scores = [0.0]
+
+            def steps_from(node_id: str) -> Iterator[tuple[MemoryEdge, MemoryNode]]:
+                remaining_depth = None if max_depth is None else max_depth - len(path_nodes)
+                steps = [
+                    (edge, neighbor) for edge, neighbor in neighbors(node_id)
+                    if neighbor.id not in path_ids and neighbor.status not in {"deleted", "rejected"}
+                    and (distance := distances.get(neighbor.id)) is not None
+                    and (remaining_depth is None or distance <= remaining_depth)
+                ]
+                next_ids = {neighbor.id for _, neighbor in steps}
+                if len(next_ids) > 1 and next_ids - end_ids:
+                    # A cycle attached to an earlier path node cannot lead to a new endpoint.
+                    reachable = distances_from_targets(remaining_depth, path_ids, next_ids)
+                    steps = [(edge, neighbor) for edge, neighbor in steps if neighbor.id in reachable]
+                return iter(steps)
+
+            stack = [steps_from(start.id)]
+            while stack:
+                step = next(stack[-1], None)
+                if step is None:
+                    stack.pop()
+                    path_ids.remove(path_nodes.pop().id)
+                    path_scores.pop()
+                    if path_edges:
+                        path_edges.pop()
+                    continue
+                edge, neighbor = step
+                score = path_scores[-1] + edge.weight * edge.confidence * max(edge.polarity, 0)
+                path_nodes.append(neighbor)
+                path_edges.append(edge)
+                if neighbor.id in end_ids:
+                    yield _path_row(path_nodes, path_edges, score, self.path_policy)
+                    path_nodes.pop()
+                    path_edges.pop()
+                else:
+                    path_ids.add(neighbor.id)
+                    path_scores.append(score)
+                    stack.append(steps_from(neighbor.id))
+
+    def _resolve_selector(self, selector: NodeSelector) -> list[MemoryNode]:
         if selector.mode == "id":
             node = self.store.get_node(selector.value)
             return [node] if node and self._is_graph_layer_node(node) else []
@@ -393,8 +437,10 @@ class QueryEvaluator:
             node = self.store.get_node_by_key(selector.type_, canonicalize(selector.value))
             return [node] if self._is_graph_layer_node(node) else []
         if selector.mode == "text":
-            subgraph = self.graph.retrieve(selector.value, top_k=limit, max_depth=1)
-            return [item.node for item in subgraph.ranked_nodes if self._is_graph_layer_node(item.node)][:limit]
+            subgraph = self.graph.retrieval.retrieve(
+                MemoryQuery(text=selector.value, top_k=None, max_depth=1), complete=True,
+            )
+            return [item.node for item in subgraph.ranked_nodes]
         return []
 
     # ------------------------------------------------------------------
@@ -402,10 +448,10 @@ class QueryEvaluator:
     # ------------------------------------------------------------------
     def _explain(self, source: str, statement: Explain) -> QueryResult:
         if statement.mode == "hub":
-            hub = self.graph.explain_hub(statement.target)
+            hub = self.graph.explain_hub(statement.target, complete=True)
             if hub is None:
                 raise REQLEvaluationError(f"Hub target not found: {statement.target}")
-            columns = ["node_id", "node_type", "label", "hub_score", "hub_rank", "is_hub", "reasons"]
+            columns = list(self.defaults.explain_hub_columns)
             row = {
                 "node_id": hub.node_id,
                 "node_type": hub.node_type,
@@ -415,10 +461,13 @@ class QueryEvaluator:
                 "is_hub": hub.is_hub,
                 "reasons": hub.reasons,
             }
-            return QueryResult(source, "EXPLAIN HUB", columns, [row])
+            return QueryResult(source, "EXPLAIN HUB", columns, [project_row(row, columns)])
         if statement.mode == "search":
-            subgraph = self.graph.retrieve(statement.target, top_k=statement.top_k, max_depth=statement.max_depth)
-            columns = DEFAULT_EXPLAIN_SEARCH_COLUMNS
+            subgraph = self.graph.retrieval.retrieve(
+                MemoryQuery(text=statement.target, top_k=statement.top_k, max_depth=statement.max_depth),
+                complete=True,
+            )
+            columns = list(self.defaults.explain_search_columns)
             rows = []
             ranked_nodes = [item for item in subgraph.ranked_nodes if self._is_graph_layer_node(item.node)]
             for i, item in enumerate(ranked_nodes, start=1):
@@ -433,22 +482,24 @@ class QueryEvaluator:
                         "reasons": item.reasons,
                     }
                 )
-            return QueryResult(source, "EXPLAIN SEARCH", columns, rows, {"seed_node_ids": subgraph.seed_node_ids, "trace_id": subgraph.trace_id})
+            return QueryResult(source, "EXPLAIN SEARCH", columns, [project_row(row, columns) for row in rows], {"seed_node_ids": subgraph.seed_node_ids, "trace_id": subgraph.trace_id})
 
         node = self.store.get_node(statement.target)
         if node is None or not self._is_graph_layer_node(node):
             raise REQLEvaluationError(f"Node not found: {statement.target}")
         rows: list[dict[str, Any]] = []
-        for edge in self.store.get_edges(from_id=node.id, limit=statement.limit):
+        for edge in self.store.get_edges(from_id=node.id, limit=None, clone=False):
             neighbor = self.store.get_node(edge.to_id)
             if self._is_graph_layer_node(neighbor):
                 rows.append(_explain_edge_row(node, edge, neighbor, "out"))
-        for edge in self.store.get_edges(to_id=node.id, limit=statement.limit):
+        for edge in self.store.get_edges(to_id=node.id, limit=None, clone=False):
             neighbor = self.store.get_node(edge.from_id)
             if self._is_graph_layer_node(neighbor):
                 rows.append(_explain_edge_row(node, edge, neighbor, "in"))
         rows.sort(key=lambda row: (row["weight"], row["confidence"]), reverse=True)
-        return QueryResult(source, "EXPLAIN NODE", DEFAULT_EXPLAIN_NODE_COLUMNS, rows[: statement.limit], {"node": _node_brief(node), "degree": self.store.degree(node.id)})
+        columns = list(self.defaults.explain_node_columns)
+        projected = [project_row(row, columns) for row in rows[:statement.limit]]
+        return QueryResult(source, "EXPLAIN NODE", columns, projected, {"node": _node_brief(node), "degree": self.store.degree(node.id)})
 
     def _stats(self, source: str, statement: Stats) -> QueryResult:
         """Apply the same case-insensitive type scope used by row queries."""
@@ -459,7 +510,8 @@ class QueryEvaluator:
         )
         if not statement.group_by:
             rows = [{"nodes": self.store.count_nodes(node_types=node_types), "edges": self.store.count_edges()}]
-            return QueryResult(source, "STATS", ["nodes", "edges"], rows)
+            columns = list(self.defaults.stats_columns)
+            return QueryResult(source, "STATS", columns, [project_row(row, columns) for row in rows])
         if len(statement.group_by) == 1 and statement.group_by[0] in {"type", "node.type"}:
             columns = [statement.group_by[0], "count"]
             rows = [
@@ -482,8 +534,8 @@ class QueryEvaluator:
         return QueryResult(source, "STATS", columns, rows)
 
     def _communities(self, source: str, statement: Communities) -> QueryResult:
-        result = self.graph.detect_communities(limit=max(statement.limit * 5, 100))
-        columns = ["id", "label", "size", "density", "salience"]
+        result = self.graph.detect_communities()
+        columns = list(self.defaults.communities_columns)
         row_objects = []
         for node in result.community_nodes:
             row = {
@@ -504,10 +556,10 @@ class QueryEvaluator:
     def _hubs(self, source: str, statement: Hubs) -> QueryResult:
         report = self.graph.analyze_hubs(
 
-            limit=max(statement.limit * 5, 100),
+            limit=None,
             node_types=set(statement.node_types) if statement.node_types else None,
         )
-        columns = ["rank", "id", "type", "label", "hub_score", "specificity", "generic_penalty", "reason"]
+        columns = list(self.defaults.hubs_columns)
         row_objects = []
         for hub in report.hubs:
             node = self.store.get_node(hub.node_id)
@@ -544,12 +596,12 @@ class QueryEvaluator:
             row_objects.append(row)
         default_order = _typed_node_default_order(statement.command)
         row_objects = _sort_rows(row_objects, statement.order_by, default_order)
-        columns = _columns(statement.returns, DEFAULT_LIST_COLUMNS[statement.command])
+        columns = _columns(statement.returns, getattr(self.defaults, f"{statement.command.lower()}_columns"))
         rows = [project_row(row, columns, default_alias="node") for row in row_objects[:statement.limit]]
         return QueryResult(source, statement.command, columns, rows, {"matched": len(row_objects), "node_types": list(statement.node_types)})
 
     def _cache_status(self, source: str, statement: CacheStatus) -> QueryResult:
-        nodes = self.store.find_nodes(type_="ArtifactCacheEntry", limit=100000, order_by="updated_at")
+        nodes = self.store.find_nodes_by_types(("ArtifactCacheEntry",), clone=False)
         by_project: dict[str, dict[str, Any]] = {}
         for node in nodes:
             project_id = str(node.properties.get("project_id") or "")
@@ -575,13 +627,13 @@ class QueryEvaluator:
             compiled_at = str(node.properties.get("compiled_at") or "")
             row["latest_compiled_at"] = max(row["latest_compiled_at"], compiled_at)
         rows = sorted(by_project.values(), key=lambda row: (row["latest_compiled_at"], row["project_id"]), reverse=True)[: statement.limit]
-        columns = ["project_id", "total_entries", "active_entries", "archived_entries", "cached_artifacts", "latest_compiled_at"]
+        columns = list(self.defaults.cache_columns)
         diagnostics = {
             "projects": len(by_project),
             "entries": len(nodes),
             "active_entries": sum(1 for node in nodes if node.status == "active"),
         }
-        return QueryResult(source, "CACHE STATUS", columns, rows, diagnostics)
+        return QueryResult(source, "CACHE STATUS", columns, [project_row(row, columns) for row in rows], diagnostics)
 
     def _verify_finding(self, source: str, statement: VerifyFinding) -> QueryResult:
         finding = self.store.get_node(statement.finding_id)
@@ -607,7 +659,8 @@ class QueryEvaluator:
             "usage_edges_found": len(uses),
             "incoming_usage_edges_found": sum(1 for item in uses if item.get("direction") == "incoming"),
         }
-        return QueryResult(source, "VERIFY FINDING", DEFAULT_VERIFY_FINDING_COLUMNS, [row], diagnostics)
+        columns = list(self.defaults.verify_finding_columns)
+        return QueryResult(source, "VERIFY FINDING", columns, [project_row(row, columns)], diagnostics)
 
     def _finding_symbol(self, finding: MemoryNode) -> MemoryNode | None:
         symbol_id = finding.properties.get("symbol_id")
@@ -1112,9 +1165,10 @@ def _explain_edge_row(node: MemoryNode, edge: MemoryEdge, neighbor: MemoryNode, 
     }
 
 
-def _path_row(path_nodes: list[MemoryNode], path_edges: list[MemoryEdge], score: float) -> dict[str, Any]:
+def _path_row(path_nodes: list[MemoryNode], path_edges: list[MemoryEdge], score: float, policy: PathQueryPolicy) -> dict[str, Any]:
     length = len(path_edges)
-    normalized = clamp((score / max(length, 1)) * 0.85 + 0.15 * sum(n.salience for n in path_nodes) / max(len(path_nodes), 1))
+    normalized = clamp((score / length) * policy.edge_weight
+                       + policy.salience_weight * sum(node.salience for node in path_nodes) / len(path_nodes))
     return {
         "length": length,
         "score": normalized,
@@ -1126,7 +1180,7 @@ def _path_row(path_nodes: list[MemoryNode], path_edges: list[MemoryEdge], score:
     }
 
 
-def _columns(return_spec: Any, defaults: list[str]) -> list[str]:
+def _columns(return_spec: Any, defaults: Sequence[str]) -> list[str]:
     if return_spec.is_all:
         return list(defaults)
     if return_spec.is_default:

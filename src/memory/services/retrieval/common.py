@@ -1,12 +1,45 @@
 """Deterministic lexical + bounded graph retrieval."""
 from __future__ import annotations
 
-from typing import Sequence
+import re
+from typing import Iterator, Sequence
+from unicodedata import category
 
-from ...extraction.normalization import (
-    expanded_tokens as _expanded_tokens,
-    singular_source_variants as _singular_source_variants,
-)
+from ...extraction.normalization import singular_source_variants
+
+_SOURCE_WORD = r"[^\W\d]\w*"
+_SOURCE_WORD_PATTERN = re.compile(rf"\b{_SOURCE_WORD}\b")
+_SOURCE_REFERENCE_PATTERN = re.compile(rf"\b{_SOURCE_WORD}(?:(?:\.|::){_SOURCE_WORD})*\b")
+_CALL_SUFFIX = re.compile(r"\s*\(")
+
+
+def source_symbol_references(text: str, *, qualified: bool = True) -> Iterator[str]:
+    """Find literal identifier spans, keeping combining marks and original spelling."""
+    return (value for value, _ in _source_symbol_spans(text, qualified=qualified))
+
+
+def source_contract_references(text: str) -> Iterator[str]:
+    """Return calls before qualified mentions, in source order within each group."""
+    calls, qualified = [], []
+    for value, end in _source_symbol_spans(text, qualified=True):
+        if _CALL_SUFFIX.match(text, end):
+            calls.append(value)
+        elif "." in value or "::" in value:
+            qualified.append(value)
+    yield from calls
+    yield from qualified
+
+
+def _source_symbol_spans(text: str, *, qualified: bool) -> Iterator[tuple[str, int]]:
+    """Scan identifiers with source offsets."""
+    # Python's word classes omit combining marks. Preserve offsets in the scan
+    # and use the original text for the exact lookup.
+    shape = "".join("_" if category(char).startswith("M") else char for char in text)
+    pattern = _SOURCE_REFERENCE_PATTERN if qualified else _SOURCE_WORD_PATTERN
+    for match in pattern.finditer(shape):
+        value = text[match.start():match.end()]
+        if shape[match.start()] == value[0]:
+            yield value, match.end()
 
 TECHNICAL_NODE_TYPES = {"RetrievalTrace", "System", "Session", "Debug", "Log", "Comment", "Docstring", "Import"}
 GRAPH_SEED_NODE_TYPES = {"Topic", "Entity", "Fact", "File", "SourceArtifact", "SourceFragment", "Module", "Function", "Class", "Interface", "Method", "Variable", "Endpoint", "Schema", "StaticAnalysisFinding"}
@@ -91,15 +124,9 @@ QUERY_EXPLORE_VIEWS = {"owners", "callers", "public_surface", "serialization_pat
 QUERY_EXPLORE_DEFAULT_VIEWS = ("owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "code")
 QUERY_EXPLORE_ALL_VIEWS = (*QUERY_EXPLORE_DEFAULT_VIEWS[:-1], "structural_duplicates", "code")
 QUERY_EXPLORE_EDGE_TYPES = CODE_CONTEXT_EDGE_TYPES | SOURCE_EDGE_TYPES | {"DECORATED_BY", "HAS_CODE_BLOCK", "HAS_COMMENT", "HAS_DOCSTRING", "TESTS"}
-OWNER_EDGE_TYPES = {"CONTAINS", "DEFINES", "EVIDENCED_BY", "HAS_FINDING", "METHOD"}
-CALLER_EDGE_TYPES = {"CALLS", "INSTANTIATES"}
-PUBLIC_SURFACE_EDGE_TYPES = {"HANDLES_ROUTE", "IMPLEMENTS", "IMPORTS", "IMPORTS_FROM", "RE_EXPORTS"}
-SERIALIZATION_EDGE_TYPES = {"READS", "WRITES", "RETURNS", "RAISES", "REFERENCES", "EVIDENCED_BY", "DEPENDS_ON", "IMPORTS_FROM"}
+FIELD_REFERENCE_PATTERN = re.compile(r"(?<![\w./\\])([^\W\d]\w*(?:\.[^\W\d]\w*)*)\.([^\W\d]\w*)(?![\w/\\]|\.\w)")
 QUERY_CONTEXT_MODES = {"informative", "cleanup"}
 QUERY_CONTEXT_SCOPES = {"code", "docs", "test"}
-QUERY_CONTEXT_MIN_CONFIDENCE_SCORE = 0.25
-QUERY_CONTEXT_MAX_RENDERED_FILES = 8
-QUERY_CONTEXT_MAX_RENDERED_TEST_FILES = 3
 STRUCTURED_SEARCH_FIELDS = (
     "name",
     "qualified_name",
@@ -118,50 +145,20 @@ STRUCTURED_SEARCH_FIELDS = (
     "overrides",
     "re_exports",
 )
-CODE_CONTEXT_GENERIC_QUERY_TOKENS = {
-    "agent",
-    "base",
-    "bug",
-    "change",
-    "changes",
-    "code",
-    "context",
-    "edit",
-    "edits",
-    "fix",
-    "fixes",
-    "function",
-    "functions",
-    "implementation",
-    "implement",
-    "issue",
-    "logic",
-    "noise",
-    "problem",
-    "query",
-    "request",
-    "task",
-    "unrelated",
-    "workflow",
-}
-def _code_context_query_tokens(value: str) -> set[str]:
-    tokens = set(_expanded_tokens(value))
-    filtered = {token for token in tokens if token not in CODE_CONTEXT_GENERIC_QUERY_TOKENS}
-    return filtered or tokens
-
-
-def _canonical_token_overlap(value: str, query_tokens: set[str]) -> set[str]:
+def _canonical_token_overlap(value: str, query_tokens: set[str], *, expand_plurals: bool = True, min_chars: int = 2) -> set[str]:
     """Return expanded query-token matches from already-canonical search text."""
     if not value or not query_tokens:
         return set()
     value_tokens = {
         token
         for raw_token in set(value.split())
-        if len(token := raw_token.strip("_-")) >= 2
+        if len(token := raw_token.strip("_-")) >= min_chars
     }
     overlap = value_tokens & query_tokens
+    if not expand_plurals:
+        return overlap
     for query_token in query_tokens - overlap:
-        if any(candidate in value_tokens for candidate in _singular_source_variants(query_token)):
+        if any(candidate in value_tokens for candidate in singular_source_variants(query_token)):
             overlap.add(query_token)
     return overlap
 

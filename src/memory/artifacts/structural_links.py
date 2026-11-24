@@ -8,6 +8,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Iterable
 
+from ..code_analysis.catalog import ECMASCRIPT_EXTENSIONS
 from ..code_analysis.models import CodeImport
 from ..code_analysis.symbol_table import is_computed_reference
 from ..diagnostics import PerformanceLogger
@@ -24,7 +25,7 @@ CALLABLE_TYPES = {"Function", "Method", "Class", "Interface"}
 STRUCTURAL_PROPERTY_NODE_TYPES = {"Module", "File", "Class", "Interface", "Function", "Method"}
 STRUCTURAL_INPUT_NODE_TYPES = {*STRUCTURAL_PROPERTY_NODE_TYPES, "Import", "Variable"}
 STRUCTURAL_EDGE_TYPES = {"INHERITS", "OVERRIDES", "WRAPS", "RE_EXPORTS", "READS", "WRITES", "RETURNS", "RAISES",
-                         "CALLS", "INSTANTIATES", "REFERENCES"}
+                         "CALLS", "INSTANTIATES", "REFERENCES", "IMPORTS"}
 
 _ANNOTATION_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
 _ANNOTATION_BUILTINS = {
@@ -64,7 +65,7 @@ def refresh_project_structural_links(
             project_id,
             type_=node_type,
             status="active",
-            limit=100000,
+            limit=None,
             clone=False,
         )
     ]
@@ -75,7 +76,7 @@ def refresh_project_structural_links(
             "project_id",
             project_id,
             type_=edge_type,
-            limit=100000,
+            limit=None,
             clone=False,
         )
         if edge.properties.get("extractor") == STRUCTURAL_LINKER
@@ -119,6 +120,7 @@ def refresh_project_structural_links(
 
     structural_nodes = [node for node in nodes if node.type in STRUCTURAL_PROPERTY_NODE_TYPES]
     desired_state = {node.id: _base_structural_state(node) for node in structural_nodes}
+    bindings = _ProjectBindings(by_path, imports_by_artifact, modules_by_path, files_by_path)
 
     new_edges: dict[str, MemoryEdge] = {}
     inheritance: dict[str, list[MemoryNode]] = defaultdict(list)
@@ -166,7 +168,28 @@ def refresh_project_structural_links(
             edge = _structural_edge(method, target, "OVERRIDES", evidence=str(method.properties.get("name") or ""))
             new_edges[edge.id] = edge
 
-    bindings = _ProjectBindings(by_path, imports_by_artifact, modules_by_path)
+    for imports in imports_by_artifact.values():
+        for item in imports:
+            name = item.properties.get("binding_name")
+            if not isinstance(name, str) or not name or name == "*":
+                continue
+            binding = bindings.import_target(item, name, frozenset())
+            if binding is None or binding.target.id == item.id:
+                continue
+            edge = _structural_edge(
+                item, binding.target, "IMPORTS", evidence=str(item.label or name),
+                extra={
+                    "module": item.properties.get("module"),
+                    "name": name,
+                    "import_name": name,
+                    "resolved_relative_path": bindings.paths[item.id],
+                    "target_symbol": binding.target.properties.get("qualified_name") or binding.target.properties.get("name"),
+                    "resolution_dependencies": list(binding.dependencies),
+                    "line_start": item.properties.get("line"),
+                    "line_end": item.properties.get("line"),
+                },
+            )
+            new_edges[edge.id] = edge
     for owner in structural_nodes:
         for reference in owner.properties.get("static_references", []):
             name = reference["name"]
@@ -286,9 +309,11 @@ def refresh_project_structural_links(
         exported_labels: set[str] = set()
         for import_node in imports:
             binding_name = import_node.properties.get("binding_name")
-            if not initializer and binding_name and binding_name != "*":
+            if binding_name and binding_name != "*":
                 binding = bindings.import_target(import_node, str(binding_name), frozenset())
                 targets = [binding.target] if binding else []
+                if initializer and binding is None and not import_node.properties.get("module"):
+                    targets = _re_export_targets(import_node, by_path, modules_by_path, files_by_path)
             else:
                 targets = _re_export_targets(import_node, by_path, modules_by_path, files_by_path)
             for target in targets:
@@ -321,13 +346,17 @@ def refresh_project_structural_links(
         profile_logger,
         "compile.structural.derive",
         derive_started,
-        pending_nodes=len(pending_nodes),
+        pending_nodes=len(pending_nodes) + len(bindings.updated_imports),
         pending_edges=len(pending_edges),
     )
 
     persist_started = perf_counter()
     for node, created in store.batch_upsert_nodes(pending_nodes, return_clones=False):
         result.record_node(node.id, created=created)
+    for node in bindings.updated_imports:
+        # Replacing properties permits clearing a resolved path after deletion.
+        store.update_node_fields(node.id, properties=node.properties)
+        result.record_node(node.id, created=False)
 
     for edge in existing_edges:
         if edge.type != "INHERITS":
@@ -352,7 +381,7 @@ def refresh_project_structural_links(
         profile_logger,
         "compile.structural.persist",
         persist_started,
-        updated_nodes=len(pending_nodes),
+        updated_nodes=len(pending_nodes) + len(bindings.updated_imports),
         updated_edges=len(pending_edges),
         archived_edges=len(result.archived_edges),
     )
@@ -527,15 +556,16 @@ class _ProjectBindings:
 
     def __init__(
         self, by_path: dict[str, list[MemoryNode]], imports_by_artifact: dict[str, list[MemoryNode]],
-        modules_by_path: dict[str, list[MemoryNode]],
+        modules_by_path: dict[str, list[MemoryNode]], files_by_path: dict[str, list[MemoryNode]],
     ) -> None:
         self.imports = imports_by_artifact
+        self.updated_imports: list[MemoryNode] = []
         self.modules = {path: items[0] for path, items in modules_by_path.items() if len(items) == 1}
         self.exports: dict[tuple[str, str], list[MemoryNode]] = defaultdict(list)
         self.paths: dict[str, str] = {}
         for path, module in self.modules.items():
             module_name = module.properties.get("qualified_name") or module.properties.get("name")
-            ecmascript = Path(path).suffix.casefold() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}
+            ecmascript = Path(path).suffix.casefold() in ECMASCRIPT_EXTENSIONS
             local_exports: dict[str, list[str]] = defaultdict(list)
             for name, alias in (module.properties.get("metadata") or {}).get("local_exports", []):
                 local_exports[name].append(alias)
@@ -552,13 +582,25 @@ class _ProjectBindings:
                     for alias in {*local_exports.get(name, []), exported_as} - {None}:
                         self.exports[(path, alias)].append(item)
         for imports in self.imports.values():
-            for node in imports:
+            for index, node in enumerate(imports):
                 props = node.properties
                 item = CodeImport(node.id, str(props["artifact_id"]), props.get("module"),
                                   props.get("binding_name"), props.get("alias"), level=int(props.get("level") or 0),
                                   metadata=props.get("metadata") or {})
-                self.paths[node.id] = next((path for path in _candidate_import_relative_paths(_path(node), item)
-                                            if path in self.modules), "")
+                source = _path(node)
+                module = self.modules.get(source)
+                language = module.properties.get("language") if module is not None else None
+                candidates = (
+                    [str(item.metadata.get("resolved_relative_path") or "")]
+                    if item.metadata.get("language") == "solidity"
+                    else _candidate_import_relative_paths(source, item, language)
+                )
+                resolved = next((path for path in candidates if path in files_by_path), None)
+                self.paths[node.id] = resolved or ""
+                if resolved != props.get("resolved_relative_path"):
+                    updated = replace(node, properties={**props, "resolved_relative_path": resolved})
+                    imports[index] = updated
+                    self.updated_imports.append(updated)
 
     def resolve(self, owner: MemoryNode, reference: str) -> _BoundSymbol | None:
         imports = self.imports.get(str(owner.properties.get("artifact_id")), [])
@@ -592,7 +634,7 @@ class _ProjectBindings:
     def import_target(self, node: MemoryNode, name: str, seen: frozenset[tuple[str, str]]) -> _BoundSymbol | None:
         path = self.paths.get(node.id, "")
         key = (path, name)
-        if not path or key in seen or len(seen) >= 32:
+        if path not in self.modules or key in seen or len(seen) >= 32:
             return None
         direct = self.exports.get(key, [])
         module = self.modules[path]
@@ -667,10 +709,6 @@ def _re_export_targets(
             and str(node.properties.get("parent_qualified_name") or "") in module_names
         ]
         return _dedupe_nodes(public)
-    if name:
-        named = [node for node in candidates if str(node.properties.get("name") or "") == name]
-        if named:
-            return _dedupe_nodes(named)
     return _dedupe_nodes([*modules_by_path.get(target_path, []), *files_by_path.get(target_path, [])])
 
 
@@ -729,10 +767,7 @@ def _deactivate_edge(store: GraphStore, edge: MemoryEdge, result: ArtifactCompil
 
 
 def _resolved_path(import_node: MemoryNode) -> str:
-    direct = import_node.properties.get("resolved_relative_path")
-    metadata = import_node.properties.get("metadata")
-    nested = metadata.get("resolved_relative_path") if isinstance(metadata, dict) else None
-    return str(direct or nested or "").replace("\\", "/")
+    return str(import_node.properties.get("resolved_relative_path") or "").replace("\\", "/")
 
 
 def _path(node: MemoryNode) -> str:

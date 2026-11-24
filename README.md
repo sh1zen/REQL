@@ -1,180 +1,194 @@
 # REQL
 
-REQL is a local repository context and working-memory layer for coding agents
-and developer tools. It compiles source files and supported documents into a
-property graph, then returns bounded context about code, tests, dependencies,
-findings and provenance.
+**Searchable code intelligence and shared working memory for coding agents.**
 
-REQL runs locally on ordinary folders without version control, model calls,
-accounts, hosted services or an external graph database. The compiled graph
-holds repository facts. Agent Workspace holds engineering intent, decisions
-and handoffs.
+REQL builds a local graph of a project's code, tests, and documentation.
+Search by feature or symbol to find the implementation, see the files it
+touches, and identify tests to inspect. When work moves to another agent or
+session, pass along the decisions, failed approaches, and verification that
+would otherwise have to be rediscovered.
 
-REQL can reduce token consumption by up to 50% in individual agent runs by
-retrieving focused repository context. Shared decisions, verified findings and
-checkpoints significantly improve coordination across agents and sessions.
-Reusing that work reduces repeated discovery and further lowers overall token
-consumption. See the [agent token benchmarks](benchmarks/README.md).
+**In measured Codex runs, two single-agent tasks used 51% and 78% fewer total
+tokens, and a two-agent task used 38% fewer across both workers.**
+[Results and measurement details](#measured-token-savings)
 
-## Quick Start
+[Quick start](#quick-start) | [What you get](#what-you-get) |
+[Agent coordination](#coordinate-agents-and-resume-work) |
+[Support REQL](#support-reql)
 
-REQL requires Python 3.10 or newer. Install the CLI in an isolated environment
-with [uv](https://docs.astral.sh/uv/getting-started/installation/):
+## Quick start
 
-```bash
-uv tool install reql
-uv tool update-shell
-```
+1. With Python 3.10+ and [uv](https://docs.astral.sh/uv/getting-started/installation/),
+   install the CLI with `uv tool install reql`.
+2. From the root of this checkout, run `reql project compile` to build the index.
+3. Run `reql query_context --query "MemoryGraph locate" --code`. The result
+   points to `MemoryGraph.locate` and its line range in `src/api/memory_graph.py`.
 
-Restart your shell after `uv tool update-shell` if `reql` is not on `PATH`.
-No virtual-environment activation is needed. Upgrade with `uv tool upgrade reql`.
-For optional PDF support, install `"reql[pdf]"` instead.
+Use the same workflow in your own project with one of its features or symbols.
+If `reql` is missing from your PATH, run `uv tool update-shell` and reopen your
+terminal. The quick start works with the published package. To try features
+from this checkout, use the [development setup](CONTRIBUTING.md#development-setup).
+Dependencies resolve to releases compatible with your Python version. See
+[Tree-sitter compatibility](docs/PIPELINE.md#tree-sitter-dependencies).
 
-To install with pip, create a virtual environment first. On Linux/macOS:
+For Codex, Claude Code, Cursor, and other supported assistants, REQL can install
+project instructions that guide agents through discovery, verification, and
+handoffs. [Assistant setup](docs/CLI.md#assistant-installs)
 
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install reql
-```
+Use `reql.conf` for project options such as scan paths and document formats.
+`reql config init` creates a short starter file. The bundled YAML
+files live in `src/config/`. `user.yaml` defines project defaults.
+`core.yaml` defines lexical scoring, extraction, retrieval, graph query,
+analysis and storage policy.
+Set setup headings and workflow naming conventions in `reql.conf` when your
+project uses them. Use `testing.discovery.directories` for custom test
+directories and `testing.suggestions.evidence_order` to rank test evidence.
+[Configuration guide](docs/CONFIGURATION.md)
 
-On Windows PowerShell:
+## What you get
 
-```powershell
-py -m venv .venv
-.venv/Scripts/python.exe -m pip install reql
-```
+| If you need toâ€¦ | REQL gives youâ€¦ |
+| --- | --- |
+| Find where a change belongs | A focused working set with symbol names, file paths, line ranges, and current source excerpts when available. |
+| See what an interface change could affect | Views of indexed callers, imports, overrides, public entry points, serialization paths, and documentation references. |
+| Choose tests for a refactor | Test associations by file or symbol, with static links, imported per-test coverage, and naming-based candidates identified separately. |
+| Get oriented in an unfamiliar codebase | A repository overview with inferred capabilities, architectural layers, workflows, and source-backed starting points for a change. |
+| Review a change between runs | Indexed revisions and file and symbol changes, plus a way to check whether the current files still match the index. |
+| Explore code structure or look for cleanup opportunities | Static findings, highly connected components, community analysis, and an interactive graph. |
 
-With pip, use the `reql` executable in that environment for the commands below.
-See [development setup](CONTRIBUTING.md#development-setup) for a checkout.
+Retrieval explores eligible relationships within the requested depth and can verify returned excerpts against
+the indexed file hash. It reports the source revision and freshness, so you
+can tell when to refresh after an edit. Static relationships and candidate
+tests give you concrete leads to verify in source.
 
-From the repository root, install the assistant instructions, build the graph,
-and retrieve a working set:
+[Search and dependency views](docs/CLI.md#retrieval-commands) |
+[Test evidence](docs/CLI.md#test-evidence) |
+[Test configuration](docs/CONFIGURATION.md#test-discovery-and-evidence) |
+[Repository explanation](docs/CLI.md#repository-explanation) |
+[Revisions](docs/CLI.md#project-compilation)
 
-```bash
-reql install codex
-reql project compile
-reql query_context --query "payment service" --code --brief
-```
+## A real change in this repository
 
-Replace `codex` with another [supported agent platform](docs/CLI.md#assistant-installs)
-or run `reql install` to detect one. Use `reql locate src/service.py` for a known
-path and [`query_context`](docs/CLI.md#retrieval-commands) for unknown code.
-Use `reql agent init --next` from a distinct activity for each queue worker.
-Track progress with `reql agent task update` and save decisions with
-`reql agent record`. Plain `reql agent finish SUMMARY` saves a checkpoint and
-returns unfinished claims to the queue. Use `reql project context --task ID`
-to recover a task or checkpoint. See the
-[parallel work and handoff guide](docs/COORDINATION.md#planning-and-continuation).
+Suppose you want to change how REQL resolves file paths. The quick-start query
+returns the Python method in `src/api/memory_graph.py` and also surfaces the
+CLI handler in `src/memory/cli.py`. It shows a re-export in
+`src/api/__init__.py` and offers test candidates to inspect.
 
-After changes, run the project's tests and refresh with `reql project compile`.
-Use [`reql stats`](docs/CLI.md#project-and-graph-statistics) to check source freshness
-and `reql project diff` to review changes in the latest REQL revision. For
-assigned tasks with saved checks, apply edits before the
-[finish command](docs/COORDINATION.md#verification-handoff), which runs those
-checks and refreshes the graph. Agent commands send progress to stderr.
-To apply a line-edit plan, use `reql edit --plan -` with
-[verified excerpts](docs/CLI.md#source-edits).
+That gives you a starting point for preserving the public lookup behavior while
+changing the implementation. If a second agent will finish the work, record
+the intended lookup order, the tests already checked, and the next action.
+The next session can retrieve that handoff together with the current source
+context. [Working with a task brief](docs/COORDINATION.md#retrieval-and-overview)
 
-## Features
+## Coordinate agents and resume work
 
-- Incremental code and document compilation with hashes, source spans and provenance.
-- Bounded lexical and graph retrieval through Python, the CLI and MCP. The CLI
-  offers focused dependency views with `query_explore`.
-- Static and observed test evidence with candidate matches labeled separately.
-- Content-addressed project revisions and live source comparison.
-- Static-analysis findings, structural code links, communities and hub analysis.
-- Revision-checked shared work, private session scratch and recoverable checkpoints.
-- Local block storage with transactions, locking, compaction and retention.
-- Markdown reports, JSON and HTML graph export, and project pipeline views.
+**Agent Workspace carries the engineering work forward across sessions.**
+A task can link to affected files, decisions, dependencies, and verification
+results. A new session can recover that task alongside the current code.
+Work context follows the full causal scope by default. Shared work keeps its
+prior revisions.
+Workspace and coordination operations wait for native store locks.
+Use `reql agent wait ID` to wait for a prerequisite after independent work.
+Use `reql agent verify --plan PLAN.json` to run an ordered verification plan
+and reuse passing results for matching revisions and inputs.
+Add `--source` to `reql agent init --json` when the result needs verified
+source bodies.
 
-See the [compilation pipeline](docs/PIPELINE.md) for supported languages,
-document formats and parser requirements.
+- **Split work with dependencies.** Queue tasks and let agents claim ready work.
+  Track which prerequisites are still open, where assigned files overlap, and
+  which tasks have blockers. A coordinator can also assign work to agents
+  dispatched by the host.
+- **Keep the useful parts of an investigation.** Record why a decision was made,
+  what a failed approach broke, or which checks already ran. Recover that history
+  by task, file, or query when related work starts again.
+- **Hand off unfinished work.** Save a checkpoint with evidence paths, progress,
+  and next actions. Unfinished claims can return to the queue with their history
+  available to the next worker.
+- **Verify before closing.** Run the project's checks and summarize their outcome
+  in the task handoff. Include any failure and the next action when handing off
+  unfinished work.
 
-## Runtime Model
+[Task queues and handoffs](docs/COORDINATION.md#planning-and-continuation) |
+[Verification handoff](docs/COORDINATION.md#verification-handoff) |
+[Workspace settings](docs/CONFIGURATION.md#storage-and-workspace-policy)
 
-REQL is alpha software. Python owns orchestration, graph operations and storage.
-Tree-sitter provides native parsing.
+## Reports and visualizations
 
-```text
-project files -> scan and compile -> canonical graph -> bounded source context
-agent outcomes -> shared work records -> task recovery and project overview
-```
+Use these views when you need to explain the system, review a change, or share
+a map with teammates.
 
-The graph defaults to `.reql/memory.reql`. Set project options in
-[`reql.conf`](docs/CONFIGURATION.md).
+| Output | What you can inspect |
+| --- | --- |
+| **Interactive graph** | Search for a symbol, expand its neighbors, filter by community, and inspect node details. The graph is also available as JSON for other tools. |
+| **Project flow** | Follow statically observed routes, commands, or public API entry points through their components and outcomes. Export interactive HTML or Mermaid. |
+| **Project reports** | Review indexed languages and artifacts, parser issues, cleanup candidates, graph changes, and cache status in Markdown. |
+| **Repository explanation** | Browse inferred capabilities and workflows with links to the source, or use the structured JSON view in an integration. |
 
-## Interactive Launcher
+[Project flow export](docs/CLI.md#project-pipeline-export) |
+[Reports and graph export](docs/CLI.md#reporting-and-graph-export)
 
-From a development checkout:
+Project reports use the same scan and cache policy as compilation and surface
+scan failures before writing report files. They compute community and hub
+summaries in memory and leave the compiled graph unchanged. Interactive HTML
+exports include their viewer and work offline. Use `reporting` in `reql.conf`
+to set the report directory and adjust list and graph detail limits.
+[Report settings](docs/CONFIGURATION.md#analysis-and-report-policies)
 
-```bash
-uv run --no-sync python launcher.py
-uv run --no-sync python launcher.py --storage .reql/memory.reql
-```
+## Measured token savings
 
-The launcher offers a guided menu for project commands. See
-[CLI entry points](docs/CLI.md#entry-points) for scripting and
-[MCP setup](docs/MCP.md#start-the-server) for tool clients.
+Focused queries keep the code context small. Shared tasks and checkpoints let
+agents reuse work across sessions, including what was already investigated or
+verified. The comparisons below used the same frozen source trees and
+acceptance checks with and without REQL. Both runs in each comparison passed.
+
+| Codex task | Without REQL | With REQL | Total tokens saved |
+| --- | ---: | ---: | ---: |
+| Import per-test coverage with Windows-qualified test IDs | 1,133,481 | 555,869 | **51%** |
+| Index JavaScript and TypeScript test modifiers | 2,294,300 | 506,771 | **78%** |
+| Coordinate Python, CLI, and MCP changes in one checkout | 1,625,700 | 1,013,598 | **38% across both workers** |
+
+Each row is one paired comparison. Total tokens count input, including cached
+input, plus output. The coordination row sums both workers. Results vary by
+task and run. The local benchmark report is in `benchmark/BENCHMARKS.md`.
+
+## Local by design
+
+Index and query an ordinary folder, even without Git. REQL parses code locally
+with Tree-sitter and uses a local store, with no model calls, API keys, hosted
+service, or external graph database required for compilation and retrieval.
+Recompiling reuses unchanged files, so you can refresh the index after edits.
+Readers can share a local store. Writes require exclusive access. Use
+`reql storage locks` to check access when a store is busy.
+
+- **Mixed-language projects.** Index Python, JavaScript, TypeScript, Go, Rust,
+  Java, C/C++, and other supported languages in one project, alongside Markdown
+  and plain text. Optional PDF support extracts text.
+  [Languages](docs/PIPELINE.md#language-support) | [Documents](docs/PIPELINE.md#supported-inputs)
+- **Developer tools.** Use REQL from the terminal, embed retrieval in a Python
+  tool, or connect an MCP client. MCP has a read-only mode for clients that
+  only need to retrieve context.
+  [Python API](docs/API.md) | [MCP server](docs/MCP.md)
 
 ## Documentation
 
-| Guide | Contents |
+REQL uses `YY.MM.DD` release versions defined in [src/config.py](src/config.py).
+
+| Guide | Use it to |
 | --- | --- |
-| [CLI](docs/CLI.md) | Commands, retrieval, test evidence, reports and exports |
-| [Configuration](docs/CONFIGURATION.md) | Defaults, `reql.conf`, overrides and scan rules |
-| [Engineering coordination](docs/COORDINATION.md) | Work records, sessions and verification handoffs |
-| [MCP server](docs/MCP.md) | Transports, tools and client configuration |
-| [REQL queries and graph](docs/REQL.md) | Query syntax, graph schema, communities and hubs |
-| [Architecture](docs/ARCHITECTURE.md) | Components, ownership and extension points |
-| [Compilation pipeline](docs/PIPELINE.md) | Stages, cache, code parsers and document ingestion |
-| [Storage](docs/STORAGE.md) | Block format, transactions, locking and maintenance |
+| [CLI reference](docs/CLI.md) | Compile, search, inspect tests, and export reports. |
+| [Agent coordination](docs/COORDINATION.md) | Set up work queues, manage handoffs, and attach checks. |
+| [Configuration](docs/CONFIGURATION.md) | Choose what to index and tune project settings. |
+| [Architecture](docs/ARCHITECTURE.md) and [compilation pipeline](docs/PIPELINE.md) | Understand source analysis, retrieval, and storage. |
+| [Graph query language](docs/REQL.md) | Query graph entities and relationships directly. |
 
-## Public API
+## Support REQL
 
-Add `reql` to your application's Python environment, for example with
-`uv add reql`. The package exports `MemoryGraph`, `BlockGraphStore` and typed
-query-context models.
+If REQL saves your team time on a real codebase, [star the project on GitHub](https://github.com/sh1zen/reql)
+or share the workflow that benefited. Examples from new languages and agent
+setups help prioritize what to improve.
 
-```python
-from reql import MemoryGraph, QueryContextRequest, QueryMode, RetrievalBudget
+Interested in sponsoring ongoing maintenance or a specific feature? Start a
+conversation in [GitHub Discussions](https://github.com/sh1zen/reql/discussions).
 
-graph = MemoryGraph.open(".reql/memory.reql")
-try:
-    graph.compile_project(".")
-    request = QueryContextRequest(
-        text="payment service",
-        mode=QueryMode.INFORMATIVE,
-        scopes=frozenset({"code"}),
-        budget=RetrievalBudget(top_k=20, max_depth=3, max_items=20),
-    )
-    result = graph.query_context_result(request)
-    print(result.to_dict())
-finally:
-    graph.close()
-```
-
-The [MemoryGraph facade](src/api/memory_graph.py) exposes compilation, retrieval,
-REQL queries, reporting and analysis. Python compilation overrides
-use `CompilationOptions` from `memory.artifacts`; see
-[typed configuration](docs/CONFIGURATION.md#loader). Context requests return
-schema-version-2 envelopes with source revision, freshness, confidence and a
-nested payload; see [retrieval contracts](docs/CLI.md#retrieval-commands).
-
-Use `graph.find_tests_for(symbol_id=...)` to retrieve test associations,
-`graph.failure_context(query, files=[...])` to recover failed approaches, and
-`graph.workspace_status(path)` to compare the current files with the last REQL
-revision. See [test evidence](docs/CLI.md#test-evidence) and [project source
-status](docs/CLI.md#project-and-graph-statistics).
-
-## License
-
-MIT. See [LICENSE](LICENSE).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and pull request
-expectations. Generated stores and caches stay local.
-
-See [CHANGELOG.md](CHANGELOG.md) for release notes and
-[Release Expectations](CONTRIBUTING.md#release-expectations) for tagging and
-creating a GitHub release.
+[Report an issue](https://github.com/sh1zen/reql/issues) | [Contribute](CONTRIBUTING.md) |
+[Changelog](CHANGELOG.md) | [License](LICENSE)

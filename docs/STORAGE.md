@@ -108,8 +108,8 @@ This keeps retrieval, activation, cache inspection, project compilation, and
 common REQL query paths bounded without relying on SQL or a graph database
 service.
 
-The block adapter owns one lexical-index implementation, using stateless term
-selection helpers in `memory.storage.adapters.lexical_index`. Import the store
+The block adapter owns the lexical index and uses stateless term scoring
+helpers in `memory.storage.adapters.lexical_index`. Import the store
 from `memory.storage`, `memory.storage.adapters`, or the public `reql` package.
 See [clean rebuilds](#inspection-compaction-and-clean-rebuilds) for explicit
 project storage maintenance.
@@ -118,10 +118,18 @@ Indexing and retrieval share immutable short-text analysis. Its process-local
 cache retains at most 1,024 strings of up to 2,048 characters; larger text uses
 the same uncached algorithm. Public token lists remain independent of cached values.
 
-Lexical postings include bounded identifier components (camelCase, snake_case,
-hyphenated names, and paths) plus conservative singular variants. Bounded
-searches rank posting scores before materializing records and only load a small
-candidate pool; unbounded callers retain the complete-result behavior.
+Lexical postings cover complete node text, labels, canonical keys and supported
+searchable properties. They include identifier components from camelCase,
+snake_case, hyphenated names and paths, plus conservative singular variants.
+Searches apply the final score, including salience, to every eligible match.
+When a caller sets `top_k`, the adapter retains the highest-scoring rows.
+
+## Operational settings
+
+`core.yaml` defines the block size for new stores, page cache size, dense-node
+layout, and WAL checkpoint threshold. Each existing checkpoint supplies its
+own block size. The block, manifest, record, and WAL identifiers are
+persistence contracts. See [configuration](CONFIGURATION.md#storage-and-workspace-policy).
 
 ## Data Locality
 
@@ -194,61 +202,50 @@ session/public-message retention and independent shared-work retention.
 
 ## Reader/Writer Locking
 
-`BlockGraphStore` uses a cross-platform reader/writer lock before opening a
-store. Writable opens acquire an atomic sidecar writer file named
-`<store>.lock`, then wait for active read slots in `<store>.readers/` to drain.
-Read-only opens create one atomic reader slot and proceed concurrently with
-other readers as long as no writer is active or waiting.
+The block adapter uses native locks on the local filesystem. Windows uses
+[`LockFileEx`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex).
+POSIX uses [`flock`](https://docs.python.org/3/library/fcntl.html#fcntl.flock).
+The adapter locks a stable file at
+`<store>.lock/access`. Keep this file and its directory in place while REQL
+processes can access the store. A process can open the file while the lock is
+free or busy. The operating system determines access.
 
-This gives local database-like isolation for parallel Codex, MCP, CLI, or user
-processes:
+- Read-only opens take a shared lock. Multiple readers can use the same store.
+- Writable opens and maintenance take an exclusive lock. A writer excludes
+  every other opener until the writer closes the store.
+- A default open returns a busy error immediately if the requested lock is
+  unavailable. Pass `wait_for_lock=True` to `MemoryGraph.open` or `BlockGraphStore`
+  for a native blocking acquisition. `lock_timeout_seconds` sets a bounded wait
+  for callers that need one.
+- Workspace and coordination store opens use native blocking acquisition.
+  Retention tries the private writer lock once and defers work if it is busy.
+- The operating system releases the lock when its process exits. The next
+  writer opens the checkpoint and replays the WAL.
 
-- multiple read-only commands can run at the same time;
-- a writer excludes other writers and new readers;
-- a writer waits for existing readers before opening;
-- a reader waits for or rejects an active writer according to the configured
-  lock timeout;
-- stale same-host lock files from dead processes are removed automatically.
+Open each store in the process that uses it. If workers use `fork`, start
+them before opening the store to avoid inheriting its file descriptor.
 
-Writer and reader-slot release retry Windows sharing violations for up to one
-second, allowing brief metadata-reader handles to close. Each retry rechecks the
-ownership token before deleting the sidecar. Other deletion errors and persistent
-sharing violations still propagate to the caller. If an owner releases between
-an acquisition check and its metadata read, the contender retries acquisition;
-timeout diagnostics also tolerate vanished sidecars.
-Windows may report access denied while a deleted sidecar is pending removal;
-exclusive creation retries that lock-file error within the acquisition timeout.
-Reader-slot creation likewise tolerates concurrent removal of an empty slot
-directory. Persistent access failures still report the original cause.
+The graph lock covers the checkpoint, WAL, and memory map for the lifetime of
+the open store. Checkpoint publication runs under the exclusive lock. The
+adapter closes the current memory map before replacing the checkpoint. If an
+external process blocks the replacement, REQL reports the filesystem error
+and keeps the previous checkpoint and WAL available.
 
-Lock sidecars record the owning command, PID, host and creation time. You can
-inspect them without opening the graph.
+Read-only CLI and MCP commands can record query usage in
+`<store>.usage.jsonl`. The journal has an independent native lock under
+`<store>.usage.jsonl.lock/access`. Journal readers take a shared lock for
+the read. Appends and maintenance take an exclusive lock. Acquire the graph
+lock before the journal lock. The standard read-only `MemoryGraph.open`
+requires an existing checkpoint or WAL payload.
 
 ```bash
 reql storage locks
 reql storage locks --json
-reql storage locks --recover-stale
 ```
 
-Diagnostics report lock duration and same-host process liveness. Recovery only
-removes a lock when its local PID is no longer alive; an incomplete or malformed
-local lock must also exceed a safety grace period, and a different-host lock is
-never removed automatically.
-
-The default lock timeout is bounded, so a genuinely stuck peer raises
-`StorageError` instead of blocking forever. Locks from a different host are
-treated as active because process liveness cannot be checked portably across
-machines. Read/query CLI commands, including `stats`, `query_context`,
-and non-mutating `query` statements, plus read-only MCP tools open the graph
-read-only directly, so they do not take the writer lock. Query usage signals
-still append to `<store>.usage.jsonl`; that sidecar journal has its own short
-exclusive file lock so concurrent readers do not interleave usage writes.
-`MemoryGraph.open(..., read_only=True)` requires an existing block store or WAL
-payload; it raises `StorageError` instead of returning an empty graph for a
-missing or empty storage path.
-
-When a writer is active, read commands respect its lock and either wait or
-raise `StorageError` according to their configured lock timeout.
+This command probes the lock without opening the graph. The JSON `mode`
+is `read` for shared access, `write` for exclusive access, and `null` when free.
+The result describes the state at the time of the probe.
 
 ## Transactions
 
@@ -312,9 +309,10 @@ The service layer should not assume any database-engine-specific behaviour.
 Pass the backend to `MemoryGraph(store)`; the bundled block adapter implements
 the same port.
 
-Adapters implement `lexical_search(..., clone=...)` and
-`find_nodes_by_types(..., clone=...)` as part of the storage port. These operations
-provide indexed search candidates and type scopes; `clone=False` returns borrowed
-records for internal read-only stages. Adapter errors propagate to callers.
+Adapters implement `lexical_search(..., project_id=..., clone=...)` and
+`find_nodes_by_types(..., clone=...)` as part of the storage port. When set,
+`project_id` restricts lexical candidates before ranking and applying the limit.
+`clone=False` returns borrowed records for internal read-only stages. Adapter
+errors propagate to callers.
 `count_nodes` and `count_edges` are also required port operations. `STATS` calls
 them directly; adapters must implement their filters and return integer counts.

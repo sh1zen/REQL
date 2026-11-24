@@ -69,7 +69,13 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertGreaterEqual(result["retention"]["files_removed"], 1)
         self.assertGreater(result["retention"]["bytes_reclaimed"], 0)
         self.assertFalse(workspace.exists())
-        self.assertEqual(list(workspace.paths.agent_storage.parent.glob("*")), [])
+        private_store = workspace.paths.agent_storage
+        self.assertEqual(
+            {path.name for path in private_store.parent.iterdir()},
+            {f"{private_store.name}.lock", f"{private_store.name}.init.lock"},
+        )
+        for name in (f"{private_store.name}.lock", f"{private_store.name}.init.lock"):
+            self.assertEqual((private_store.parent / name / "access").stat().st_size, 0)
         dashboard = workspace.public_dashboard()
         self.assertEqual(dashboard["agents"][0]["status"], "finished")
         self.assertEqual(dashboard["active_tasks"], [])
@@ -189,6 +195,8 @@ class AgentLifecycleTests(unittest.TestCase):
         other.init("Other work")
         other.reject_approach("Global cache", "Mixed tenants")
         other.add_task("Add isolation tests")
+        public_summary = "Progress detail " * 40 + "Final evidence line"
+        other.publish_note(public_summary)
 
         class Explanation:
             """Avoid opening the canonical graph at the presentation boundary."""
@@ -210,6 +218,7 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertEqual(graph.path, ".")
         self.assertEqual(output.getvalue().count("Add isolation tests"), 1)
         self.assertIn("see Active above", output.getvalue())
+        self.assertIn(public_summary, output.getvalue())
         for text in ("# Sample project", "Cache every query", "Stale results", "Mixed tenants",
                      "Parsing works", "Global cache", "Try direct parsing", "Add isolation tests",
                      "agent:cli", "agent:other"):

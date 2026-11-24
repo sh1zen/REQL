@@ -18,14 +18,15 @@ from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.options import CompilationOptions
 from memory.artifacts.revision import RevisionRepository
 from memory.cli import main
+from memory.config import default_config, merge_config
 from memory.domain.query_context import QueryContextRequest
 from memory.extraction.deterministic import DeterministicExtractor
 from memory.services.coordination import CoordinationStore
-from memory.services.retrieval.context.source import _read_bounded_source, capture_source_excerpts
+from memory.services.retrieval.context.source import _read_source_file, capture_source_excerpts
 
 
 class SourceContextTests(unittest.TestCase):
-    """Keep source excerpts accurate, bounded, optional, and independent of the cwd."""
+    """Keep source excerpts accurate, optional and independent of the cwd."""
 
     def setUp(self) -> None:
         test_root = Path.cwd() / ".tmp" / "regression-tests"
@@ -53,28 +54,129 @@ class SourceContextTests(unittest.TestCase):
         self.graph.close()
         self.temp.cleanup()
 
-    def test_assigned_markdown_without_a_passage_has_a_bounded_verified_outline(self) -> None:
+    def test_test_only_task_queries_keep_production_source_out(self) -> None:
+        """Apply the test scope to ranked source, named symbols, and saved pins."""
+        tests = self.root / "tests"
+        tests.mkdir()
+        test_file = tests / "test_tax_rules.py"
+        test_file.write_text("def test_invoice_total():\n    assert 14 == 14\n", encoding="utf-8")
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        work = CoordinationStore.for_project(self.db)
+        production_hash = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        for next_action, files in (
+            ("Inspect the production function.", [self.path.name]),
+            (f"Read `tax_rules.py#L1-L3@{production_hash}`.", [self.path.name, "tests/test_tax_rules.py"]),
+        ):
+            task = work.put("task", next_action, files=files,
+                            next_action=next_action, agent_id="agent:planner", session_id="session:plan")["node"]
+            request = QueryContextRequest.from_raw(text="calculate_invoice_total test_invoice_total",
+                                                   scopes=["test"], task_id=task["id"])
+            service = self.graph.query_context_service
+            for follow_up in (False, True):
+                with self.subTest(next_action=next_action, follow_up=follow_up):
+                    result = service.execute(request, brief=True, follow_up=follow_up)
+                    rendered = service.render(result, brief=True)
+                    self.assertIn("assert 14 == 14", rendered)
+                    self.assertNotIn("total = sum(prices)", rendered)
+                    self.assertNotIn("total = sum(prices)", json.dumps(result.to_dict()))
+
+    def test_assigned_project_constrains_initial_and_follow_up_queries(self) -> None:
+        """Keep stronger lexical matches and duplicate paths in another project out."""
+        other = self.root.parent / "other"
+        other.mkdir()
+        (other / self.path.name).write_text(
+            "def foreign_invoice_query():\n    return 'foreign project body'\n", encoding="utf-8",
+        )
+        (other / "foreign.py").write_text("def foreign_only_owner():\n    return 'foreign only'\n", encoding="utf-8")
+        (self.root / "assigned.py").write_text("def assigned_owner():\n    return 'assigned project body'\n",
+                                               encoding="utf-8")
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        self.assertFalse(self.graph.compile_project(other).run.errors)
+        revision = RevisionRepository(self.graph.store).latest(self.project_id)
+        task = CoordinationStore.for_project(self.db).put(
+            "task", "Inspect assigned owner", files=["assigned.py", self.path.name],
+            agent_id="agent:planner", session_id="session:plan",
+        )["node"]
+        service = self.graph.query_context_service
+        for query, expected_body in (("foreign_invoice_query assigned_owner", "assigned project body"),
+                                     ("foreign_only_owner", None), (self.path.name, None)):
+            for follow_up in (False, True):
+                with self.subTest(query=query, follow_up=follow_up):
+                    request = QueryContextRequest.from_raw(text=query, scopes=["code"], top_k=1,
+                                                           task_id=task["id"])
+                    result = service.execute(request, brief=True, follow_up=follow_up)
+                    self.assertEqual(result.source_revision.id, revision.id)
+                    serialized = json.dumps(result.to_dict())
+                    self.assertNotIn("foreign project body", serialized)
+                    self.assertNotIn("foreign.py", serialized)
+                    if expected_body is not None:
+                        self.assertIn(expected_body, serialized)
+
+        ambiguous = CoordinationStore.for_project(self.db).put(
+            "task", "Inspect shared path", files=[self.path.name],
+            agent_id="agent:planner", session_id="session:plan",
+        )["node"]
+        request = QueryContextRequest.from_raw(text="foreign_invoice_query", scopes=["code"],
+                                               task_id=ambiguous["id"], include_source=True)
+        for follow_up in (False, True):
+            with self.subTest(ambiguous=True, follow_up=follow_up):
+                result = service.execute(request, brief=True, follow_up=follow_up)
+                self.assertIsNone(result.source_revision)
+                self.assertEqual(result.payload["snippets"], [])
+
+    def test_assigned_markdown_without_a_passage_lists_verified_sections(self) -> None:
         """Give a focused way to read an assigned document without echoing the whole file."""
         document = self.root / "README.md"
         document.write_text("# Guide\n\n" + "".join(
-            f"## Section {index}\n\nLong prose body {index}\n\n" for index in range(11)), encoding="utf-8")
+            f"## Section {index}\n\nLong prose body {index}\n\n" for index in range(1000)), encoding="utf-8")
         self.assertFalse(self.graph.compile_project(self.root, parsing_options=CompilationOptions(ingest_documents=True)).run.errors)
         board = CoordinationStore(self.db.with_name("agent-dashboard.reql"))
         task = board.put("task", "Document invoice totals", files=[self.path.name, document.name],
                          agent_id="agent:planner", session_id="session:plan")["node"]
         service = self.graph.query_context_service
-        request = QueryContextRequest.from_raw(text="calculate_invoice_total", scopes=["code"], task_id=task["id"])
+        request = QueryContextRequest.from_raw(text="calculate_invoice_total", scopes=["code"], task_id=task["id"],
+                                              max_items=1)
         result = service.execute(request, brief=True)
         outline = result.payload["task_documentation_outline"]
-        self.assertEqual(len(outline["headings"]), 8)
-        self.assertEqual(outline["omitted"], 3)
+        self.assertEqual(len(outline["headings"]), 1)
+        self.assertEqual(outline["omitted"], 999)
         self.assertEqual(outline["headings"][0], {"title": "Section 0", "line_start": 3, "line_end": 6})
         rendered = service.render(result, brief=True)
         self.assertIn("Assigned document sections", rendered)
         self.assertIn("3-6 Section 0", rendered)
+        self.assertIn("999 more sections", rendered)
+        self.assertNotIn("Section 999", rendered)
         self.assertNotIn("Long prose body", rendered)
         document.write_text("# Changed\n", encoding="utf-8")
         self.assertNotIn("task_documentation_outline", service.execute(request, brief=True).payload)
+
+    def test_assigned_markdown_brief_gives_ranges_for_multiple_files(self) -> None:
+        """Each assigned document gets verified locations within one section budget."""
+        documents = ("README.md", "guide.md")
+        for name in documents:
+            (self.root / name).write_text(
+                f"# {name}\n\n## Getting started\n\nDo not print this body.\n\n"
+                "## Examples\n\nDo not print this example.\n",
+                encoding="utf-8",
+            )
+        self.assertFalse(self.graph.compile_project(
+            self.root, parsing_options=CompilationOptions(ingest_documents=True),
+        ).run.errors)
+        task = CoordinationStore.for_project(self.db).put(
+            "task", "Document invoice totals", files=[self.path.name, *documents],
+            agent_id="agent:planner", session_id="session:plan",
+        )["node"]
+        service = self.graph.query_context_service
+        request = QueryContextRequest.from_raw(text="calculate_invoice_total", scopes=["code"], task_id=task["id"],
+                                              max_items=3)
+        result = service.execute(request, brief=True)
+        outlines = result.payload["task_documentation_outlines"]
+        self.assertEqual({row["path"] for row in outlines}, set(documents))
+        self.assertTrue(all(row["source_status"] == "verified" and row["headings"] for row in outlines))
+        self.assertEqual(sum(len(row["headings"]) for row in outlines), 3)
+        rendered = service.render(result, brief=True)
+        self.assertTrue(all(f"`{name}` (verified)" in rendered for name in documents))
+        self.assertNotIn("Do not print", rendered)
 
     def _payload(self, **kwargs):
         """Use the public Python boundary with explicit source scope."""
@@ -83,6 +185,150 @@ class SourceContextTests(unittest.TestCase):
     def _read(self, start: int = 1, end: int = 24):
         """Construct a graph-provenanced source request for boundary tests."""
         return {"path": "tax_rules.py", "line_start": start, "line_end": end, "node_id": self.node.id}
+
+    def test_assigned_brief_prefers_nested_named_symbol_and_limits_oversize_bodies(self) -> None:
+        """Keep the named member and give a verified location for a large body."""
+        board = CoordinationStore(self.db.with_name("agent-dashboard.reql"))
+        service = self.graph.query_context_service
+        for path, container, member, small_body, large_body in (
+            ("支払い.py", "計算", "合計", "class 計算:\n    def 合計(self):\n        return 17\n",
+             "    def 保管(self):\n        return '" + "領収書" * 4100 + "'\n"),
+            ("بند.ts", "Tarification", "कुल", "export class Tarification {\n  कुल() { return 17; }\n",
+             "  archive() { return '" + "règlement" * 1800 + "'; }\n}\n"),
+        ):
+            with self.subTest(path=path):
+                (self.root / path).write_text(small_body + large_body, encoding="utf-8")
+                self.assertFalse(self.graph.compile_project(self.root).run.errors)
+                task = board.put("task", "Подготовить итог", key=path, files=[path],
+                                 agent_id="agent:planner", session_id="session:plan")["node"]
+                query = QueryContextRequest.from_raw(text=f"{container} {member}", scopes=["code"], task_id=task["id"])
+                result = service.execute(query, brief=True)
+                row, = result.payload["snippets"]
+                self.assertEqual((row["path"], row["line_start"], row["type"]), (path, 2, "Method"))
+                self.assertIn("return 17", row["text"])
+                broad = service.execute(replace(query, text=container), brief=True)
+                large = next(row for row in broad.payload["snippets"] if row["path"] == path)
+                self.assertTrue(large["body_omitted"])
+                self.assertEqual(large["source_status"], "verified")
+                rendered = service.render(broad, brief=True)
+                self.assertIn(f"{path} [1-", rendered)
+                self.assertNotIn("return 17", rendered)
+
+    def test_follow_up_resolves_an_indexed_filename_before_related_symbols(self) -> None:
+        """Use a literal file match even when a different file mentions its name."""
+        folder = self.root / "tests"
+        folder.mkdir()
+        target = folder / "test_échéance.py"
+        target.write_text("def test_échéance():\n    assert True\n", encoding="utf-8")
+        other = self.root / "billing.py"
+        other.write_text("def échéance():\n    return 'test_échéance.py'\n", encoding="utf-8")
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        board = CoordinationStore(self.db.with_name("agent-dashboard.reql"))
+        task = board.put("task", "Revisar vencimiento", files=[other.name],
+                         agent_id="agent:planner", session_id="session:plan")["node"]
+        service = self.graph.query_context_service
+        request = QueryContextRequest.from_raw(text=target.name, scopes=["code", "test"], task_id=task["id"])
+        result = service.execute(request, brief=True, follow_up=True)
+        self.assertEqual(result.payload["exact_paths"], ["tests/test_échéance.py"])
+        self.assertEqual(result.payload["snippets"], [])
+        self.assertIn("tests/test_échéance.py", service.render(result, brief=True))
+
+    def test_exact_test_file_brief_excludes_unrelated_test_candidates(self) -> None:
+        """A literal test path selects its own candidates and keeps the indexed read location."""
+        tests = self.root / "tests"
+        tests.mkdir()
+        target = tests / "test_tax_rules_contract.py"
+        target.write_text(
+            "from tax_rules import calculate_invoice_total\n\n"
+            "def test_tax_rules_contract():\n"
+            "    def example():\n        return calculate_invoice_total([])\n"
+            "    assert example() == 190\n",
+            encoding="utf-8",
+        )
+        (tests / "test_tax_rules_cleanup.py").write_text(
+            "from tax_rules import calculate_invoice_total\n\n"
+            "def test_tax_rules_contract_cleanup():\n    assert calculate_invoice_total([1]) == 191\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        path = "tests/test_tax_rules_contract.py"
+        task = CoordinationStore.for_project(self.db).put(
+            "task", "Check the tax rules contract", files=[self.path.name],
+            agent_id="agent:planner", session_id="session:plan",
+        )["node"]
+        service = self.graph.query_context_service
+        request = QueryContextRequest.from_raw(text=path, scopes=["code", "test"], task_id=task["id"])
+        result = service.execute(request, brief=True, follow_up=True)
+        self.assertEqual(result.payload["exact_paths"], [path])
+        row, = result.payload["test_targets"]
+        self.assertEqual(row["path"], path)
+        self.assertEqual((row["evidence_kind"], row["verified_current"]), ("static", True))
+        test = self.graph.store.get_node(row["test_id"])
+        self.assertEqual((row["line_start"], row["line_end"]), (3, 6))
+        self.assertEqual(row["symbols"], [test.properties["qualified_name"]])
+        self.assertIn(path, service.render(result, brief=True))
+
+    def test_exact_filenames_survive_ranking_and_item_limits(self) -> None:
+        """Return all exact paths for a bare filename and one for a qualified path."""
+        expected = ["reference.py", "a/reference.py", "b/reference.py"]
+        for index, path in enumerate(expected):
+            file = self.root / path
+            file.parent.mkdir(exist_ok=True)
+            file.write_text(f"def reference_{index}():\n    return {index}\n", encoding="utf-8")
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        service = self.graph.query_context_service
+        for query, paths in (("reference.py", sorted(expected)), ("a/reference.py", ["a/reference.py"])):
+            with self.subTest(query=query):
+                request = QueryContextRequest.from_raw(text=query, scopes=["code"], top_k=1, max_items=1)
+                result = service.execute(request, brief=True)
+                self.assertEqual(result.payload["exact_paths"], paths)
+                self.assertEqual(result.payload["ranked_nodes"], 1)
+                self.assertEqual(result.payload["snippets"], [])
+                self.assertTrue(all(path in service.render(result, brief=True) for path in paths))
+
+    def test_unicode_exact_symbols_are_available_globally_and_in_tasks(self) -> None:
+        """Keep source and confidence consistent across Unicode spellings and assignment scopes."""
+        self.path.write_text("def 合計():\n    return 17\n\ndef café():\n    return 23\n", encoding="utf-8")
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        task = CoordinationStore(self.db.with_name("agent-dashboard.reql")).put(
+            "task", "Check totals", files=[self.path.name], agent_id="agent:planner", session_id="session:plan",
+        )["node"]
+        service = self.graph.query_context_service
+        for query, returned in (("合計", 17), ("café", 23), ("cafe\u0301", 23)):
+            for scopes, task_id in ((None, None), (["code"], None), (["code"], task["id"])):
+                with self.subTest(query=query, scopes=scopes, assigned=bool(task_id)):
+                    request = QueryContextRequest.from_raw(text=query, scopes=scopes, task_id=task_id)
+                    result = service.execute(request, brief=True)
+                    rendered = service.render(result, brief=True)
+                    self.assertIn(f"return {returned}", rendered)
+                    self.assertEqual(result.confidence.status, "sufficient")
+                    self.assertNotIn("targeted rg fallback", rendered)
+
+    def test_tiny_brief_budgets_verify_each_location_without_loading_a_body(self) -> None:
+        """Validate zero in config and avoid decoding known oversize bodies."""
+        self.path.write_text("def calculate_invoice_total(prices):\n    return sum(prices)\n", encoding="utf-8")
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        task = CoordinationStore(self.db.with_name("agent-dashboard.reql")).put(
+            "task", "Check totals", files=[self.path.name], agent_id="agent:planner", session_id="session:plan",
+        )["node"]
+        request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"], task_id=task["id"])
+        self.graph.close()
+        for budget in (0, 1):
+            config = merge_config(default_config(), {"retrieval.source.brief_max_source_chars": budget})
+            with self.subTest(budget=budget), contextlib.closing(MemoryGraph.open(
+                self.db, config=config, read_only=True,
+            )) as graph, patch("memory.services.retrieval.context.source._read_source_file",
+                               side_effect=AssertionError("oversize body was loaded")):
+                service = graph.query_context_service
+                result = service.execute(request, brief=True)
+                row, = result.payload["snippets"]
+                self.assertEqual(row["source_status"], "verified")
+                self.assertTrue(row["body_omitted"])
+                self.assertNotIn("text", row)
+                self.assertEqual(service.render(result, brief=True).count("tax_rules.py [1-2]"), 1)
+                self.assertFalse(any(read["snippet_embedded"] for read in result.payload["read_plan"]))
+        with self.assertRaisesRegex(ValueError, "brief_max_source_chars"):
+            merge_config(default_config(), {"retrieval.source.brief_max_source_chars": -1})
 
     def test_context_preserves_read_spans_and_supported_followups(self) -> None:
         """Return source locations without linking to the removed command."""
@@ -145,16 +391,6 @@ class SourceContextTests(unittest.TestCase):
         self.assertIn("Graph freshness: current", rendered)
         self.assertNotIn("snapshot", rendered.casefold())
 
-    def test_retired_monitor_state_does_not_override_source_freshness(self) -> None:
-        """A legacy sidecar cannot mark matching committed source as stale."""
-        storage = self.graph.store.path
-        storage.with_name(f"{storage.name}.watch.json").write_text(
-            '{"format":"reql-watch-state-v1","status":"refreshing","pending_paths":3}', encoding="utf-8",
-        )
-        result = self._payload(include_source=True)
-        self.assertEqual(result["freshness"]["status"], "current")
-        self.assertEqual(result["freshness"]["pending_paths"], 0)
-
     def test_exact_path_bypasses_only_the_builtin_extractor(self) -> None:
         """An indexed path skips unused built-in seeds while preserving custom extraction."""
         request = QueryContextRequest.from_raw(text="tax_rules.py", scopes=["code"])
@@ -174,8 +410,8 @@ class SourceContextTests(unittest.TestCase):
     def test_brief_returns_one_complete_verified_owner(self) -> None:
         """Use one verified source read, and keep normal JSON independent of brief text."""
         request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"])
-        with patch("memory.services.retrieval.context.source._read_bounded_source",
-                   wraps=_read_bounded_source) as read:
+        with patch("memory.services.retrieval.context.source._read_source_file",
+                   wraps=_read_source_file) as read:
             result = self.graph.query_context_service.execute(request, brief=True)
         read.assert_called_once_with(self.path.resolve())
         row = next(item for item in result.payload["snippets"] if item.get("text"))
@@ -230,8 +466,8 @@ class SourceContextTests(unittest.TestCase):
         self.assertNotIn("linked_section", self.graph.query_context_service.execute(request, brief=True).payload)
         options = CompilationOptions(ingest_documents=True)
         self.assertFalse(self.graph.compile_project(self.root, parsing_options=options).run.errors)
-        with patch("memory.services.retrieval.context.source._read_bounded_source",
-                   wraps=_read_bounded_source) as read:
+        with patch("memory.services.retrieval.context.source._read_source_file",
+                   wraps=_read_source_file) as read:
             result = self.graph.query_context_service.execute(request, brief=True)
         self.assertEqual([call.args[0] for call in read.call_args_list], [self.path.resolve(), doc.resolve()])
         linked = result.payload["linked_section"]
@@ -251,19 +487,35 @@ class SourceContextTests(unittest.TestCase):
         self.assertFalse(self.graph.compile_project(self.root, parsing_options=options).run.errors)
         self.assertNotIn("linked_section", self.graph.query_context_service.execute(request, brief=True).payload)
 
+    def test_linked_sections_try_next_reference_and_accept_unicode_anchors(self) -> None:
+        """Resolve actual heading anchors after broken references in the same body."""
+        doc = self.root / "guide.md"
+        doc.write_text("# Guide\n\n## Démarrage\n\nFrench.\n\n## Начало\n\nRussian.\n\n## Setup\n\nEnglish.\n",
+                       encoding="utf-8")
+        options = CompilationOptions(ingest_documents=True)
+        request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"])
+        for anchor, span in (("démarrage", (3, 5)), ("de\u0301marrage", (3, 5)),
+                             ("%D0%BD%D0%B0%D1%87%D0%B0%D0%BB%D0%BE", (7, 9)),
+                             ("начало", (7, 9)), ("setup", (11, 13))):
+            with self.subTest(anchor=anchor):
+                body = self.body.replace("Apply invoice rules to the supplied prices.",
+                                         f"See missing.md#section, guide.md#unknown and guide.md#{anchor} for details.")
+                self.path.write_text(body, encoding="utf-8")
+                self.assertFalse(self.graph.compile_project(self.root, parsing_options=options).run.errors)
+                linked = self.graph.query_context_service.execute(request, brief=True).payload["linked_section"]
+                self.assertEqual((linked["path"], linked["line_start"], linked["line_end"]), (doc.name, *span))
+
     def test_assigned_brief_supplies_one_complete_current_test_file(self) -> None:
-        """Keep the edit-ready test bounded, source-backed and restricted to the task."""
+        """Show the full source of an assigned test even when the file is large."""
         tests = self.root / "tests"
         tests.mkdir()
         assigned = tests / "test_totals.py"
-        body = "def test_totals():\n    assert sum([2, 3]) == 5\n"
+        body = "def test_totals():\n    assert sum([2, 3]) == 5\n" + ("# " + "fixture " * 9 + "end\n") * 100
         assigned.write_bytes(body.replace("\n", "\r\n").encode("utf-8-sig"))
-        oversized = tests / "test_bulk.py"
-        oversized.write_text("# fixture\n" * 600, encoding="utf-8")
         self.assertFalse(self.graph.compile_project(self.root).run.errors)
         work = CoordinationStore(self.db.with_name("agent-dashboard.reql"))
         task = work.put("task", "Verify invoice totals", agent_id="agent:owner", session_id="session:work",
-                        files=["tests/test_bulk.py", "tests/test_totals.py"])["node"]
+                        files=["tests/test_totals.py"])["node"]
         request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"],
                                                task_id=task["id"])
         result = self.graph.query_context_service.execute(request, brief=True)
@@ -271,13 +523,13 @@ class SourceContextTests(unittest.TestCase):
         self.assertEqual(captured["text"], body.rstrip())
         self.assertEqual(captured["sha256"], hashlib.sha256(assigned.read_bytes()).hexdigest())
         self.assertEqual((captured["encoding"], captured["line_endings"]), ("UTF-8 BOM", "CRLF"))
-        self.assertIn("tests/test_totals.py [1-2]` (whole file, verified) [UTF-8 BOM, line endings: CRLF]",
+        self.assertIn("tests/test_totals.py [1-102]` (whole file, verified) [UTF-8 BOM, line endings: CRLF]",
                       self.graph.query_context_service.render(result, brief=True))
         self.assertNotIn("task_test_source", self.graph.query_context_result(request).payload)
         assigned.write_text("def test_totals():\n    assert True\n", encoding="utf-8")
         self.assertNotIn("task_test_source", self.graph.query_context_service.execute(request, brief=True).payload)
 
-    def test_assigned_brief_embeds_small_current_guidance_without_reading_twice(self) -> None:
+    def test_assigned_brief_embeds_current_guidance_without_reading_twice(self) -> None:
         """Supply the verified section body and patch format only for assigned work."""
         source = self.body.replace("Apply invoice rules to the supplied prices.",
                                    "See docs/invoice.md#invoice-policy for the contract.")
@@ -294,8 +546,8 @@ class SourceContextTests(unittest.TestCase):
                         files=[self.path.name])["node"]
         request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"], task_id=task["id"])
         service = self.graph.query_context_service
-        with patch("memory.services.retrieval.context.source._read_bounded_source",
-                   wraps=_read_bounded_source) as read:
+        with patch("memory.services.retrieval.context.source._read_source_file",
+                   wraps=_read_source_file) as read:
             result = service.execute(request, brief=True)
         self.assertEqual([call.args[0] for call in read.call_args_list], [self.path.resolve(), doc.resolve()])
         self.assertEqual(result.payload["linked_section"]["text"], section)
@@ -311,13 +563,13 @@ class SourceContextTests(unittest.TestCase):
         self.assertNotIn("linked_section", service.execute(request, brief=True).payload)
         self.assertFalse(self.graph.compile_project(self.root, parsing_options=options).run.errors)
         linked = service.execute(request, brief=True).payload["linked_section"]
-        self.assertNotIn("text", linked)
+        self.assertEqual(linked["text"].splitlines().count("Long guidance."), 30)
         self.assertEqual(linked["source_status"], "verified")
 
     def test_assigned_brief_resolves_only_current_pinned_ranges_for_task_files(self) -> None:
         """Recover the exact saved edit evidence without trusting shifted or external lines."""
         support = self.root / "format_rules.py"
-        support.write_bytes(b"MODE = 1\n\nSTABLE_SETTING = 2\n")
+        support.write_bytes(b"MODE = 1\n\nSTABLE_SETTING = 2\n" + b"# padding\n" * 6)
         digest = hashlib.sha256(support.read_bytes()).hexdigest()
         same_body_hash = hashlib.sha256(self.path.read_bytes()).hexdigest()
         reference = f"`format_rules.py#L1-L2@{digest}`"
@@ -332,7 +584,7 @@ class SourceContextTests(unittest.TestCase):
                                                task_id=task["id"])
         result = self.graph.query_context_service.execute(request, brief=True)
         spans = result.payload["task_edit_spans"]["spans"]
-        self.assertEqual(len(spans), 1)
+        self.assertEqual([row["path"] for row in spans], [support.name, self.path.name])
         self.assertEqual((spans[0]["path"], spans[0]["sha256"], spans[0]["text"]),
                          (support.name, digest, "MODE = 1\n"))
         self.assertEqual((spans[0]["encoding"], spans[0]["line_endings"]), ("UTF-8", "LF"))
@@ -357,8 +609,8 @@ class SourceContextTests(unittest.TestCase):
             self.assertNotIn("text", row)
             self.assertIn(reference, self.graph.query_context_service.render(result, brief=True))
 
-    def test_assigned_ranges_replace_covered_owner_and_share_its_budget(self) -> None:
-        """Spend the space from a repeated owner on other pinned task files."""
+    def test_assigned_ranges_replace_covered_owner_in_the_brief(self) -> None:
+        """Show pinned ranges across files and render shared source once."""
         self.path.write_text(self.body + "\nMODE = 1\n", encoding="utf-8")
         tests = self.root / "tests"
         tests.mkdir()
@@ -385,7 +637,6 @@ class SourceContextTests(unittest.TestCase):
         self.assertEqual(rendered.count("def calculate_invoice_total(prices):"), 1)
         self.assertIn("guide.md [1-20]", rendered)
         self.assertIn("MODE = 1", rendered)
-        self.assertNotIn("assigned source budget exceeded", rendered)
 
         targets = [
             {"kind": "test", "path": "tests/test_unrelated.py", "evidence_kind": "candidate"},
@@ -397,7 +648,7 @@ class SourceContextTests(unittest.TestCase):
         self.assertIn("tests/test_confirmed.py", rendered)
         self.assertEqual(projected.payload["test_targets"], targets)
 
-    def test_pinned_markdown_heading_includes_complete_bounded_example(self) -> None:
+    def test_pinned_markdown_heading_includes_the_complete_example(self) -> None:
         guide = self.root / "README.md"
         guide.write_bytes(b"# Invoice\r\n\r\n## Example\r\n\r\nCall total().\r\n\r\n## Other\r\nIgnore this.\r\n")
         digest = hashlib.sha256(guide.read_bytes()).hexdigest()
@@ -436,14 +687,16 @@ class SourceContextTests(unittest.TestCase):
                            "    def reset(self):\n"
                            "        return None\n\n"
                            "    def unrelated(self):\n"
-                           "        return None\n", encoding="utf-8")
+                           "        return None\n\n"
+                           "    def 確認する(self):\n"
+                           "        return True\n", encoding="utf-8")
         model = self.root / "rows.py"
         model.write_text("from dataclasses import dataclass\n\n@dataclass\n"
                          "class DecisionRow:\n    price: int\n", encoding="utf-8")
         self.assertFalse(self.graph.compile_project(self.root).run.errors)
         board = CoordinationStore(self.db.with_name("agent-dashboard.reql"))
         author = {"agent_id": "agent:owner", "session_id": "session:work"}
-        decision = board.put("decision", "After RuleClient.reset, use RuleClient.check(price=...) for invoice rules",
+        decision = board.put("decision", "After RuleClient.reset, use RuleClient.check(price=...) and 確認する()",
                              rationale="Use the price field on DecisionRow.", files=[adapter.name], **author)["node"]
         board.put("decision", "Use RuleClient.unrelated() for invoice rules",
                   rationale="For another task only.", files=[adapter.name], **author)
@@ -451,16 +704,17 @@ class SourceContextTests(unittest.TestCase):
                          **author)["node"]
         service = self.graph.query_context_service
         request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"], task_id=task["id"])
-        with patch("memory.services.retrieval.context.source._read_bounded_source", wraps=_read_bounded_source) as reads:
+        with patch("memory.services.retrieval.context.source._read_source_file", wraps=_read_source_file) as reads:
             result = service.execute(request, brief=True)
         paths = [call.args[0] for call in reads.call_args_list]
         self.assertEqual(paths.count(adapter), 1)
         self.assertEqual(paths.count(model), 1)
-        call, returned, reset = result.payload["task_contract_source"]
+        call, returned, confirmation, reset = result.payload["task_contract_source"]
         self.assertEqual((call["path"], call["line_start"], call["line_end"]), (adapter.name, 4, 5))
         self.assertEqual(call["sha256"], hashlib.sha256(adapter.read_bytes()).hexdigest())
         self.assertEqual(returned["path"], model.name)
         self.assertIn("price: int", returned["text"])
+        self.assertIn("def 確認する(", confirmation["text"])
         self.assertIn("def reset(", reset["text"])
         self.assertNotIn("task_edit_spans", result.payload)
         rendered = service.render(result, brief=True)
@@ -473,7 +727,7 @@ class SourceContextTests(unittest.TestCase):
         # The exact name in the annotation cannot safely select either declaration.
         (self.root / "other_rows.py").write_text("class DecisionRow:\n    amount: str\n", encoding="utf-8")
         self.assertFalse(self.graph.compile_project(self.root).run.errors)
-        call, reset = service.execute(request, brief=True).payload["task_contract_source"]
+        call, confirmation, reset = service.execute(request, brief=True).payload["task_contract_source"]
         self.assertEqual(call["path"], adapter.name)
         self.assertEqual(reset["path"], adapter.name)
         adapter.write_text(adapter.read_text(encoding="utf-8").replace("price: int", "price: str"), encoding="utf-8")
@@ -522,7 +776,7 @@ class SourceContextTests(unittest.TestCase):
         self.assertFalse(service.execute(request, brief=True).payload["snippets"])
 
     def test_assigned_exact_brief_and_follow_up_prefer_scoped_symbols(self) -> None:
-        """Display exact in-scope evidence, an oversized span, and no repeated work record."""
+        """Display exact source bodies in the assignment and omit repeated work records."""
         assigned = self.root / "assigned.py"
         assigned.write_text("LIMIT = 7\ndef approach():\n    return LIMIT\n\n"
                             "def long_owner():\n" + "    total = 7\n" * 40 + "    return total\n",
@@ -538,13 +792,14 @@ class SourceContextTests(unittest.TestCase):
         rendered = service.render(result, brief=True)
         self.assertEqual(rendered.count("def approach():"), 1)
         self.assertIn("LIMIT = 7", rendered)
-        self.assertIn("long_owner (indexed range)", rendered)
+        self.assertIn("def long_owner():", rendered)
+        self.assertIn("    return total", rendered)
         self.assertNotIn("unassigned sentinel", rendered)
         self.assertNotIn("other.py", rendered)
         follow_up = service.execute(request, brief=True, follow_up=True)
         text = service.render(follow_up, brief=True)
         self.assertIn("def approach():", text)
-        self.assertIn("long_owner (indexed range)", text)
+        self.assertIn("def long_owner():", text)
         self.assertNotIn("Engineering context", text)
         self.assertNotIn("Change the assigned rule", text)
 
@@ -614,7 +869,7 @@ class SourceContextTests(unittest.TestCase):
         self.assertNotIn("task_source_file", service.execute(request, brief=True).payload)
 
     def test_brief_completes_the_indexed_owner_without_expanding_the_saved_pin(self) -> None:
-        """Show a complete routine when the short tail fits and the pin remains current."""
+        """Show a complete routine while preserving the verified pinned range."""
         rows = ["def fold_discounts(items):", "    total = 0",
                 *("    total += sum(items)" for _ in range(35)), "    return total"]
         worker = self.root / "discounts.py"
@@ -626,7 +881,7 @@ class SourceContextTests(unittest.TestCase):
         task = board.put("task", "Update fold_discounts", files=[worker.name],
                          next_action=f"`{worker.name}#L1-L30@{digest}`",
                          agent_id="agent:owner", session_id="session:work")["node"]
-        request = QueryContextRequest.from_raw(text="fold_discounts", scopes=["code"], task_id=task["id"])
+        request = QueryContextRequest.from_raw(text=worker.name, scopes=["code"], task_id=task["id"])
         service = self.graph.query_context_service
         result = service.execute(request, brief=True)
         pin, = result.payload["task_edit_spans"]["spans"]
@@ -717,8 +972,8 @@ class SourceContextTests(unittest.TestCase):
         self.assertTrue(any(item.get("text") == self.body.rstrip("\n") for item in brief.payload["snippets"]))
         self.assertIn("Current source", self.graph.query_context_service.render(brief, brief=True))
 
-    def test_brief_keeps_locations_for_ambiguous_long_and_stale_symbols(self) -> None:
-        """Show useful locations without embedding an ambiguous or partial body."""
+    def test_brief_keeps_locations_for_ambiguous_or_stale_symbols(self) -> None:
+        """Show complete long bodies when the selected symbol is unambiguous and current."""
         request = QueryContextRequest.from_raw(text=self.node.properties["name"], scopes=["code"])
         conflict = self.root / "alternate.py"
         conflict.write_text(self.body, encoding="utf-8")
@@ -733,7 +988,7 @@ class SourceContextTests(unittest.TestCase):
         self.path.write_text(long_body, encoding="utf-8")
         self.graph.compile_project(self.root)
         result = self.graph.query_context_service.execute(request, brief=True)
-        self.assertFalse(result.payload["snippets"])
+        self.assertIn(long_body.rstrip("\n"), [row.get("text") for row in result.payload["snippets"]])
         self.assertIn("tax_rules.py", self.graph.query_context_service.render(result, brief=True))
 
         self.path.write_text(self.body, encoding="utf-8")
@@ -757,8 +1012,13 @@ class SourceContextTests(unittest.TestCase):
         refreshed = self._payload(include_source=True)
         self.assertTrue(any("sum(prices) * 2" in item.get("text", "") for item in refreshed["payload"]["snippets"]))
         self.path.unlink()
-        rows = self._payload(include_source=True)["payload"]["snippets"]
-        self.assertTrue(all(item["source_status"] == "stale" and "text" not in item for item in rows))
+        deleted = self._payload(include_source=True)
+        self.assertEqual(deleted["freshness"]["status"], "stale")
+        rows = deleted["payload"]["snippets"]
+        self.assertEqual({row["path"] for row in rows}, {self.path.name})
+        for row in rows:
+            self.assertEqual(row["source_status"], "stale")
+            self.assertNotIn("text", row)
 
     def test_partial_failed_run_then_reverted_scan_cannot_validate_wrong_spans(self) -> None:
         other = self.root / "other.py"
@@ -795,33 +1055,52 @@ class SourceContextTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertTrue(all(item["source_status"] == "unavailable" and "text" not in item for item in rows))
 
-    def test_byte_limit_and_read_errors_never_return_graph_text(self) -> None:
-        with patch("memory.services.retrieval.context.source.MAX_SOURCE_BYTES", 32):
-            rows = capture_source_excerpts(self.graph.store, [self._read()])
-        self.assertEqual(rows[0]["source_status"], "unavailable")
-        self.assertNotIn("text", rows[0])
+    def test_read_errors_never_return_graph_text(self) -> None:
         with patch.object(Path, "open", side_effect=PermissionError("denied")):
             rows = capture_source_excerpts(self.graph.store, [self._read()])
         self.assertEqual(rows[0]["source_status"], "unavailable")
         self.assertIn("PermissionError", rows[0]["reason"])
         self.assertNotIn("text", rows[0])
 
-    def test_file_region_and_total_budgets_apply_across_the_entire_response(self) -> None:
+    def test_verified_source_covers_all_selected_files_regions_and_lines(self) -> None:
+        body = self.body.replace("    return total", ("    # " + "evidence " * 12 + "\n") * 140 + "    return total")
+        self.path.write_text(body, encoding="utf-8")
         for index in range(3):
             (self.root / f"zone_{index}.py").write_text(
                 f"def zone_{index}():\n    return {index}\n", encoding="utf-8")
-        self.graph.compile_project(self.root)
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
         other_nodes = [node for node in self.graph.store.all_nodes()
                        if node.type == "Function" and node.id != self.node.id]
         reads = [self._read(line, line) for line in range(1, 24, 2)]
         regions = capture_source_excerpts(self.graph.store, reads)
-        self.assertEqual(len(regions), 6)
-        reads = [self._read()] + [dict(path=node.properties["relative_path"], line_start=1,
+        self.assertEqual(len(regions), 12)
+        self.assertTrue(all(row["source_status"] == "verified" for row in regions))
+        reads = [self._read(1, len(body.splitlines()))] + [dict(path=node.properties["relative_path"], line_start=1,
                                       line_end=2, node_id=node.id) for node in other_nodes]
         rows = capture_source_excerpts(self.graph.store, reads)
-        self.assertEqual(len({row["artifact_id"] for row in rows}), 3)
-        self.assertLessEqual(sum(len(row.get("text", "").splitlines()) for row in rows), 120)
-        self.assertLessEqual(sum(len(row.get("text", "")) for row in rows), 6000)
+        self.assertEqual(len({row["artifact_id"] for row in rows}), 4)
+        self.assertEqual(rows[0]["text"], body.rstrip("\n"))
+        self.assertFalse(any(row["truncated"] for row in rows))
+        payload = self._payload(include_source=True)
+        self.assertIn(body.rstrip("\n"), [row.get("text") for row in payload["payload"]["snippets"]])
+
+    def test_verified_source_and_working_set_reach_all_matching_files(self) -> None:
+        """Show complete source and working-set rows up to the request size."""
+        paths = {self.path.name}
+        for index in range(10):
+            path = self.root / f"invoice_{index}.py"
+            path.write_text(f"def calculate_invoice_total(prices):\n    return {index}\n", encoding="utf-8")
+            paths.add(path.name)
+        self.assertFalse(self.graph.compile_project(self.root).run.errors)
+        request = QueryContextRequest.from_raw(
+            text="calculate_invoice_total", scopes=["code"], include_source=True, top_k=50, max_items=25,
+        )
+        service = self.graph.query_context_service
+        result = service.execute(request)
+        self.assertEqual({row["path"] for row in result.payload["working_set"]}, paths)
+        self.assertEqual({row["path"] for row in result.payload["snippets"] if row["source_status"] == "verified"}, paths)
+        rendered = service.render(result)
+        self.assertTrue(all(f"`{path} [" in rendered for path in paths))
 
     def test_outside_paths_and_resolved_links_are_rejected_before_open(self) -> None:
         artifact = self.graph.store.get_node(self.artifact_id)
@@ -846,23 +1125,6 @@ class SourceContextTests(unittest.TestCase):
                 patch.object(Path, "open", side_effect=AssertionError("resolved link was opened")):
             rows = capture_source_excerpts(self.graph.store, [self._read()])
         self.assertEqual(rows[0]["source_status"], "unavailable")
-
-    def test_python_cli_and_mcp_provide_the_same_verified_source(self) -> None:
-        expected = self._payload(include_source=True)["payload"]["snippets"]
-        self.graph.close()
-        mcp = mcp_query_context(storage_path=str(self.db), query="calculate_invoice_total", code=True, include_source=True)
-        output = io.StringIO()
-        previous = Path.cwd()
-        try:
-            os.chdir(self.root.parent)
-            with contextlib.redirect_stdout(output):
-                code = main(["query_context", "--query", "calculate_invoice_total", "--code", "--source", "--json"])
-        finally:
-            os.chdir(previous)
-        self.assertEqual(code, 0, output.getvalue())
-        cli = json.loads(output.getvalue())
-        self.assertEqual(mcp["payload"]["snippets"], expected)
-        self.assertEqual(cli["payload"]["snippets"], expected)
 
     def test_invalid_source_requests_are_rejected_at_shared_boundaries(self) -> None:
         for scopes in (None, ["docs"], ["code", "docs"]):

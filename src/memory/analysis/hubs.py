@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from ..config import AnalysisConfig, default_config
+from ..config.models import HubPolicy
 from ..domain.constants import ACTIVE_STATUSES
 from ..domain.models import MemoryNode
 from ..storage.graph_store import GraphStore
 from .centrality import CentralityCalculator, CentralityMetrics
-from .communities import CommunityDetector
+from .communities import CommunityDetector, stored_community_membership
 from .specificity import SpecificityScorer, SpecificityScore
 
 
@@ -39,31 +41,40 @@ class HubReport:
 
 
 class HubAnalyzer:
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, config: AnalysisConfig | None = None) -> None:
+        config = config if config is not None else default_config().analysis
         self.store = store
-        self.communities = CommunityDetector(store)
-        self.centrality = CentralityCalculator(store)
-        self.specificity = SpecificityScorer(store)
+        self.policy = config.hubs
+        self.communities = CommunityDetector(store, policy=config.communities)
+        self.centrality = CentralityCalculator(store, policy=config.centrality)
+        self.specificity = SpecificityScorer(store, policy=config.specificity)
 
     def analyze(
         self,
         *,
 
         project_id: str | None = None,
-        limit: int = 20,
+        limit: int | None = 20,
         node_types: set[str] | None = None,
         ensure_communities: bool = False,
+        community_by_node: dict[str, str] | None = None,
+        persist: bool = True,
     ) -> HubReport:
-        candidate_limit = max(limit * 12, 120)
-        candidates = self._candidate_nodes(project_id=project_id, node_types=node_types, limit=candidate_limit)
-        community_result = self.communities.detect(project_id=project_id, limit=candidate_limit) if ensure_communities else None
-        membership = community_result.membership if community_result else self._existing_membership()
+        """Rank hubs using supplied, computed, or stored communities."""
+        policy = self.policy
+        candidates = self._candidate_nodes(project_id=project_id, node_types=node_types)
+        if community_by_node is None:
+            if ensure_communities:
+                community_by_node = self.communities.detect(
+                    project_id=project_id, persist=persist,
+                ).membership
+            else:
+                community_by_node = stored_community_membership(self.store, project_id=project_id)
         centrality = self.centrality.calculate(
 
             project_id=project_id,
-            community_by_node=membership,
+            community_by_node=community_by_node,
             candidate_nodes=candidates,
-            edge_limit=max(candidate_limit * 40, 5000),
         )
         scores: list[HubScore] = []
         for node in candidates:
@@ -73,8 +84,8 @@ class HubAnalyzer:
             if metrics is None:
                 continue
             specificity = self.specificity.score(node)
-            score = _hub_score(node, metrics, specificity)
-            reasons = _hub_reasons(metrics, specificity, score)
+            score = _hub_score(node, metrics, specificity, policy)
+            reasons = _hub_reasons(metrics, specificity, score, policy)
             scores.append(
                 HubScore(
                     node_id=node.id,
@@ -94,7 +105,7 @@ class HubAnalyzer:
         scores.sort(key=lambda item: (item.hub_score, item.specificity_score, item.centrality_score), reverse=True)
         ranked = []
         for rank, score in enumerate(scores[:limit], start=1):
-            is_hub = score.hub_score >= 0.18 and score.generic_penalty < 0.65
+            is_hub = score.hub_score >= policy.min_score and score.generic_penalty < policy.max_generic_penalty
             ranked_score = HubScore(
                 node_id=score.node_id,
                 node_type=score.node_type,
@@ -109,13 +120,21 @@ class HubAnalyzer:
                 reasons=score.reasons,
             )
             ranked.append(ranked_score)
-            self._update_node(ranked_score)
+        if persist and ranked:
+            with self.store.transaction():
+                for score in ranked:
+                    self._update_node(score)
 
-        warnings = [f"Generic high-degree candidate penalized: {score.label}" for score in scores if score.generic_penalty >= 0.45 and score.centrality_score >= 0.5][:10]
+        warnings = [
+            f"Generic high-degree candidate penalized: {score.label}"
+            for score in scores
+            if score.generic_penalty >= policy.warning_generic_penalty
+            and score.centrality_score >= policy.warning_centrality
+        ]
         return HubReport(hubs=ranked, warnings=warnings)
 
-    def explain(self, node_id: str) -> HubScore | None:
-        report = self.analyze(limit=1000, ensure_communities=False)
+    def explain(self, node_id: str, *, complete: bool = False) -> HubScore | None:
+        report = self.analyze(limit=None, persist=not complete)
         for hub in report.hubs:
             if hub.node_id == node_id:
                 return hub
@@ -126,29 +145,23 @@ class HubAnalyzer:
         if metrics is None:
             return None
         spec = self.specificity.score(node)
-        score = _hub_score(node, metrics, spec)
-        return HubScore(node.id, node.type, _hub_label(node), score, (metrics.degree_centrality + metrics.weighted_degree) / 2, spec.specificity, metrics.community_bridge_score, spec.generic_penalty, 0, False, _hub_reasons(metrics, spec, score))
+        score = _hub_score(node, metrics, spec, self.policy)
+        return HubScore(node.id, node.type, _hub_label(node), score, (metrics.degree_centrality + metrics.weighted_degree) / 2, spec.specificity, metrics.community_bridge_score, spec.generic_penalty, 0, False, _hub_reasons(metrics, spec, score, self.policy))
 
-    def _candidate_nodes(self, *, project_id: str | None, node_types: set[str] | None, limit: int) -> list[MemoryNode]:
-        blocked = {"Community", "CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace"}
+    def _candidate_nodes(self, *, project_id: str | None, node_types: set[str] | None) -> list[MemoryNode]:
         return [
             node
             for node, _, _ in self.store.top_nodes_by_degree(
-                limit=limit,
+                limit=None,
                 node_types=node_types,
                 statuses=set(ACTIVE_STATUSES),
-                exclude_types=blocked,
-                ignored_edge_types={"BELONGS_TO_COMMUNITY", "BRIDGES_COMMUNITY"},
+                exclude_types=set(self.policy.excluded_node_types),
+                ignored_edge_types=set(self.centrality.policy.ignored_edge_types),
                 project_id=project_id,
                 include_global_project=True,
+                clone=False,
             )
         ]
-
-    def _existing_membership(self) -> dict[str, str]:
-        membership = {}
-        for edge in self.store.get_edges(type_="BELONGS_TO_COMMUNITY", limit=100000):
-            membership[edge.from_id] = edge.to_id
-        return membership
 
     def _update_node(self, score: HubScore) -> None:
         node = self.store.get_node(score.node_id)
@@ -174,22 +187,22 @@ class HubAnalyzer:
         )
 
 
-def _hub_score(node: MemoryNode, metrics: CentralityMetrics, spec: SpecificityScore) -> float:
+def _hub_score(node: MemoryNode, metrics: CentralityMetrics, spec: SpecificityScore, policy: HubPolicy) -> float:
     score = (
-        0.20 * metrics.degree_centrality
-        + 0.15 * metrics.weighted_degree
-        + 0.15 * metrics.activation_frequency
-        + 0.15 * metrics.retrieval_usefulness
-        + 0.10 * node.salience
-        + 0.10 * metrics.community_bridge_score
-        + 0.10 * spec.specificity
-        + 0.05 * node.confidence
-        - 0.20 * spec.generic_penalty
+        policy.degree_weight * metrics.degree_centrality
+        + policy.weighted_degree_weight * metrics.weighted_degree
+        + policy.activation_weight * metrics.activation_frequency
+        + policy.retrieval_weight * metrics.retrieval_usefulness
+        + policy.salience_weight * node.salience
+        + policy.community_weight * metrics.community_bridge_score
+        + policy.specificity_weight * spec.specificity
+        + policy.confidence_weight * node.confidence
+        - policy.generic_penalty_weight * spec.generic_penalty
     )
     return max(0.0, min(1.0, score))
 
 
-def _hub_reasons(metrics: CentralityMetrics, spec: SpecificityScore, score: float) -> list[str]:
+def _hub_reasons(metrics: CentralityMetrics, spec: SpecificityScore, score: float, policy: HubPolicy) -> list[str]:
     """Describe the metrics and penalties used to rank a hub."""
     reasons = [
         f"degree={metrics.degree_centrality:.2f}",
@@ -200,8 +213,8 @@ def _hub_reasons(metrics: CentralityMetrics, spec: SpecificityScore, score: floa
     ]
     if metrics.community_bridge_score > 0:
         reasons.append(f"bridges communities={metrics.community_bridge_score:.2f}")
-    reasons.extend(spec.reasons[:3])
-    if spec.generic_penalty >= 0.45:
+    reasons.extend(spec.reasons)
+    if spec.generic_penalty >= policy.warning_generic_penalty:
         reasons.append("warning: generic high-degree node")
     return reasons
 

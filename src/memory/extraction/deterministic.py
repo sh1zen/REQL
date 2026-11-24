@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..config.loader import default_config
+from ..config.policies import LexicalNormalizationPolicy, SeedExtractionPolicy
 from .normalization import canonicalize, extract_capitalized_entities, keyword_scores, normalize_text, split_sentences
 
 
@@ -72,22 +74,32 @@ class ExtractionResult:
     warnings: list[str] = field(default_factory=list)
 
 
+_DEFAULT_LEXICAL = default_config().lexical
+
+
 class DeterministicExtractor:
     """Rule-based extractor used for query seed discovery."""
 
+    def __init__(self, *, policy: SeedExtractionPolicy = _DEFAULT_LEXICAL.seeds,
+                 normalization: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> None:
+        self.policy = policy
+        self.normalization = normalization
+
     def extract(self, text: str) -> ExtractionResult:
+        sentences = split_sentences(text, policy=self.normalization)
         text = normalize_text(text)
-        semantic_hash = canonicalize(text)
-        sentences = split_sentences(text)
+        semantic_hash = canonicalize(text, fold_accents=self.normalization.fold_accents)
         topics = self._extract_topics(text)
         entities = self._extract_entities(text)
         signature = {
             "normalized_tokens": [topic for topic, _ in topics],
-            "main_topics": [topic for topic, _ in topics[:8]],
-            "entity_canonical_keys": sorted({canonicalize(entity) for entity, _, _ in entities if canonicalize(entity)}),
+            "main_topics": [topic for topic, _ in topics[:self.policy.signature_topics]],
+            "entity_canonical_keys": sorted({key for entity, _, _ in entities
+                                             if (key := canonicalize(entity, fold_accents=self.normalization.fold_accents))}),
             "relation_predicates": [],
         }
-        quality = min(1.0, 0.25 + 0.15 * len(topics) + 0.15 * len(entities))
+        quality = min(1.0, self.policy.quality_base + self.policy.quality_per_topic * len(topics)
+                      + self.policy.quality_per_entity * len(entities))
         return ExtractionResult(
             text=text,
             semantic_hash=semantic_hash,
@@ -102,10 +114,12 @@ class DeterministicExtractor:
     def _extract_topics(self, text: str) -> list[tuple[str, float]]:
         return [
             (term, score)
-            for term, score in keyword_scores(text, max_terms=14)
-            if len(term) >= 3 and not (" " not in term and score < 0.45)
-        ][:10]
+            for term, score in keyword_scores(text, max_terms=self.policy.topic_candidates, policy=self.normalization)
+            if len(term) >= self.policy.topic_min_chars and (" " in term or score >= self.policy.topic_min_signal)
+        ][:self.policy.topic_limit]
 
     def _extract_entities(self, text: str) -> list[tuple[str, str, float]]:
         """Use lexical mentions as seeds without inferring their semantic type."""
-        return [(entity, "named_thing", 0.65) for entity in extract_capitalized_entities(text)[:16]]
+        entities = extract_capitalized_entities(text, policy=self.policy, normalization=self.normalization)
+        return [(entity, "named_thing", self.policy.entity_confidence)
+                for entity in entities[:self.policy.entity_limit]]

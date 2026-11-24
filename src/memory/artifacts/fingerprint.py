@@ -5,31 +5,10 @@ import hashlib
 import json
 from functools import lru_cache
 from importlib.metadata import distributions
-from os import fstat
 from pathlib import Path
 from typing import Any
 
 from ..domain.ids import stable_id
-
-# Advance this revision for project-wide changes to persisted facts.
-# Language-specific revisions belong to the extractor that produces the facts.
-PARSER_FACTS_VERSION = 15
-DEFAULT_PARSER_VERSION = f"project-scan-v{PARSER_FACTS_VERSION}"
-DEFAULT_CHUNKING_VERSION = "uncompiled-v1"
-
-
-def read_bounded_file(path: Path, limit: int) -> bytes | None:
-    """Read through EOF within a byte ceiling without allocating the full ceiling up front."""
-    with path.open("rb") as stream:
-        size = fstat(stream.fileno()).st_size
-        if size > limit:
-            return None
-        content = stream.read(size + 1)
-        if len(content) > size and len(content) <= limit:
-            # A file grew between stat and read. Keep the same bound for the remainder.
-            content += stream.read(limit + 1 - len(content))
-    return content if len(content) <= limit else None
-
 
 @lru_cache(maxsize=1)
 def tree_sitter_versions() -> dict[str, str]:

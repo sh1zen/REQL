@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import MutableMapping, Protocol, Sequence
 
 from ....domain.query_context import ContextPayload
@@ -42,21 +42,13 @@ class PathCandidate:
     type_bonus: float
     seed_score: float
     depth_penalty: float
-    edge_ids: list[str] = field(default_factory=list)
+    last_edge_id: str | None = None
 
 
 class SearchComponent(Protocol):
     store: GraphStore
 
     def _query_profile(self, query_text: str) -> QueryProfile: ...
-
-    def _pick_seed_node_ids(
-        self,
-        scored: list[tuple[str, float]],
-        *,
-        max_k: int,
-        gap_ratio: float = 0.20,
-    ) -> list[str]: ...
 
 
 class ExpansionComponent(Protocol):
@@ -95,4 +87,7 @@ class ContextServiceComponent(Protocol):
 
 
 class ContextRendererComponent(Protocol):
-    def _render_query_context_payload(self, payload: ContextPayload, *, brief: bool = False) -> str: ...
+    def _render_query_context_payload(
+        self, payload: ContextPayload, *, brief: bool = False,
+        displayed_source: list[dict[str, Any]] | None = None,
+    ) -> str: ...

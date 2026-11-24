@@ -144,14 +144,22 @@ class MemoryQuery:
     """Retrieval request."""
 
     text: str
-    top_k: int = 20
-    max_depth: int = 3
+    top_k: int | None = 20
+    max_depth: int | None = 3
     min_activation: float = 0.03
     include_archived: bool = False
     node_types: set[str] | None = None
     edge_types: set[str] | None = None
     context_scopes: set[str] | None = None
     store_trace: bool = True
+    project_ids: frozenset[str] | None = None
+
+    def allows_project(self, node: MemoryNode) -> bool:
+        """Apply the internal project constraint, including unresolved assignments."""
+        if self.project_ids is None:
+            return True
+        project_id = node.id if node.type == "Project" else node.properties.get("project_id")
+        return isinstance(project_id, str) and project_id in self.project_ids
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +192,7 @@ class MemorySubgraph:
     edges: list[MemoryEdge]
     seed_node_ids: list[str]
     trace_id: str | None = None
+    exact_paths: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -202,7 +211,7 @@ class MemorySubgraph:
 @dataclass(slots=True)
 class ActivationOptions:
     seed_boost: float = 1.0
-    max_depth: int = 3
+    max_depth: int | None = 3
     min_activation: float = 0.03
     depth_decay: float = 0.55
     persistence: float = 0.15

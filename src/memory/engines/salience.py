@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..config import default_config
+from ..config.models import SaliencePolicy
 from ..domain.constants import INACTIVE_STATUSES
 from ..domain.models import MemoryNode
 from ..extraction.normalization import clamp
@@ -10,49 +12,33 @@ from ..domain.timeutils import seconds_since
 from ..storage.graph_store import GraphStore
 
 
-TYPE_PRIORS = {
-    "Topic": 0.03,
-    "Entity": 0.02,
-    "Project": 0.05,
-    "Directory": 0.04,
-    "File": 0.08,
-    "SourceArtifact": 0.08,
-    "Module": 0.10,
-    "Class": 0.11,
-    "Interface": 0.10,
-    "Function": 0.12,
-    "Method": 0.12,
-    "Endpoint": 0.12,
-    "Schema": 0.10,
-    "StaticAnalysisFinding": 0.12,
-}
-
-
 class SalienceEngine:
     """Numerical salience computation independent of LLM calls."""
 
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, policy: SaliencePolicy | None = None) -> None:
         self.store = store
+        self.policy = policy if policy is not None else default_config().analysis.salience
 
     def compute_salience_signal(self, node: MemoryNode) -> dict[str, Any]:
         """Compute deterministic salience for code graph retrieval."""
+        policy = self.policy
         props = node.properties
         novelty = clamp(float(props.get("novelty", 1.0 / max(1, node.usage_count + 1))))
         recency = self.recency_score(node)
-        graph_centrality = clamp(self.store.degree(node.id) / 12.0)
-        code_priority = clamp(float(props.get("cleanup_rank", 0.0) or props.get("priority", 0.0) or 0.0) / 3.0)
-        evidence_count = clamp(node.evidence_count / 5.0)
+        graph_centrality = clamp(self.store.degree(node.id) / policy.degree_saturation)
+        code_priority = clamp(float(props.get("cleanup_rank", 0.0) or props.get("priority", 0.0) or 0.0) / policy.priority_saturation)
+        evidence_count = clamp(node.evidence_count / policy.evidence_saturation)
         confidence = clamp(node.confidence)
         salience_score = clamp(
-            0.16 * novelty
-            + 0.12 * recency
-            + 0.24 * graph_centrality
-            + 0.18 * code_priority
-            + 0.12 * evidence_count
-            + 0.18 * confidence
+            policy.novelty_weight * novelty
+            + policy.recency_weight * recency
+            + policy.centrality_weight * graph_centrality
+            + policy.code_priority_weight * code_priority
+            + policy.evidence_weight * evidence_count
+            + policy.confidence_weight * confidence
         )
         if node.status in INACTIVE_STATUSES:
-            salience_score *= 0.25
+            salience_score *= policy.inactive_factor
         return {
             "input": {
                 "novelty": novelty,
@@ -68,11 +54,12 @@ class SalienceEngine:
     def compute_node_salience(self, node: MemoryNode) -> float:
         signal = self.compute_salience_signal(node)
         return clamp(
-            TYPE_PRIORS.get(node.type, 0.04)
-            + 0.82 * float(signal["output"]["salience_score"])
-            - 0.08 * clamp(node.volatility)
+            self.policy.type_priors.get(node.type, self.policy.default_prior)
+            + self.policy.signal_weight * float(signal["output"]["salience_score"])
+            - self.policy.volatility_weight * clamp(node.volatility)
         )
 
-    def recency_score(self, node: MemoryNode, *, half_life_days: float = 14.0) -> float:
-        half_life = max(1.0, half_life_days * 86400.0)
+    def recency_score(self, node: MemoryNode, *, half_life_days: float | None = None) -> float:
+        days = self.policy.half_life_days if half_life_days is None else half_life_days
+        half_life = max(1.0, days * 86400.0)
         return clamp(0.5 ** (seconds_since(node.updated_at) / half_life))

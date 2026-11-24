@@ -6,14 +6,9 @@ from pathlib import PurePosixPath
 import re
 from typing import Any, Sequence
 
-from .....artifacts.context_scope import is_test_context_path
+from .....artifacts.context_scope import is_documentation_context, is_test_context_path
 from .....domain.models import MemoryEdge, MemoryNode
-from ...common import (
-    QUERY_CONTEXT_MAX_RENDERED_FILES,
-    QUERY_CONTEXT_MAX_RENDERED_TEST_FILES,
-    QUERY_CONTEXT_MIN_CONFIDENCE_SCORE,
-    SOURCE_NODE_TYPES,
-)
+from ...common import SOURCE_NODE_TYPES
 from ..source import uncovered_source_rows
 
 
@@ -116,63 +111,72 @@ class MarkdownContextRendererMixin:
         }
         return {key: value for key, value in node.properties.items() if key in keys}
 
-    @staticmethod
-    def _is_public_surface_node(node: MemoryNode) -> bool:
-        if node.type in {"Module", "Class", "Interface", "Endpoint", "Schema"}:
-            return True
+    def _is_public_surface_node(self, node: MemoryNode) -> bool:
+        if node.type not in self.policy.explore.public_surface_nodes:
+            return False
         if node.type == "Import":
             return bool(node.properties.get("is_re_export"))
         if node.type in {"Function", "Method"}:
             name = str(node.properties.get("name") or node.label or "")
             return bool(name and not name.startswith("_"))
-        return False
+        return True
 
     def _is_docs_mention_node(self, node: MemoryNode) -> bool:
-        if node.type not in SOURCE_NODE_TYPES and node.type not in {"Docstring", "Comment"}:
+        if node.type not in self.policy.explore.docs_nodes:
             return False
-        path = self._node_relative_path(node) or self._location_summary(node) or ""
-        normalized = path.replace("\\", "/").casefold()
-        return node.type in {"Docstring", "Comment"} or normalized.startswith("docs/") or normalized == "readme.md" or "/docs/" in normalized
+        return is_documentation_context(node.type, node.properties, self._node_relative_path(node) or "")
 
 
-    def _render_query_context_payload(self, payload: dict[str, Any], *, brief: bool = False) -> str:
+    def _render_query_context_payload(
+        self, payload: dict[str, Any], *, brief: bool = False, displayed_source: list[dict[str, Any]] | None = None,
+    ) -> str:
         if payload.get("kind") == "code":
-            return self._render_code_context_payload(payload, brief=brief)
+            return self._render_code_context_payload(payload, brief=brief, displayed_source=displayed_source)
         return self._render_general_context_payload(payload)
 
-    def _render_code_context_payload(self, payload: dict[str, Any], *, brief: bool = False) -> str:
+    def _render_code_context_payload(
+        self, payload: dict[str, Any], *, brief: bool = False, displayed_source: list[dict[str, Any]] | None = None,
+    ) -> str:
         if str(payload.get("query_mode") or "informative") == "cleanup":
             return self._render_cleanup_context_payload(payload)
 
         lines = self._render_context_header(payload, title="# REQL Context")
         emitted: list[dict[str, Any]] = []
+        located: set[tuple[str, int, int]] = set()
 
-        def source_lines(rows: Sequence[dict[str, Any]], limit: int) -> list[str]:
+        def source_lines(rows: Sequence[dict[str, Any]]) -> list[str]:
             """Use only complete, displayed bodies to cover later evidence."""
             visible = []
             for row in rows:
                 if not uncovered_source_rows([row], emitted):
                     continue
+                location = (row["path"], row["line_start"], row["line_end"])
+                if location in located and not row.get("text"):
+                    continue
                 visible.append(row)
+                located.add(location)
                 if row.get("source_status") == "verified" and "text" in row and not row.get("truncated"):
                     emitted.append(row)
-                if len(visible) == limit:
-                    break
-            return self._render_snippet_lines(visible, limit=limit, brief=True)
+                    if displayed_source is not None:
+                        displayed_source.append(row)
+            return self._render_snippet_lines(visible, brief=True)
 
         exact_ranges = payload.get("task_focus_ranges", ()) if brief else ()
+        exact_paths = payload.get("exact_paths", ()) if brief else ()
         task_paths = set(payload.get("task_source_paths", ())) if brief else set()
-        verification_test = payload.get("verification_test_source") if brief else None
-        if verification_test:
-            self._append_section(lines, "Saved verification test", source_lines([verification_test], 1))
-        if self._query_context_confidence_is_insufficient(payload) and not exact_ranges:
-            if brief and (outline := payload.get("task_documentation_outline")):
-                self._append_section(lines, "Assigned document sections", self._document_outline_lines(outline))
+        outlines: Sequence[dict[str, Any]] = ()
+        if brief:
+            outline = payload.get("task_documentation_outline")
+            outlines = (outline,) if outline else payload.get("task_documentation_outlines", ())
+        if self._query_context_confidence_is_insufficient(payload) and not (exact_ranges or exact_paths):
+            self._append_section(lines, "Assigned document sections", self._document_outline_lines(outlines))
             return "\n".join(lines).strip()
         working_set = list(payload.get("working_set") or [])
         owner_candidates = list(payload.get("owner_candidates") or [])
         targeted_reads = list(payload.get("targeted_reads") or [])
         read_plan = list(payload.get("read_plan") or [])
+        if exact_paths:
+            self._append_section(lines, "Requested files", [f"- `{path}`" for path in exact_paths])
         edit_spans = payload.get("task_edit_spans") if brief else None
         assigned_test = payload.get("task_test_source") if brief else None
         assigned_file = payload.get("task_source_file") if brief else None
@@ -181,7 +185,7 @@ class MarkdownContextRendererMixin:
         complete_assignments = [row for row in (assigned_file, assigned_test, assigned_owner) if row]
         assigned_sources = [*(edit_spans["spans"] if edit_spans else []), *complete_assignments,
                             *([documentation] if documentation else [])]
-        assigned_tests = {item["path"] for item in (*assigned_sources, *([verification_test] if verification_test else []))
+        assigned_tests = {item["path"] for item in assigned_sources
                           if item.get("source_status") == "verified" and is_test_context_path(item["path"])}
         tests: list[dict[str, Any]] = []
         seen_test_paths: set[str] = set()
@@ -193,8 +197,6 @@ class MarkdownContextRendererMixin:
                 continue
             seen_test_paths.add(path)
             tests.append(item)
-            if len(tests) >= QUERY_CONTEXT_MAX_RENDERED_TEST_FILES:
-                break
 
         snippets = payload.get("snippets") or []
         complete = [row for row in (*snippets, *assigned_sources)
@@ -202,32 +204,30 @@ class MarkdownContextRendererMixin:
         verified_paths = {row["path"] for row in complete}
         task_covered = bool(task_paths) and task_paths <= verified_paths
         if assigned_file:
-            self._append_section(lines, "Assigned source file", source_lines([assigned_file], 1))
+            self._append_section(lines, "Assigned source file", source_lines([assigned_file]))
         if assigned_test:
-            self._append_section(lines, "Assigned test file", source_lines([assigned_test], 1))
+            self._append_section(lines, "Assigned test file", source_lines([assigned_test]))
         if edit_spans:
             span_rows = list(edit_spans["spans"])
             if assigned_owner:
                 span_rows.insert(0, assigned_owner)
-            span_lines = source_lines(span_rows, 5)
-            if edit_spans["omitted"]:
-                span_lines.append(f"- {edit_spans['omitted']} assigned range(s) beyond the brief budget.")
+            span_lines = source_lines(span_rows)
             self._append_section(lines, "Assigned edit spans", span_lines)
         if documentation:
-            self._append_section(lines, "Assigned documentation", source_lines([documentation], 1))
-        if brief and (outline := payload.get("task_documentation_outline")):
-            self._append_section(lines, "Assigned document sections", self._document_outline_lines(outline))
+            self._append_section(lines, "Assigned documentation", source_lines([documentation]))
+        self._append_section(lines, "Assigned document sections", self._document_outline_lines(outlines))
         if brief and payload.get("source_mode") == "verified":
-            self._append_section(lines, "Current source", source_lines(snippets, 6))
+            self._append_section(lines, "Current source", source_lines(snippets))
             if linked_section := payload.get("linked_section"):
                 span = self._format_path_bracket_span(
                     linked_section["path"], linked_section["line_start"], linked_section["line_end"],
                 )
-                section_lines = source_lines([linked_section], 1) if "text" in linked_section else [f"- `{span}` (verified section)"]
+                section_lines = source_lines([linked_section]) if "text" in linked_section else [f"- `{span}` (verified section)"]
                 self._append_section(lines, "Linked guidance", section_lines)
         if exact_ranges:
             missing = [
-                row for row in exact_ranges if not any(
+                row for row in exact_ranges
+                if (row["path"], row["line_start"], row["line_end"]) not in located and not any(
                     seen["path"] == row["path"] and seen["line_start"] <= row["line_start"]
                     and row["line_end"] <= seen["line_end"]
                     for seen in (*emitted, *[s for s in snippets if s.get("source_status") == "stale"])
@@ -240,25 +240,14 @@ class MarkdownContextRendererMixin:
             ]
             self._append_section(lines, "Assigned locations", locations)
         if brief and (local_source := payload.get("task_local_source")):
-            self._append_section(lines, "Related source in assigned files", source_lines(local_source, 2))
+            self._append_section(lines, "Related source in assigned files", source_lines(local_source))
         if brief and (contracts := payload.get("task_contract_source")):
-            self._append_section(lines, "Referenced declarations", source_lines(contracts, 3))
+            self._append_section(lines, "Referenced declarations", source_lines(contracts))
         if brief:
             complete = emitted
             verified_paths = {row["path"] for row in emitted}
             task_covered = bool(task_paths) and task_paths <= verified_paths
-        if brief and complete:
-            # Keep linked evidence and lead with the strongest lexical test hints.
-            # Full candidate rows remain available in the structured projection.
-            backed = [item for item in tests if item.get("evidence_kind") in {"static", "observed"}]
-            hints = [item for item in tests if item.get("evidence_kind") not in {"static", "observed"}]
-            hint_limit = min(2, len(complete))
-            tests = [*backed, *hints[: max(0, hint_limit - len(backed))]]
-        source_limit = max(5, QUERY_CONTEXT_MAX_RENDERED_FILES - len(tests)) if tests else QUERY_CONTEXT_MAX_RENDERED_FILES
-        source_rows = working_set[:source_limit]
-        # Reserve the full file budget for ambiguous or cross-cutting work.
-        # When an exact owner is embedded, keep additional ranked owners and
-        # boundary/test evidence and limit only low-signal file suggestions.
+        source_rows = working_set
         if brief and complete:
             focus = {row.get("path") for row in complete} | {row.get("path") for row in owner_candidates}
             source_rows = [
@@ -266,9 +255,9 @@ class MarkdownContextRendererMixin:
                 if row.get("path") in focus or (index < 3 and row.get("reason") != "graph match")
             ]
         if task_covered or exact_ranges:
-            located = {row["path"] for row in exact_ranges}
+            focused_paths = {row["path"] for row in exact_ranges}
             source_rows = [row for row in source_rows if row.get("path") in task_paths
-                           and row.get("path") not in located]
+                           and row.get("path") not in focused_paths]
         rendered_paths: set[str] = set()
 
         def best_span(path: str, row: dict[str, Any]) -> tuple[Any, Any]:
@@ -318,11 +307,11 @@ class MarkdownContextRendererMixin:
                     read.get("snippet_embedded") for read in read_plan
                     if read.get("path") == path and read.get("reason") == "owner symbol"
                 )
-            if (brief and covered) or (not brief and path in verified_paths):
+            if (brief and (covered or (path, line_start, line_end) in located)) or (not brief and path in verified_paths):
                 continue
             rendered_paths.add(path)
             file_lines.append(f"- `{location}`{owner_note if symbols or not brief else ''}")
-        if not file_lines and not verified_paths and not exact_ranges:
+        if not file_lines and not verified_paths and not exact_ranges and not exact_paths and not located:
             file_lines.append("- No source files matched this query.")
         self._append_section(lines, "Files", file_lines)
 
@@ -378,17 +367,21 @@ class MarkdownContextRendererMixin:
         self._append_section(lines, "Associated tests", test_lines)
         if payload.get("source_mode") == "verified":
             if not brief:
-                self._append_section(lines, "Current source", self._render_snippet_lines(snippets, limit=6))
+                self._append_section(lines, "Current source", self._render_snippet_lines(snippets))
         else:
-            self._append_section(lines, "Source previews", self._render_snippet_lines(snippets, limit=3))
+            self._append_section(lines, "Source previews", self._render_snippet_lines(snippets))
         return "\n".join(lines).strip()
 
-    def _document_outline_lines(self, outline: dict[str, Any]) -> list[str]:
-        """Show one document path with verified section ranges for targeted reads."""
-        lines = [f"`{outline['path']}` (verified). Read the relevant section by line range."]
-        lines.extend(f"- {row['line_start']}-{row['line_end']} {row['title']}" for row in outline["headings"])
-        if outline["omitted"]:
-            lines.append(f"- {outline['omitted']} more sections.")
+    def _document_outline_lines(self, outlines: Sequence[dict[str, Any]]) -> list[str]:
+        """Show assigned document paths with verified section ranges."""
+        lines = []
+        for outline in outlines:
+            if lines:
+                lines.append("")
+            lines.append(f"`{outline['path']}` (verified). Read the relevant section by line range.")
+            lines.extend(f"- {row['line_start']}-{row['line_end']} {row['title']}" for row in outline["headings"])
+            if outline["omitted"]:
+                lines.append(f"- {outline['omitted']} more sections.")
         return lines
 
     def _render_general_context_payload(self, payload: dict[str, Any]) -> str:
@@ -440,7 +433,7 @@ class MarkdownContextRendererMixin:
             read_lines.append(f"- {kind} `{location}` from `{item.get('node_id')}` [{item.get('type')}] {item.get('reason')}{status_text}")
         self._append_section(lines, "Targeted reads", read_lines)
         self._append_section(lines, "Change chain", self._render_change_chain_lines(payload.get("change_chain") or []))
-        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or [], limit=6 if payload.get("source_mode") else 3))
+        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or []))
         self._append_section(lines, "Research queries", self._render_research_refs(payload))
         self._append_section(lines, "Summary", self._render_compact_counts(payload))
         return "\n".join(lines).strip()
@@ -525,14 +518,17 @@ class MarkdownContextRendererMixin:
             return "(module)"
         return name.removeprefix(module + ".")
 
-    def _render_snippet_lines(self, snippets: Sequence[dict[str, Any]], *, limit: int, brief: bool = False) -> list[str]:
+    def _render_snippet_lines(self, snippets: Sequence[dict[str, Any]], *, brief: bool = False) -> list[str]:
         snippet_lines: list[str] = []
-        for item in list(snippets)[:limit]:
+        for item in snippets:
             location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
             if "source_status" in item:
                 status = item["source_status"]
                 suffix = "" if status == "verified" else f" ({status})"
                 if brief and status == "verified":
+                    if item.get("body_omitted"):
+                        snippet_lines.append(f"- `{location}` (verified range)")
+                        continue
                     if item.get("whole_file"):
                         suffix = " (whole file, verified)"
                     else:
@@ -541,7 +537,6 @@ class MarkdownContextRendererMixin:
                         suffix += f" [{item['encoding']}, line endings: {item['line_endings']}]"
                 snippet_lines.append(f"- `{location}`{suffix}")
                 if status == "verified":
-                    # Source capture already enforces a shared line and character budget.
                     text = str(item.get("text") or "")
                     if brief:
                         # Keep indentation copyable, even when a document embeds its own fences.
@@ -560,7 +555,6 @@ class MarkdownContextRendererMixin:
             snippet_lines.append(f"- `{location}` ({item.get('type')}; {origin})")
             text = str(item.get("text") or "")
             if text:
-                # Preview production already bounds complete lines and characters.
                 snippet_lines.extend(f"  {line}" for line in text.splitlines())
             if item.get("truncated"):
                 next_line = f"; next line {item['next_line']}" if item.get("next_line") else ""
@@ -576,8 +570,7 @@ class MarkdownContextRendererMixin:
         lines.append(f"## {title}")
         lines.extend(body)
 
-    @staticmethod
-    def _render_context_header(payload: dict[str, Any], *, title: str) -> list[str]:
+    def _render_context_header(self, payload: dict[str, Any], *, title: str) -> list[str]:
         lines = [title, f"Query: {payload.get('query', '')}", f"Mode: {payload.get('query_mode', 'informative')}"]
         scopes = list(payload.get("scopes") or [])
         if scopes:
@@ -585,10 +578,9 @@ class MarkdownContextRendererMixin:
         confidence = payload.get("confidence") or {}
         if confidence.get("status") == "insufficient":
             max_score = float(confidence.get("max_score", 0.0) or 0.0)
-            threshold = float(confidence.get("threshold", QUERY_CONTEXT_MIN_CONFIDENCE_SCORE) or QUERY_CONTEXT_MIN_CONFIDENCE_SCORE)
-            lines.append(
-                f"Confidence: insufficient (max score {max_score:.3f} < {threshold:.3f}); targeted rg fallback allowed."
-            )
+            threshold = float(confidence.get("threshold", self.policy.context.min_confidence))
+            detail = f"max score {max_score:.3f} < {threshold:.3f}" if max_score < threshold else "no ranked results"
+            lines.append(f"Confidence: insufficient ({detail}); targeted rg fallback allowed.")
         return lines
 
     @staticmethod

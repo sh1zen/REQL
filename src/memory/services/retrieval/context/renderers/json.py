@@ -2,21 +2,16 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from pathlib import Path
-import re
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
+from .....artifacts.context_scope import application_surface_kind
+from .....code_analysis.markup import markup_structure
 from .....domain.constants import INACTIVE_STATUSES
 from .....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from ...common import (
-    CALLER_EDGE_TYPES,
-    OWNER_EDGE_TYPES,
-    PUBLIC_SURFACE_EDGE_TYPES,
     QUERY_EXPLORE_ALL_VIEWS,
     QUERY_EXPLORE_DEFAULT_VIEWS,
     QUERY_EXPLORE_VIEWS,
-    SERIALIZATION_EDGE_TYPES,
-    SOURCE_NODE_TYPES,
 )
 
 
@@ -226,7 +221,7 @@ class JsonContextRendererMixin:
                 return rows
         seen: set[tuple[str, str]] = set()
         for edge in edges:
-            if edge.type not in OWNER_EDGE_TYPES or edge.to_id not in seed_ids:
+            if edge.type not in self.policy.explore.owner_edges or edge.to_id not in seed_ids:
                 continue
             owner = nodes.get(edge.from_id)
             target = nodes.get(edge.to_id)
@@ -271,19 +266,8 @@ class JsonContextRendererMixin:
                 break
         return rows
 
-    @staticmethod
-    def _is_owner_symbol_node(node: MemoryNode) -> bool:
-        return node.type in {
-            "Module",
-            "Function",
-            "Class",
-            "Interface",
-            "Method",
-            "Endpoint",
-            "Schema",
-            "Config",
-            "StaticAnalysisFinding",
-        }
+    def _is_owner_symbol_node(self, node: MemoryNode) -> bool:
+        return node.type in self.policy.explore.owner_nodes
 
     def _query_explore_callers(
         self,
@@ -296,7 +280,7 @@ class JsonContextRendererMixin:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for edge in edges:
-            if edge.type not in CALLER_EDGE_TYPES or edge.to_id not in seed_ids:
+            if edge.type not in self.policy.explore.caller_edges or edge.to_id not in seed_ids:
                 continue
             caller = nodes.get(edge.from_id)
             target = nodes.get(edge.to_id)
@@ -327,7 +311,7 @@ class JsonContextRendererMixin:
         rows: list[dict[str, Any]] = []
         seen: set[tuple[str, str | None]] = set()
         for edge in edges:
-            if edge.type in PUBLIC_SURFACE_EDGE_TYPES and (edge.from_id in seed_ids or edge.to_id in seed_ids):
+            if edge.type in self.policy.explore.public_surface_edges and (edge.from_id in seed_ids or edge.to_id in seed_ids):
                 node = nodes.get(edge.from_id if edge.from_id not in seed_ids else edge.to_id)
                 if node is None:
                     continue
@@ -376,18 +360,21 @@ class JsonContextRendererMixin:
         seen: set[tuple[str, str | None]] = set()
         frontier = set(seed_ids)
         visited = set(seed_ids)
-        prefetched = list(edges)
-        for depth in range(1, max(1, int(query.max_depth)) + 1):
-            if not frontier:
-                break
+        if not self.policy.explore.serialization_edges:
+            return rows
+        prefetched = edges
+        depth = 0
+        max_depth = max(1, query.max_depth) if query.max_depth is not None else None
+        while frontier and (max_depth is None or depth < max_depth):
+            depth += 1
             current_edges = prefetched if depth == 1 else self.store.incident_edges(
                 sorted(frontier),
-                edge_types=SERIALIZATION_EDGE_TYPES,
+                edge_types=set(self.policy.explore.serialization_edges),
                 limit=max(1000, limit * 120),
             )
             next_frontier: set[str] = set()
             for edge in current_edges:
-                if edge.type not in SERIALIZATION_EDGE_TYPES:
+                if edge.type not in self.policy.explore.serialization_edges:
                     continue
                 if edge.from_id in frontier:
                     other_id = edge.to_id
@@ -433,7 +420,7 @@ class JsonContextRendererMixin:
         rows: list[dict[str, Any]] = []
         seen: set[tuple[str, str | None]] = set()
         for edge in edges:
-            if edge.type not in {"REFERENCES", "EVIDENCED_BY", "DERIVED_FROM", "HAS_DOCSTRING", "HAS_COMMENT"}:
+            if edge.type not in self.policy.explore.docs_edges:
                 continue
             if edge.from_id not in seed_ids and edge.to_id not in seed_ids:
                 continue
@@ -454,7 +441,12 @@ class JsonContextRendererMixin:
             )
             if len(rows) >= limit:
                 return rows
-        for node, score in self.store.lexical_search(query.text, top_k=max(limit * 2, 20), node_types=set(SOURCE_NODE_TYPES), include_archived=query.include_archived):
+        if not self.policy.explore.docs_nodes:
+            return rows
+        for node, score in self.store.lexical_search(
+            query.text, top_k=max(limit * 2, 20), node_types=set(self.policy.explore.docs_nodes),
+            include_archived=query.include_archived,
+        ):
             if not self._is_docs_mention_node(node):
                 continue
             key = (node.id, None)
@@ -479,52 +471,67 @@ class JsonContextRendererMixin:
         *,
         limit: int,
     ) -> list[dict[str, Any]]:
+        policy = self.policy.explore
         seed_paths = {
-            path
+            (str(node.properties.get("project_id") or ""), path)
             for node in seed_nodes
-            if (path := self._node_relative_path(node)) and self._is_template_path(path)
+            if (path := self._node_relative_path(node)) and application_surface_kind(path) == "template"
         }
         if not seed_paths:
             return []
 
-        fragments: dict[str, list[MemoryNode]] = {}
-        representatives: dict[str, MemoryNode] = {}
-        for node in self.store.all_nodes():
+        projects = {project for project, _ in seed_paths}
+        nodes: Iterable[MemoryNode]
+        if "" in projects:
+            nodes = self.store.find_nodes_by_types(("File", "SourceArtifact", "SourceFragment"), clone=False)
+        else:
+            nodes = (
+                node for project in sorted(projects) for kind in ("File", "SourceArtifact", "SourceFragment")
+                for node in self.store.find_nodes_by_property("project_id", project, type_=kind, limit=None, clone=False)
+            )
+
+        fragments: dict[tuple[str, str], list[MemoryNode]] = {}
+        representatives: dict[tuple[str, str], MemoryNode] = {}
+        for node in nodes:
             if node.status in INACTIVE_STATUSES:
                 continue
             path = self._node_relative_path(node)
-            if not path or not self._is_template_path(path):
+            if not path or application_surface_kind(path) != "template":
                 continue
-            current = representatives.get(path)
+            key = (str(node.properties.get("project_id") or ""), path)
+            if key[0] not in projects:
+                continue
+            current = representatives.get(key)
             if current is None or self._template_representative_rank(node) > self._template_representative_rank(current):
-                representatives[path] = node
+                representatives[key] = node
             if node.type == "SourceFragment" and node.text:
-                fragments.setdefault(path, []).append(node)
+                fragments.setdefault(key, []).append(node)
 
-        signatures: dict[str, tuple[tuple[str, ...], set[str]]] = {}
+        signatures: dict[tuple[str, str], tuple[int, set[str]]] = {}
         for path, items in fragments.items():
             ordered = sorted(items, key=lambda item: int(item.properties.get("line_start") or 0))
-            signatures[path] = self._template_structure_signature("\n".join(item.text or "" for item in ordered))
+            signatures[path] = markup_structure("\n".join(item.text or "" for item in ordered))
 
         rows: list[dict[str, Any]] = []
-        seen_pairs: set[tuple[str, str]] = set()
+        seen_pairs: set[tuple[tuple[str, str], tuple[str, str]]] = set()
         for source_path in sorted(seed_paths):
             source_signature = signatures.get(source_path)
             source_node = representatives.get(source_path)
             if source_signature is None or source_node is None:
                 continue
-            source_sequence, source_features = source_signature
-            if len(source_sequence) < 3 or not source_features:
+            source_count, source_features = source_signature
+            if source_count < policy.duplicate_min_tags or not source_features:
                 continue
-            for duplicate_path, (duplicate_sequence, duplicate_features) in signatures.items():
-                if duplicate_path == source_path or len(duplicate_sequence) < 3:
+            for duplicate_path, (duplicate_count, duplicate_features) in signatures.items():
+                if (duplicate_path == source_path or duplicate_path[0] != source_path[0]
+                        or duplicate_count < policy.duplicate_min_tags):
                     continue
-                pair = tuple(sorted((source_path, duplicate_path)))
+                pair = (source_path, duplicate_path) if source_path < duplicate_path else (duplicate_path, source_path)
                 if pair in seen_pairs:
                     continue
                 shared = source_features & duplicate_features
                 similarity = len(shared) / max(1, len(source_features | duplicate_features))
-                if similarity < 0.50 or len(shared) < 2:
+                if similarity < policy.duplicate_similarity or len(shared) < policy.duplicate_min_features:
                     continue
                 duplicate_node = representatives.get(duplicate_path)
                 if duplicate_node is None:
@@ -540,10 +547,10 @@ class JsonContextRendererMixin:
                         "source": self._query_explore_node_payload(source_node),
                         "duplicate": self._query_explore_node_payload(duplicate_node),
                         "similarity": round(similarity, 4),
-                        "source_tag_count": len(source_sequence),
-                        "duplicate_tag_count": len(duplicate_sequence),
+                        "source_tag_count": source_count,
+                        "duplicate_tag_count": duplicate_count,
                         "shared_patterns": shared_patterns[:8],
-                        "reason": "similar markup hierarchy and tag sequence; lexical relevance is not used",
+                        "reason": "shared markup hierarchy and tag sequence",
                     }
                 )
         rows.sort(
@@ -556,52 +563,9 @@ class JsonContextRendererMixin:
         return rows[:limit]
 
     @staticmethod
-    def _is_template_path(path: str) -> bool:
-        value = path.replace("\\", "/").lstrip("/").casefold()
-        suffix = Path(value).suffix
-        if suffix in {".html", ".htm", ".twig", ".jinja", ".jinja2", ".hbs", ".mustache", ".vue"}:
-            return True
-        return suffix in {".php", ".phtml"} and any(part in f"/{value}" for part in ("/views/", "/templates/"))
-
-    @staticmethod
     def _template_representative_rank(node: MemoryNode) -> int:
         return {"File": 3, "SourceArtifact": 2, "SourceFragment": 1}.get(node.type, 0)
 
-    @staticmethod
-    def _template_structure_signature(text: str) -> tuple[tuple[str, ...], set[str]]:
-        tag_pattern = re.compile(r"<\s*(/?)\s*([A-Za-z][\w:-]*)\b([^>]*)>", re.IGNORECASE)
-        attr_pattern = re.compile(r"\b([A-Za-z_:][\w:.-]*)\s*(?:=|\s|$)")
-        void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
-        stack: list[str] = []
-        sequence: list[str] = []
-        features: set[str] = set()
-        for match in tag_pattern.finditer(text):
-            closing, raw_tag, raw_attrs = match.groups()
-            tag = raw_tag.casefold()
-            if closing:
-                if tag in stack:
-                    while stack and stack[-1] != tag:
-                        stack.pop()
-                    if stack:
-                        stack.pop()
-                continue
-            attrs = sorted(
-                {
-                    attr.casefold()
-                    for attr in attr_pattern.findall(raw_attrs)
-                    if attr.casefold() not in {"php", "echo"}
-                }
-            )
-            parent = stack[-1] if stack else "root"
-            descriptor = f"{len(stack)}:{tag}[{','.join(attrs)}]"
-            sequence.append(descriptor)
-            features.add(f"edge:{parent}>{tag}")
-            features.add(f"node:{descriptor}")
-            if not raw_attrs.rstrip().endswith("/") and tag not in void_tags:
-                stack.append(tag)
-        for index in range(len(sequence) - 2):
-            features.add("sequence:" + "/".join(sequence[index : index + 3]))
-        return tuple(sequence), features
 
     def _query_explore_followups(self, query_text: str, views: Sequence[str]) -> list[dict[str, str]]:
         query = self._reql_string(query_text)

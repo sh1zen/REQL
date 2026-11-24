@@ -6,12 +6,14 @@ term-to-term relations without language-specific rules or model calls.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations, pairwise
 import math
 import unicodedata
 from typing import TYPE_CHECKING, Any
 
+from ..config.loader import default_config
+from ..config.policies import DocumentExtractionPolicy
 from .normalization import clamp, normalize_text, short_label, token_signal_score
 
 if TYPE_CHECKING:
@@ -65,16 +67,34 @@ class DocumentProcessingResult:
     signature: dict[str, Any]
 
 
+_DEFAULT_DOCUMENTS = default_config().lexical.documents
+
+
 class DocumentProcessor:
     """Build a language-agnostic deterministic concept layer from fragments."""
 
-    def __init__(self, *, max_terms: int = 32, max_relations: int = 96, max_events_per_term: int = 2) -> None:
-        self.max_terms = max_terms
-        self.max_relations = max_relations
-        self.max_events_per_term = max_events_per_term
+    def __init__(self, *, max_terms: int | None = None, max_relations: int | None = None,
+                 max_events_per_term: int | None = None,
+                 policy: DocumentExtractionPolicy = _DEFAULT_DOCUMENTS) -> None:
+        overrides = {name: value for name, value in (
+            ("max_terms", max_terms), ("max_relations", max_relations), ("max_events_per_term", max_events_per_term),
+        ) if value is not None}
+        self.policy = replace(policy, **overrides) if overrides else policy
+
+    @property
+    def max_terms(self) -> int:
+        return self.policy.max_terms
+
+    @property
+    def max_relations(self) -> int:
+        return self.policy.max_relations
+
+    @property
+    def max_events_per_term(self) -> int:
+        return self.policy.max_events_per_term
 
     def process(self, fragments: list[DocumentFragment]) -> DocumentProcessingResult:
-        indexed = [_fragment_terms(fragment) for fragment in fragments if str(fragment.text or "").strip()]
+        indexed = [_fragment_terms(fragment, self.policy) for fragment in fragments if str(fragment.text or "").strip()]
         indexed = [item for item in indexed if item["tokens"]]
         if not indexed:
             return DocumentProcessingResult(terms=[], relations=[], raw_events=[], signature={"term_count": 0, "relation_count": 0})
@@ -91,7 +111,7 @@ class DocumentProcessor:
             evidence = short_label(str(fragment.text or ""), 220)
             for term, count in terms.items():
                 key = _document_key(term)
-                if not _useful_document_term(key):
+                if not _useful_document_term(key, self.policy):
                     continue
                 term_counts[key] += count
                 term_labels.setdefault(key, term)
@@ -107,7 +127,7 @@ class DocumentProcessor:
         for key, count in term_counts.items():
             fragments_for_term = term_fragment_counts[key]
             fragment_count = len(fragments_for_term)
-            score = _term_rank(key, count, max_count=max_count, fragment_count=fragment_count, fragment_total=fragment_total)
+            score = _term_rank(key, count, max_count=max_count, fragment_count=fragment_count, fragment_total=fragment_total, policy=self.policy)
             ranked_terms.append(
                 DocumentTerm(
                     key=key,
@@ -141,7 +161,7 @@ class DocumentProcessor:
                     term_key=term.key,
                     term_label=term.label,
                     occurrence_count=float(count),
-                    rank=clamp(term.rank * min(1.0, float(count) / max_count + 0.25)),
+                    rank=clamp(term.rank * min(1.0, float(count) / max_count + self.policy.event_frequency_boost)),
                     evidence=short_label(str(fragment.text or ""), 260),
                     start_line=fragment.start_line,
                     end_line=fragment.end_line,
@@ -183,8 +203,9 @@ class DocumentProcessor:
         for pair, count in pair_counts.items():
             source, target = pair
             source_rank, target_rank = term_rank[source], term_rank[target]
-            rank = clamp((count / max_count) * 0.55 + ((source_rank + target_rank) / 2.0) * 0.45)
-            if rank < 0.18:
+            rank = clamp((count / max_count) * self.policy.relation_frequency_weight
+                         + ((source_rank + target_rank) / 2.0) * self.policy.relation_term_weight)
+            if rank < self.policy.relation_min_rank:
                 continue
             if target_rank > source_rank:
                 source, target = target, source
@@ -205,20 +226,20 @@ class DocumentProcessor:
         return relations[: self.max_relations]
 
 
-def _fragment_terms(fragment: DocumentFragment) -> dict[str, Any]:
+def _fragment_terms(fragment: DocumentFragment, policy: DocumentExtractionPolicy) -> dict[str, Any]:
     text = normalize_text(str(fragment.text or ""))
     tokens = _document_tokens(text)
-    counts: Counter[str] = Counter(token for token in tokens if _useful_document_term(token))
+    counts: Counter[str] = Counter(token for token in tokens if _useful_document_term(token, policy))
     for left, right in pairwise(tokens):
-        if token_signal_score(left) >= 0.5 and token_signal_score(right) >= 0.5:
-            counts[f"{left} {right}"] += 1.4
+        if min(token_signal_score(left), token_signal_score(right)) >= policy.bigram_min_signal:
+            counts[f"{left} {right}"] += policy.bigram_frequency
     for first, second, third in zip(tokens, tokens[1:], tokens[2:]):
-        if min(token_signal_score(first), token_signal_score(second), token_signal_score(third)) >= 0.65:
-            counts[f"{first} {second} {third}"] += 1.8
+        if min(token_signal_score(first), token_signal_score(second), token_signal_score(third)) >= policy.trigram_min_signal:
+            counts[f"{first} {second} {third}"] += policy.trigram_frequency
     return {"fragment": fragment, "tokens": tokens, "terms": counts}
 
 
-def _useful_document_term(term: str) -> bool:
+def _useful_document_term(term: str, policy: DocumentExtractionPolicy) -> bool:
     compact = _document_key(term)
     if compact.isdigit():
         return False
@@ -230,8 +251,8 @@ def _useful_document_term(term: str) -> bool:
         return False
     parts = compact.split()
     if len(parts) == 1:
-        return token_signal_score(compact) >= 0.45
-    return all(token_signal_score(part) >= 0.35 for part in parts)
+        return token_signal_score(compact) >= policy.token_min_signal
+    return all(token_signal_score(part) >= policy.phrase_min_signal for part in parts)
 
 
 def _document_tokens(value: str) -> list[str]:
@@ -260,11 +281,13 @@ def _has_non_latin_alnum(value: str) -> bool:
     return any(char.isalnum() and ord(char) > 127 for char in value)
 
 
-def _term_rank(term: str, count: float, *, max_count: float, fragment_count: int, fragment_total: int) -> float:
+def _term_rank(term: str, count: float, *, max_count: float, fragment_count: int, fragment_total: int,
+               policy: DocumentExtractionPolicy) -> float:
     parts = term.split()
     specificity = sum(token_signal_score(part) for part in parts) / max(1, len(parts))
-    phrase_boost = 0.14 if " " in term else 0.0
+    phrase_boost = policy.phrase_boost if " " in term else 0.0
     distribution = math.log1p(fragment_count) / math.log1p(fragment_total)
     frequency = math.log1p(count) / math.log1p(max_count)
-    saturation_penalty = 0.85 if fragment_count == fragment_total and fragment_total > 2 else 1.0
-    return clamp((frequency * 0.48 + specificity * 0.34 + distribution * 0.18 + phrase_boost) * saturation_penalty)
+    saturation_penalty = policy.ubiquitous_factor if fragment_count == fragment_total >= policy.ubiquitous_min_fragments else 1.0
+    return clamp((frequency * policy.frequency_weight + specificity * policy.specificity_weight
+                  + distribution * policy.distribution_weight + phrase_boost) * saturation_penalty)

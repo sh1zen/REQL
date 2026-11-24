@@ -6,6 +6,18 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+from ..artifacts.context_scope import is_test_context_path
+from ..code_analysis.entrypoints import (
+    INFERRED_TRIGGER_REASON,
+    WORKFLOW_NODE_TYPES,
+    is_workflow_root_candidate,
+    select_workflow_entries,
+    strongly_connected_components,
+    workflow_edge_ids,
+)
+from ..config import AnalysisConfig, default_config
+from ..config.models import WorkflowPolicy
+from ..domain.constants import INACTIVE_STATUSES
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..explanation.service import (
@@ -14,8 +26,6 @@ from ..explanation.service import (
     _humanize_symbol,
     _implementation_body_text,
     _infer_layer,
-    _is_public_owner,
-    _is_test_path,
     _module_hint_matches_path,
     _node_label,
     _node_path,
@@ -32,10 +42,7 @@ from .models import (
     ProjectPipeline,
 )
 
-PIPELINE_NODE_TYPES = {"Class", "Endpoint", "Function", "Interface", "Method"}
-PIPELINE_EDGE_TYPES = {"CALLS", "HANDLES_ROUTE", "IMPORTS_FROM", "INSTANTIATES", "WRAPS"}
 OUTCOME_EDGE_TYPES = {"EMITS", "RAISES", "RETURNS", "WRITES"}
-GENERIC_MODULE_NAMES = {"base", "common", "core", "helpers", "models", "service", "types", "utils"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,8 +64,9 @@ class _Traversal:
 class ProjectPipelineService:
     """Project a compiled code graph into shared high-level workflows."""
 
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, config: AnalysisConfig | None = None) -> None:
         self.store = store
+        self.config = config if config is not None else default_config().analysis
 
     def build(self, project: MemoryNode) -> ProjectPipeline:
         project_id = project.id
@@ -74,25 +82,29 @@ class ProjectPipelineService:
         participants = {
             node.id: node
             for node in pipeline_nodes
-            if node.type in PIPELINE_NODE_TYPES
+            if node.type in WORKFLOW_NODE_TYPES
         }
         all_edges = [
             edge
             for edge in self.store.all_edges()
             if edge.from_id in node_by_id and edge.to_id in node_by_id
+            and edge.properties.get("status") not in INACTIVE_STATUSES
         ]
         adjacency, handled_by_endpoint = _flow_adjacency(all_edges, participants)
-        import_sources = {
-            node.id
+        reasons = {
+            node.id: reason
             for node in participants.values()
-            if _workflow_trigger_reason(node) is not None
+            if (reason := _workflow_trigger_reason(node, self.config.workflow)) is not None
         }
+        import_sources = set(reasons)
         _merge_flow_steps(
             adjacency,
             _resolved_import_steps(pipeline_nodes, participants, import_sources),
         )
         effects = _outcome_edges(all_edges, node_by_id)
-        entries, used_fallback = _entrypoints(participants, adjacency, handled_by_endpoint)
+        entries, used_fallback = _entrypoints(
+            participants, adjacency, reasons, handled_by_endpoint, self.config.workflow,
+        )
         traversals = [
             _traverse(anchor, reason=reason, inferred=inferred, adjacency=adjacency)
             for anchor, reason, inferred in entries
@@ -153,6 +165,7 @@ class ProjectPipelineService:
             workflow_id_by_anchor,
             entry_ids,
             degree_by_id,
+            self.config,
         )
         component_by_id = {component.id: component for component in components}
 
@@ -221,7 +234,7 @@ class ProjectPipelineService:
             )
 
         component_pairs = list(edge_relations)
-        component_sccs = _strongly_connected_components(
+        component_sccs = strongly_connected_components(
             [component.id for component in components],
             component_pairs,
         )
@@ -231,7 +244,7 @@ class ProjectPipelineService:
             if len(component_ids) > 1
             for node_id in component_ids
         }
-        symbol_sccs = _strongly_connected_components(traversed_node_ids, all_symbol_steps)
+        symbol_sccs = strongly_connected_components(traversed_node_ids, all_symbol_steps)
         for symbol_ids in symbol_sccs:
             if len(symbol_ids) <= 1:
                 continue
@@ -294,7 +307,7 @@ class ProjectPipelineService:
 def _is_pipeline_node(node: MemoryNode) -> bool:
     """Return whether a graph node may enter any part of the pipeline projection."""
 
-    return node.type.casefold() != "test" and not _is_test_path(_node_path(node))
+    return node.type.casefold() != "test" and not is_test_context_path(_node_path(node))
 
 
 def _basis(project_id: str, *, used_fallback: bool, nodes: int, raw_steps: int) -> dict[str, object]:
@@ -318,17 +331,17 @@ def _flow_adjacency(
     adjacency: dict[str, list[_FlowStep]] = defaultdict(list)
     handled_by_endpoint: set[str] = set()
     for edge in edges:
-        if edge.type not in PIPELINE_EDGE_TYPES:
-            continue
         source = participants.get(edge.from_id)
         target = participants.get(edge.to_id)
         if source is None or target is None:
             continue
-        if edge.type == "HANDLES_ROUTE" and target.type == "Endpoint":
-            adjacency[target.id].append(_FlowStep(target.id, source.id, edge.type))
-            handled_by_endpoint.add(source.id)
+        link = workflow_edge_ids(source.id, target.id, edge.type, target.type)
+        if link is None:
             continue
-        adjacency[source.id].append(_FlowStep(source.id, target.id, edge.type))
+        if edge.type == "HANDLES_ROUTE" and target.type == "Endpoint":
+            handled_by_endpoint.add(source.id)
+        start, end = link
+        adjacency[start].append(_FlowStep(start, end, edge.type))
     for node_id, steps in adjacency.items():
         adjacency[node_id] = sorted(
             set(steps),
@@ -356,52 +369,23 @@ def _outcome_edges(
 def _entrypoints(
     participants: dict[str, MemoryNode],
     adjacency: dict[str, list[_FlowStep]],
+    reasons: dict[str, str],
     handled_by_endpoint: set[str],
+    policy: WorkflowPolicy,
 ) -> tuple[list[tuple[MemoryNode, str, bool]], bool]:
-    explicit: list[tuple[MemoryNode, str, bool]] = []
-    endpoint_handlers = {
-        step.to_id
-        for node_id, steps in adjacency.items()
-        if participants.get(node_id) is not None and participants[node_id].type == "Endpoint"
-        for step in steps
-    }
-    for node in participants.values():
-        reason = _workflow_trigger_reason(node)
-        if reason is None or not adjacency.get(node.id):
-            continue
-        if node.id in handled_by_endpoint and node.id in endpoint_handlers:
-            continue
-        explicit.append((node, reason, False))
-    if explicit:
-        return sorted(explicit, key=lambda item: _node_sort_key(item[0])), False
-
-    incoming: Counter[str] = Counter(
-        step.to_id
-        for steps in adjacency.values()
-        for step in steps
-    )
-    public_roots = [
-        node
+    outgoing = {node_id: [step.to_id for step in steps] for node_id, steps in adjacency.items()}
+    candidate_keys = {
+        node.id: _node_sort_key(node)
         for node in participants.values()
-        if node.type in {"Endpoint", "Function", "Method"}
-        and adjacency.get(node.id)
-        and incoming[node.id] == 0
-        and _is_public_owner(node)
-    ]
-    if not public_roots:
-        public_roots = [
-            node
-            for node in participants.values()
-            if node.type in {"Endpoint", "Function", "Method"}
-            and adjacency.get(node.id)
-            and _is_public_owner(node)
-        ]
-        public_roots.sort(key=lambda node: (-len(adjacency[node.id]), *_node_sort_key(node)))
-        public_roots = public_roots[:1]
+        if node.id in reasons or is_workflow_root_candidate(node.type, _node_label(node), policy)
+    }
+    root_ids, inferred = select_workflow_entries(
+        outgoing, reasons, candidate_keys, handled_by_endpoint, infer_roots=policy.infer_roots,
+    )
     return [
-        (node, "inferred call-graph root", True)
-        for node in sorted(public_roots, key=_node_sort_key)
-    ], bool(public_roots)
+        (participants[node_id], INFERRED_TRIGGER_REASON if inferred else reasons[node_id], inferred)
+        for node_id in root_ids
+    ], inferred
 
 
 def _traverse(
@@ -441,6 +425,7 @@ def _components(
     workflow_id_by_anchor: dict[str, str],
     entry_ids: set[str],
     degree_by_id: dict[str, int],
+    config: AnalysisConfig,
 ) -> tuple[list[PipelineComponent], dict[str, str]]:
     groups: dict[str, _CapabilityGroup] = {}
     workflow_ids_by_key: dict[str, set[str]] = defaultdict(set)
@@ -482,8 +467,8 @@ def _components(
             PipelineComponent(
                 id=component_id_by_key[key],
                 key=key,
-                name=_component_name(group, degree_by_id),
-                layer=_infer_layer(key, group.paths),
+                name=_component_name(group, degree_by_id, config),
+                layer=_infer_layer(group, config),
                 paths=sorted(group.paths),
                 symbols=symbols,
                 workflow_ids=sorted(workflow_ids_by_key[key]),
@@ -551,15 +536,15 @@ def _component_key(node: MemoryNode) -> str:
     return f"unlocated-{node.type.casefold()}"
 
 
-def _component_name(group: _CapabilityGroup, degree_by_id: dict[str, int]) -> str:
+def _component_name(group: _CapabilityGroup, degree_by_id: dict[str, int], config: AnalysisConfig) -> str:
     """Name a component using its representative path or capability."""
     if group.paths:
         path = PurePosixPath(group.paths.most_common(1)[0][0].replace("\\", "/"))
         stem = path.stem
-        if stem.casefold() in GENERIC_MODULE_NAMES and path.parent.name:
+        if stem.casefold() in config.architecture.generic_module_names and path.parent.name:
             stem = f"{path.parent.name} {stem}"
         return _humanize_symbol(stem)
-    return _capability_name(group, degree_by_id)
+    return _capability_name(group, degree_by_id, config.architecture)
 
 
 def _resolved_import_steps(
@@ -699,53 +684,3 @@ def _int_or_none(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-
-
-def _strongly_connected_components(
-    node_ids: Iterable[str],
-    edges: Iterable[tuple[str, str]],
-) -> list[set[str]]:
-    adjacency: dict[str, list[str]] = defaultdict(list)
-    nodes = set(node_ids)
-    for source, target in edges:
-        nodes.add(source)
-        nodes.add(target)
-        adjacency[source].append(target)
-    for source, targets in adjacency.items():
-        adjacency[source] = sorted(set(targets))
-
-    index = 0
-    indices: dict[str, int] = {}
-    lowlinks: dict[str, int] = {}
-    stack: list[str] = []
-    on_stack: set[str] = set()
-    components: list[set[str]] = []
-
-    def visit(node_id: str) -> None:
-        nonlocal index
-        indices[node_id] = index
-        lowlinks[node_id] = index
-        index += 1
-        stack.append(node_id)
-        on_stack.add(node_id)
-        for target_id in adjacency.get(node_id, []):
-            if target_id not in indices:
-                visit(target_id)
-                lowlinks[node_id] = min(lowlinks[node_id], lowlinks[target_id])
-            elif target_id in on_stack:
-                lowlinks[node_id] = min(lowlinks[node_id], indices[target_id])
-        if lowlinks[node_id] != indices[node_id]:
-            return
-        component: set[str] = set()
-        while stack:
-            target_id = stack.pop()
-            on_stack.remove(target_id)
-            component.add(target_id)
-            if target_id == node_id:
-                break
-        components.append(component)
-
-    for node_id in sorted(nodes):
-        if node_id not in indices:
-            visit(node_id)
-    return components

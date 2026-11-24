@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-import hashlib
 from pathlib import Path
 import re
 from typing import Any, Iterable
 
-from ..artifacts.fingerprint import normalize_relative_lookup_path, read_bounded_file
+from ..artifacts.fingerprint import normalize_relative_lookup_path
+from ..artifacts.testing_conventions import candidate_test_names, candidate_test_stems, project_test_paths, test_path_stem
+from ..artifacts.scanner import fingerprint_file
 from ..artifacts.revision import RevisionRepository
+from ..config import StorageConfig, default_config
+from ..config.policies import TestSuggestionPolicy
 from ..domain.ids import stable_hash
 from ..domain.models import MemoryNode
 from ..storage.graph_store import GraphStore
@@ -17,17 +20,17 @@ from .evidence_store import TestEvidenceStore
 from .models import TestAssociation
 from .static_links import SYMBOL_TYPES, TEST_NODE_TYPES, is_test_case
 
-_MAX_SOURCE_BYTES = 16 * 1024 * 1024
-_EVIDENCE_ORDER = {"observed": 0, "static": 1, "candidate": 2}
-
 
 class TestIntelligenceService:
     """Return stable, bounded test associations without executing tests."""
 
-    def __init__(self, graph: GraphStore) -> None:
+    def __init__(self, graph: GraphStore, *, policy: StorageConfig | None = None,
+                 suggestions: TestSuggestionPolicy | None = None) -> None:
         self.graph = graph
+        suggestions = suggestions or default_config().testing.suggestions
+        self.evidence_order = {kind: index for index, kind in enumerate(suggestions.evidence_order)}
         storage = getattr(graph, "path", None)
-        self.evidence = TestEvidenceStore(Path(storage)) if storage is not None else None
+        self.evidence = TestEvidenceStore(Path(storage), policy=policy) if storage is not None else None
 
     def find(self, *, symbol_id: str | None = None, file: str | None = None,
              include_candidates: bool = False, limit: int = 20) -> list[TestAssociation]:
@@ -68,9 +71,15 @@ class TestIntelligenceService:
                         rows = evidence.find_nodes_by_property("name", target_id, type_="TestObservation",
                                                                limit=None, clone=False)
                         out.extend(self._observed(row.properties, hashes) for row in rows)
+        known_by_target: dict[str, set[str]] = {}
+        if include_candidates:
+            for row in out:
+                known_by_target.setdefault(row.target_symbol_id, set()).add(row.test_id)
+        test_paths: dict[str, dict[str, list[str]]] = {}
         for target in selected.values():
             if target.status != "active":
                 continue
+            static_tests = set()
             for edge in self.graph.get_edges(to_id=target.id, type_="TESTS", limit=None, clone=False):
                 if edge.properties.get("evidence_kind") != "static" or edge.properties.get("status") != "active":
                     continue
@@ -81,35 +90,42 @@ class TestIntelligenceService:
                 resolved_current = len(dependencies) == len(edge.properties.get("resolution_dependencies", [])) and all(
                     hashes.current(node) for node in dependencies
                 )
+                static_tests.add(test.id)
                 out.append(TestAssociation(
                     test.id, target.id, "static", str(edge.properties["evidence_ref"]), hashes.revision_id(target),
                     hashes.compiled(target), bool(resolved_current and hashes.current(test) and hashes.current(target)),
                     _path(test), _path(target),
                 ))
             if include_candidates:
-                out.extend(self._candidates(target, {row.test_id for row in out if row.target_symbol_id == target.id}))
-        out.sort(key=lambda row: (not row.verified_current, _EVIDENCE_ORDER[row.evidence_kind],
+                out.extend(self._candidates(target, known_by_target.get(target.id, set()) | static_tests, test_paths))
+        out.sort(key=lambda row: (not row.verified_current, self.evidence_order[row.evidence_kind],
                                   row.test_path or "", row.test_id, row.target_symbol_id, row.evidence_ref or ""))
         return out[:limit]
 
-    def _candidates(self, target: MemoryNode, known: set[str]) -> Iterable[TestAssociation]:
+    def _candidates(self, target: MemoryNode, known: set[str],
+                    test_paths: dict[str, dict[str, list[str]]]) -> Iterable[TestAssociation]:
+        """Look up exact naming matches without a preliminary lexical cutoff."""
         name = str(target.properties.get("name") or "")
-        stem = Path(_path(target) or "").stem
-        if not name or not stem:
+        path = _path(target)
+        project_id = target.properties.get("project_id")
+        if not name or not path or not isinstance(project_id, str):
             return
-        seen = set(known)
-        for node, _ in self.graph.lexical_search(f"{name} {stem} test", top_k=60,
-                                                 node_types=tuple(sorted(TEST_NODE_TYPES))):
-            if node.id in seen or not is_test_case(node) or node.properties.get("project_id") != target.properties.get("project_id"):
-                continue
-            test_name = str(node.properties.get("name") or "")
-            test_stem = Path(_path(node) or "").stem
-            if (test_name not in {f"test_{name}", f"test{name}", f"test{name[:1].upper()}{name[1:]}"}
-                    and test_stem not in {f"test_{stem}", f"{stem}_test", f"{stem}.test", f"{stem}.spec"}):
-                continue
-            seen.add(node.id)
-            yield TestAssociation(node.id, target.id, "candidate", "naming convention", None, None, False,
-                                  _path(node), _path(target))
+        if project_id not in test_paths:
+            paths_by_stem: dict[str, list[str]] = {}
+            for test_path in project_test_paths(self.graph, project_id):
+                paths_by_stem.setdefault(test_path_stem(test_path), []).append(test_path)
+            test_paths[project_id] = paths_by_stem
+        known.add(target.id)
+        lookups = [("name", test_name) for test_name in candidate_test_names(name)]
+        lookups.extend(("relative_path", test_path) for stem in candidate_test_stems(path)
+                       for test_path in test_paths[project_id].get(stem, ()))
+        for field, value in lookups:
+            for node in self.graph.find_nodes_by_property(field, value, status="active", limit=None, clone=False):
+                if node.id in known or node.properties.get("project_id") != project_id or not is_test_case(node):
+                    continue
+                known.add(node.id)
+                yield TestAssociation(node.id, target.id, "candidate", "naming convention", None, None, False,
+                                      _path(node), path)
 
     def import_coverage(self, input_path: str | Path, *, project_path: str | Path = ".") -> dict[str, Any]:
         """Import coverage.py JSON with optional capture-time SHA-256 metadata."""
@@ -136,7 +152,7 @@ class TestIntelligenceService:
             if path not in symbols_by_path:
                 symbols_by_path[path] = [
                     node for node in self.graph.find_nodes_by_property("relative_path", path, status="active", limit=None, clone=False)
-                    if node.properties.get("project_id") == project.id and node.type in SYMBOL_TYPES
+                    if node.properties.get("project_id") == project.id and node.type in SYMBOL_TYPES | TEST_NODE_TYPES
                 ]
             return symbols_by_path[path]
 
@@ -145,8 +161,7 @@ class TestIntelligenceService:
         for observed in observations(root, report):
             tests = [
                 node for node in symbols(observed.test_path) if is_test_case(node)
-                and str(node.properties.get("qualified_name") or "").endswith("." + observed.test_name)
-                and (("." in observed.test_name) == (node.type == "Method"))
+                and _coverage_name_matches(node, observed.test_name)
             ]
             if len(tests) != 1:
                 skipped += 1
@@ -191,7 +206,7 @@ class TestIntelligenceService:
         target = self.graph.get_node(data["target_symbol_id"], clone=False)
         fields = {key: value for key, value in data.items() if key not in {"name", "test_hash"}}
         fields["verified_current"] = bool(
-            test and target and data["source_hash"] and data["test_hash"]
+            test and is_test_case(test) and target and data["source_hash"] and data["test_hash"]
             and hashes.current(test) == data["test_hash"] and hashes.current(target) == data["source_hash"]
         )
         return TestAssociation(**fields)
@@ -224,19 +239,32 @@ class TestIntelligenceService:
             if test is None or test.status != "active":
                 continue
             seen.add(path)
-            row = selected.setdefault(path, {"path": path, "kind": "test", "score": 1.0,
-                                              "line_start": test.properties.get("start_line"),
-                                              "line_end": test.properties.get("end_line"),
-                                              "symbols": [test.properties.get("qualified_name") or test.label]})
-            row.update(asdict(association), reason=f"{association.evidence_kind} test evidence")
+            row = selected.setdefault(path, {"path": path, "kind": "test", "score": 1.0})
+            row.update(
+                asdict(association),
+                line_start=test.properties.get("start_line"),
+                line_end=test.properties.get("end_line"),
+                symbols=[test.properties.get("qualified_name") or test.label],
+                reason=f"{association.evidence_kind} test evidence",
+            )
         ordered = sorted(selected.values(), key=lambda row: (not row["verified_current"],
-                         _EVIDENCE_ORDER[row["evidence_kind"]], -row["score"], row["path"]))
+                         self.evidence_order[row["evidence_kind"]], -row["score"], row["path"]))
         return ordered[:limit] or rows[:limit]
 
 
 def _path(node: MemoryNode) -> str | None:
     value = node.properties.get("relative_path")
     return value if isinstance(value, str) else None
+
+
+def _coverage_name_matches(node: MemoryNode, name: str) -> bool:
+    """Match a fully qualified identity or a unique file-local test identity."""
+    qualified = str(node.properties.get("qualified_name") or "")
+    if qualified == name:
+        return True
+    if node.type == "Method" and "." not in name:
+        return False
+    return qualified.endswith("." + name) or (node.type == "Test" and node.properties.get("name") == name)
 
 
 def _span(node: MemoryNode) -> tuple[int, int]:
@@ -293,8 +321,8 @@ class _SourceHashes:
             try:
                 path = local_path(root, relative)
                 if path.is_file():
-                    content = read_bounded_file(path, _MAX_SOURCE_BYTES)
-                    if content is not None and hashlib.sha256(content).hexdigest() == digest:
+                    _, current_digest, _ = fingerprint_file(path)
+                    if current_digest == digest:
                         self.verified[key] = digest
             except (OSError, ValueError):
                 return None

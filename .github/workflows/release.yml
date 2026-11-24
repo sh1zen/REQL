@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: Existing tag (vMAJOR.MINOR.PATCH)
+        description: Existing tag (vYY.MM.DD)
         required: true
         type: string
 
@@ -29,8 +29,8 @@ jobs:
     steps:
       - name: Validate tag format
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Release tag must use vMAJOR.MINOR.PATCH."
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]{2}\.[0-9]{2}\.[0-9]{2}$ ]]; then
+            echo "::error::Release tag must use vYY.MM.DD."
             exit 1
           fi
 
@@ -49,19 +49,44 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          import tomllib
+          from datetime import datetime
+          from runpy import run_path
+
+          tag = os.environ["RELEASE_TAG"]
+          version = run_path("src/config.py")["VERSION"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag} does not match REQL version {version}.")
+          try:
+              datetime.strptime(version, "%y.%m.%d")
+          except ValueError:
+              raise SystemExit(f"REQL version {version} must be a valid calendar date.") from None
+          PY
+
+      - name: Extract release notes
+        run: |
+          python - <<'PY'
+          import os
+          import re
           from pathlib import Path
 
           tag = os.environ["RELEASE_TAG"]
-          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-          if tag != f"v{version}":
-              raise SystemExit(f"Tag {tag} does not match package version {version}.")
-          PY
+          try:
+              changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+              heading = rf"^## \[{re.escape(tag)}\](?: - [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}})?[ \t]*$"
+              sections = list(re.finditer(heading, changelog, re.MULTILINE))
+              if len(sections) != 1:
+                  raise ValueError(f"CHANGELOG.md must contain exactly one section for {tag}.")
 
-      - name: Validate release workflow and extract notes
-        run: |
-          python -m unittest discover -s mini-test -p 'test_release_*.py' -v
-          python .github/scripts/release_notes.py "$RELEASE_TAG" release-notes.md
+              body = changelog[sections[0].end():]
+              next_heading = re.search(r"^## ", body, re.MULTILINE)
+              notes = (body[:next_heading.start()] if next_heading else body).strip("\n")
+              if not notes.strip():
+                  raise ValueError(f"CHANGELOG.md has no release notes for {tag}.")
+
+              Path("release-notes.md").write_text(notes + "\n", encoding="utf-8", newline="\n")
+          except (OSError, ValueError) as error:
+              raise SystemExit(str(error)) from None
+          PY
 
       - name: Install REQL
         run: python -m pip install -e ".[dev]"

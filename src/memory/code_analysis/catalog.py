@@ -13,13 +13,21 @@ class CodeLanguageSpec(TypedDict, total=False):
     basenames: tuple[str, ...]
 
 
+_TYPESCRIPT_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts")
+_JAVASCRIPT_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs")
+PHP_EXTENSIONS = (".php", ".php3", ".php4", ".php5", ".phtml")
+_TREE_SITTER_LANGUAGE_CAPSULE_NAME = b"tree_sitter.Language"
+# Keep extensionless import precedence stable when several variants coexist.
+ECMASCRIPT_EXTENSIONS = (*_TYPESCRIPT_EXTENSIONS[:2], *_JAVASCRIPT_EXTENSIONS, *_TYPESCRIPT_EXTENSIONS[2:])
+
+
 CODE_LANGUAGE_CATALOG: dict[str, CodeLanguageSpec] = {
     "apex": {"display": "Apex", "aliases": ("apex",), "extensions": (".apex", ".cls", ".trigger")},
     "bash": {
         "display": "Bash",
         "aliases": ("bash", "bourne shell", "shell", "sh"),
         "extensions": (".bash", ".sh"),
-        "basenames": ("bashrc",),
+        "basenames": ("bashrc", ".bashrc"),
     },
     "c": {"display": "C", "aliases": ("c",), "extensions": (".c", ".h")},
     "cpp": {"display": "C++", "aliases": ("c++", "c/c++", "cpp"), "extensions": (".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".ipp")},
@@ -27,17 +35,17 @@ CODE_LANGUAGE_CATALOG: dict[str, CodeLanguageSpec] = {
     "dockerfile": {"display": "Dockerfile", "aliases": ("dockerfile",), "basenames": ("dockerfile",)},
     "elixir": {"display": "Elixir", "aliases": ("elixir",), "extensions": (".ex", ".exs")},
     "fortran": {"display": "Fortran", "aliases": ("fortran",), "extensions": (".f", ".f03", ".f08", ".f77", ".f90", ".f95", ".for", ".ftn")},
-    "fsharp": {"display": "F#", "aliases": ("f#", "fsharp")},
+    "fsharp": {"display": "F#", "aliases": ("f#", "fsharp"), "extensions": (".fs", ".fsi", ".fsx")},
     "go": {"display": "Go", "aliases": ("go", "golang"), "extensions": (".go",)},
     "java": {"display": "Java", "aliases": ("java",), "extensions": (".java",)},
-    "javascript": {"display": "JavaScript", "aliases": ("javascript", "js", "jsx"), "extensions": (".cjs", ".js", ".jsx", ".mjs")},
+    "javascript": {"display": "JavaScript", "aliases": ("javascript", "js", "jsx"), "extensions": _JAVASCRIPT_EXTENSIONS},
     "julia": {"display": "Julia", "aliases": ("julia",), "extensions": (".jl",)},
     "just": {"display": "Just", "aliases": ("just",), "basenames": ("justfile",)},
     "kotlin": {"display": "Kotlin", "aliases": ("kotlin",), "extensions": (".kt", ".kts")},
     "lua": {"display": "Lua", "aliases": ("lua",), "extensions": (".lua",)},
     "makefile": {"display": "Makefile", "aliases": ("makefile",), "basenames": ("makefile",)},
     "pascal": {"display": "Pascal", "aliases": ("pascal",), "extensions": (".pas", ".pp")},
-    "php": {"display": "PHP", "aliases": ("php",), "extensions": (".php", ".php3", ".php4", ".php5", ".phtml")},
+    "php": {"display": "PHP", "aliases": ("php",), "extensions": PHP_EXTENSIONS},
     "powershell": {"display": "PowerShell", "aliases": ("powershell", "pwsh"), "extensions": (".ps1", ".psd1", ".psm1")},
     "python": {"display": "Python", "aliases": ("python", "py"), "extensions": (".py", ".pyi", ".pyw")},
     "razor": {"display": "Razor", "aliases": ("razor",), "extensions": (".cshtml", ".razor")},
@@ -49,7 +57,7 @@ CODE_LANGUAGE_CATALOG: dict[str, CodeLanguageSpec] = {
     "swift": {"display": "Swift", "aliases": ("swift",), "extensions": (".swift",)},
     "terraform": {"display": "Terraform", "aliases": ("terraform", "tf"), "extensions": (".tf", ".tfvars")},
     "tsx": {"display": "TSX", "aliases": ("tsx",)},
-    "typescript": {"display": "TypeScript", "aliases": ("typescript", "ts"), "extensions": (".cts", ".mts", ".ts", ".tsx")},
+    "typescript": {"display": "TypeScript", "aliases": ("typescript", "ts"), "extensions": _TYPESCRIPT_EXTENSIONS},
     "verilog": {"display": "Verilog", "aliases": ("verilog",), "extensions": (".sv", ".svh", ".v", ".vh")},
     "zig": {"display": "Zig", "aliases": ("zig",), "extensions": (".zig",), "basenames": ("build.zig",)},
 }
@@ -61,7 +69,6 @@ LANGUAGE_PACK_ALIASES: dict[str, tuple[str, ...]] = {
     "fsharp": ("f_sharp", "f-sharp", "fsharp"),
     "makefile": ("make", "makefile"),
     "powershell": ("powershell", "power_shell"),
-    "tsx": ("tsx", "typescript"),
     "typescript": ("typescript", "ts"),
 }
 
@@ -99,14 +106,15 @@ def language_key(language: str | None) -> str:
 def tree_sitter_language_key(path: str, language: str | None) -> str:
     if Path(path).suffix.casefold() == ".tsx":
         return "tsx"
-    key = language_key(language)
-    return "typescript" if key == "tsx" else key
+    return language_key(language)
 
 
 def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
     """Accept current grammar capsules or already constructed Language objects."""
     language_cls = getattr(tree_sitter, "Language")
     raw = _load_direct_language(language)
+    if language == "solidity" and type(raw) is int:
+        raw = _solidity_language_capsule(raw)
     if raw is None:
         raw = _load_language_pack_language(language)
     if raw is None:
@@ -116,6 +124,22 @@ def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
     if isinstance(raw, language_cls):
         return raw
     return language_cls(raw)
+
+
+def _solidity_language_capsule(address: int) -> object:
+    """Wrap the pointer returned by the installed legacy Solidity binding."""
+    from ctypes import c_char_p, c_void_p, py_object, pythonapi, sizeof
+
+    # Retain the size and alignment checks from Tree-sitter's integer constructor.
+    pointer_size = sizeof(c_void_p)
+    if address <= 0 or address.bit_length() > 8 * pointer_size or address % pointer_size:
+        raise ValueError("Invalid Tree-sitter Solidity grammar pointer")
+
+    # The grammar is static data owned by the extension. The capsule borrows it.
+    new_capsule = pythonapi["PyCapsule_New"]
+    new_capsule.argtypes = (c_void_p, c_char_p, c_void_p)
+    new_capsule.restype = py_object
+    return new_capsule(address, _TREE_SITTER_LANGUAGE_CAPSULE_NAME, None)
 
 
 def _load_direct_language(language: str) -> Any | None:
@@ -128,7 +152,9 @@ def _load_direct_language(language: str) -> Any | None:
     function_name = getattr(extractor_cls, "tree_sitter_function", "language")
     try:
         module = import_module(module_name)
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise
         return None
     return getattr(module, function_name)()
 
@@ -155,7 +181,9 @@ def _load_language_pack_language(language: str) -> Any | None:
     """Load only locally available fallback grammars; downloads require explicit setup."""
     try:
         language_pack = import_module("tree_sitter_language_pack")
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+        if exc.name != "tree_sitter_language_pack":
+            raise
         return None
     get_language = getattr(language_pack, "get_language")
     available = set(language_pack.available_languages())

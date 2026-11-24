@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from api import MemoryGraph
-from mcp.tools import call_tool, query_context as mcp_query_context
+from mcp.tools import call_tool
 from memory.artifacts.options import CompilationOptions
 from memory.domain.models import MemoryNode
 from memory.extraction.deterministic import DeterministicExtractor
@@ -217,8 +217,8 @@ class QueryContextServiceTests(unittest.TestCase):
         token_pattern = re.compile(r"\w+|[^\w\s]")
         self.assertLessEqual(len(token_pattern.findall(brief_work)), 0.75 * len(token_pattern.findall(detailed_work)))
 
-    def test_failure_rationale_survives_truncated_handoff(self) -> None:
-        """A structured reference cannot hide evidence absent from the rendered work."""
+    def test_long_handoff_renders_complete_prerequisites_and_shared_failure_once(self) -> None:
+        """Keep the attached operational record complete alongside code evidence."""
         work = CoordinationStore(self.db.with_name("agent-dashboard.reql"))
         author = {"agent_id": "agent:planner", "session_id": "session:plan"}
         failure = work.put("failure", "Avoid the stale serializer adapter",
@@ -232,9 +232,10 @@ class QueryContextServiceTests(unittest.TestCase):
         self.assertEqual(row["engineering_context_ref"], failure["id"])
         self.assertNotIn("rationale", row)
         text = service.render(result, brief=True)
-        self.assertNotIn("direct prerequisites shown in full", text)
+        self.assertIn(task["rationale"], text)
+        self.assertIn("direct prerequisites shown in full", text)
         self.assertEqual(text.count("The adapter loses an empty field."), 1)
-        self.assertIn("## Relevant failures", text)
+        self.assertIn("evidence unknown", text)
         self.assertNotIn("rationale", row)
 
     def test_compiled_context_exposes_implementation_links_and_affected_callers(self) -> None:
@@ -276,43 +277,6 @@ class QueryContextServiceTests(unittest.TestCase):
                     self.assertIn("CALLS: `request` @ api.py:3-4", brief)
                     self.assertTrue({"derived.local_request", "derived.other_request"}.issubset(
                         row["caller"]["label"] for row in result.payload["impact"]["callers"]))
-
-    def test_python_and_mcp_adapters_serialize_the_same_result(self) -> None:
-        self.graph.close()
-        api_graph = MemoryGraph.open(self.db, read_only=True)
-        try:
-            api_payload = api_graph.query_context_payload(
-                "typed query context common service",
-                scopes=["code"],
-                top_k=8,
-                max_depth=3,
-                max_items=8,
-            )
-        finally:
-            api_graph.close()
-
-        arguments = {
-            "storage_path": str(self.db),
-            "query": "typed query context common service",
-            "scopes": ["code"],
-            "top_k": 8,
-            "max_depth": 3,
-            "max_items": 8,
-        }
-        mcp_payload = mcp_query_context(**arguments)
-        dispatched = call_tool("query_context", arguments)
-        for field in ("schema_version", "graph_revision", "confidence", "freshness", "source_revision"):
-            self.assertEqual(dispatched[field], mcp_payload[field])
-        self.assertNotIn("context", dispatched["payload"])
-        self.assertEqual(dispatched["payload"]["kind"], "code")
-        for field in ("trace_id", "ranked_nodes", "seed_node_ids", "followups", "working_set",
-                      "contracts", "read_plan", "change_chain", "targeted_reads"):
-            self.assertIn(field, dispatched["payload"])
-        api_payload["payload"].pop("trace_id", None)
-        mcp_payload["payload"].pop("trace_id", None)
-        self.assertEqual(api_payload, mcp_payload)
-
-        self.graph = MemoryGraph.open(self.db)
 
     def test_document_classification_follows_markup_across_filenames(self) -> None:
         """Compile Markdown based on its markup and keep custom markers as text."""

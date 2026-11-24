@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import os
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
-from threading import Barrier
+from threading import Barrier, Event
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,7 +18,9 @@ from memory.agent import AgentWorkspace
 from memory.cli import main
 from memory.config import default_config, merge_config
 from memory.domain.models import MemoryNode
-from memory.services.coordination import CoordinationStore, MAX_REVISIONS, render_work_context
+from memory.services.coordination import CoordinationStore, render_work_context
+from memory.storage import BlockGraphStore
+from memory.storage.adapters.store_lock import StoreLease
 from mcp.tools import call_tool, list_tools, query_context as mcp_context
 
 
@@ -46,7 +47,10 @@ class CoordinationWorkflowTests(unittest.TestCase):
         return agent.record(item["kind"], item["content"], record_id=item["id"],
                             expected_revision=item["revision"], **fields)["node"]
 
-    def _claim_cli(self, task_id: str, query: str | None = None, *, as_json: bool = True) -> tuple[int, str]:
+    def _claim_cli(
+        self, task_id: str, query: str | None = None, *, as_json: bool = True, source: bool = False,
+        lock_timeout: float | None = None,
+    ) -> tuple[int, str]:
         """Run the public assignment command from the fixture project."""
         previous = Path.cwd()
         output = StringIO()
@@ -56,10 +60,135 @@ class CoordinationWorkflowTests(unittest.TestCase):
                 args = ["agent", "--agent", "agent:worker", "--activity", "worker", "init", "--task", task_id]
                 if query is not None:
                     args.append(f"--query={query}")
+                if source:
+                    args.append("--source")
+                if lock_timeout is not None:
+                    args.extend(("--lock-timeout", str(lock_timeout)))
                 code = main([*args, "--json"] if as_json else args)
         finally:
             os.chdir(previous)
         return code, output.getvalue()
+
+    def test_wait_returns_the_published_status_and_releases_read_leases(self) -> None:
+        """Let another worker write after the wait has seen an unfinished record."""
+        author = {"agent_id": "agent:planner", "session_id": "session:plan"}
+        task = self.work.put("task", "Prepare the inventory", **author)["node"]
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.root)
+        capture = StringIO()
+        with redirect_stdout(capture):
+            self.assertEqual(main(["agent", "wait", task["id"], "--timeout", "0", "--json"]), 1)
+        self.assertEqual(json.loads(capture.getvalue()), {"matched": False, "node": task})
+
+        read = Event()
+        find = self.work.find
+
+        def observe(record_id: str, *, lock_timeout_seconds: float | None = None) -> dict | None:
+            row = find(record_id, lock_timeout_seconds=lock_timeout_seconds)
+            read.set()
+            return row
+
+        with patch.object(self.work, "find", side_effect=observe), ThreadPoolExecutor(max_workers=1) as pool:
+            waiting = pool.submit(self.work.wait_for_status, task["id"], frozenset({"done"}), timeout_seconds=5)
+            self.assertTrue(read.wait(2))
+            self.assertFalse(waiting.done())
+            finished = self.work.put(record_id=task["id"], expected_revision=task["revision"], status="done", **author)["node"]
+            self.assertEqual(waiting.result(timeout=5), (finished, True))
+
+    def test_wait_loads_an_unchanged_dashboard_once(self) -> None:
+        """Poll the native store without decoding the same checkpoint and WAL repeatedly."""
+        task = self.work.put("task", "Prepare inventory", agent_id="agent:planner", session_id="session:plan")["node"]
+        current = 0.0
+
+        def advance(seconds: float) -> None:
+            nonlocal current
+            current += seconds
+
+        clock = SimpleNamespace(monotonic=lambda: current, sleep=advance)
+        with (patch("memory.services.coordination.time", clock),
+              patch.object(BlockGraphStore, "_load", autospec=True, side_effect=BlockGraphStore._load) as load):
+            result = self.work.wait_for_status(task["id"], frozenset({"done"}), timeout_seconds=0.24)
+        self.assertEqual(result, (task, False))
+        self.assertEqual(current, 0.24)
+        self.assertEqual(load.call_count, 1)
+
+    def test_claim_waits_for_a_graph_writer_and_returns_source_in_one_command(self) -> None:
+        """The claim commits before the command waits for the shared graph lease."""
+        planner = self.agent("planner")
+        task = planner.add_task("Inspect invoice_total", files=["invoice.py"])["node"]
+        (self.root / "invoice.py").write_text("def invoice_total():\n    return 23\n", encoding="utf-8")
+        attempted = Event()
+        native_wait = StoreLease._wait_for_lock
+
+        def observe(lease: StoreLease, fd: int) -> None:
+            if lease.target == self.storage and lease.shared:
+                attempted.set()
+            native_wait(lease, fd)
+
+        with (ThreadPoolExecutor(max_workers=1) as pool, patch.object(StoreLease, "_wait_for_lock", observe)):
+            with closing(MemoryGraph.open(self.storage)) as writer:
+                self.assertFalse(writer.compile_project(self.root).run.errors)
+                pending = pool.submit(self._claim_cli, task["id"], "invoice_total", source=True)
+                self.assertTrue(attempted.wait(5))
+                self.assertEqual(self.work.show(task["id"])["status"], "in_progress")
+                self.assertFalse(pending.done())
+            code, output = pending.result(timeout=5)
+        self.assertEqual(code, 0, output)
+        result = json.loads(output)
+        self.assertIn("return 23", result["source_context"]["payload"]["snippets"][0]["text"])
+        self.assertEqual(result["claimed_task"]["revision"], self.work.show(task["id"])["revision"])
+
+    def test_claim_with_a_graph_wait_limit_keeps_its_recovery_receipt(self) -> None:
+        """A caller can bound contention and recover the committed claim later."""
+        planner = self.agent("planner")
+        task = planner.add_task("Inspect invoice_total", files=["invoice.py"])["node"]
+        (self.root / "invoice.py").write_text("def invoice_total():\n    return 23\n", encoding="utf-8")
+        with closing(MemoryGraph.open(self.storage)) as writer:
+            self.assertFalse(writer.compile_project(self.root).run.errors)
+            code, output = self._claim_cli(task["id"], "invoice_total", lock_timeout=0)
+        self.assertEqual(code, 2, output)
+        result = json.loads(output)
+        self.assertIn("storage is locked", result["source_context_error"])
+        self.assertIn("query_context --task", result["source_context_retry"])
+        self.assertEqual(result["claimed_task"]["revision"], self.work.show(task["id"])["revision"])
+        code, output = self._claim_cli(task["id"], "invoice_total")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(json.loads(output)["claimed_task"], result["claimed_task"])
+
+    def test_follow_up_can_wait_for_a_graph_writer(self) -> None:
+        """Keep the default busy error and let a timed follow-up acquire a shared lease."""
+        (self.root / "invoice.py").write_text("def invoice_total():\n    return 23\n", encoding="utf-8")
+        planner = self.agent("planner")
+        planner.add_task("Refresh shared invoice code", status="in_progress", files=["invoice.py"])
+        task = planner.add_task("Inspect invoice_total", files=["invoice.py"])["node"]
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.root)
+        command = ["query_context", "--task", task["id"], "--follow-up", "--query", "invoice_total",
+                   "--code", "--brief"]
+        attempted = Event()
+        native_wait = StoreLease._wait_for_lock
+
+        def observe(lease: StoreLease, fd: int) -> None:
+            if lease.target == self.storage and lease.shared and lease._timeout_seconds == 5:
+                attempted.set()
+            native_wait(lease, fd)
+
+        with (ThreadPoolExecutor(max_workers=1) as pool,
+              patch.object(StoreLease, "_wait_for_lock", observe), redirect_stdout(StringIO()) as output):
+            with closing(MemoryGraph.open(self.storage)) as writer:
+                self.assertFalse(writer.compile_project(self.root).run.errors)
+                for args in (command, [*command, "--lock-timeout", "0"]):
+                    with redirect_stderr(StringIO()) as errors:
+                        self.assertEqual(main(args), 1)
+                    self.assertIn("storage is locked", errors.getvalue())
+                pending = pool.submit(main, [*command, "--lock-timeout", "5"])
+                self.assertTrue(attempted.wait(3))
+                self.assertFalse(pending.done())
+            self.assertEqual(pending.result(timeout=5), 0)
+        self.assertIn("return 23", output.getvalue())
+        code, brief = self._claim_cli(task["id"], "invoice_total", as_json=False)
+        self.assertEqual(code, 0, brief)
+        self.assertIn(f"query_context --task {task['id']} --follow-up --lock-timeout 60", brief)
 
     def test_next_prefers_disjoint_work_then_reports_an_overlap(self) -> None:
         """Keep assignments flowing and report shared files without turning them into locks."""
@@ -111,50 +240,13 @@ class CoordinationWorkflowTests(unittest.TestCase):
             self.assertEqual(resumed["assignment_status"], "resumed")
             self.assertEqual(first["claimed_task"]["revision"], resumed["claimed_task"]["revision"])
 
-    def test_cli_processes_share_the_queue_without_duplicate_claims(self) -> None:
-        """Claim and resume work from two CLI processes sharing on-disk state."""
-        planner = self.agent("planner")
-        tasks = {}
-        for symbol in ("calculate_total", "parse_invoice"):
-            path = f"{symbol}.py"
-            (self.root / path).write_text(f"def {symbol}():\n    return 1\n", encoding="utf-8")
-            tasks[planner.add_task(symbol, files=[path])["node"]["id"]] = path
-        graph = MemoryGraph.open(self.storage)
-        try:
-            self.assertFalse(graph.compile_project(self.root).run.errors)
-        finally:
-            graph.close()
-
-        launcher = Path(__file__).resolve().parents[1] / "cli.py"
-        barrier = Barrier(2, timeout=10)
-
-        def worker(index: int) -> tuple[dict, dict]:
-            command = [sys.executable, str(launcher), "agent", "--agent", f"agent:worker{index}",
-                       "--activity", f"worker{index}", "init", "--next", "--json"]
-            barrier.wait()
-            outcomes = []
-            for _ in range(2):
-                result = subprocess.run(command, cwd=self.root, capture_output=True, encoding="utf-8", timeout=40)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                outcomes.append(json.loads(result.stdout))
-            return outcomes[0], outcomes[1]
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            workers = list(executor.map(worker, range(2)))
-        self.assertEqual({claimed["claimed_task"]["id"] for claimed, _ in workers}, tasks.keys())
-        for claimed, resumed in workers:
-            task = claimed["claimed_task"]
-            source = claimed["source_context"]["payload"]
-            self.assertIn(tasks[task["id"]], {row["path"] for row in source["snippets"]})
-            self.assertEqual(claimed["assignment_status"], "claimed")
-            self.assertEqual(resumed["assignment_status"], "resumed")
-            self.assertEqual(resumed["claimed_task"], task)
-            self.assertEqual(claimed["file_overlaps"]["files"], [])
-
     def test_explicit_claim_reports_overlaps_without_a_source_lookup(self) -> None:
         """Return shared evidence and file scopes even when the graph has not been built."""
         planner = self.agent("planner")
-        active = planner.add_task("Existing edit", status="in_progress", files=["shared.py"])["node"]
+        active_ids = sorted(
+            planner.add_task(f"Existing edit {index}", status="in_progress", files=["shared.py"])["node"]["id"]
+            for index in range(6)
+        )
         pending = planner.add_task("Follow-up edit", files=["shared.py"], next_action="Check affected callers")["node"]
 
         code, output = self._claim_cli(pending["id"])
@@ -163,13 +255,13 @@ class CoordinationWorkflowTests(unittest.TestCase):
         self.assertEqual(result["claimed_task"]["revision"], 2)
         self.assertEqual(result["work_context"]["records"][0]["next_action"], "Check affected callers")
         self.assertEqual(result["file_overlaps"]["files"],
-                         [{"path": "shared.py", "tasks": [active["id"]], "omitted": 0}])
+                         [{"path": "shared.py", "tasks": active_ids, "omitted": 0}])
 
         code, output = self._claim_cli(pending["id"], as_json=False)
         self.assertEqual(code, 0, output)
         self.assertIn(f"Resumed task: {pending['id']}\tr2", output)
         self.assertIn("Coordinate edits with their owners", output)
-        self.assertIn(active["id"], output)
+        self.assertIn(", ".join(active_ids), output)
 
     def test_next_cli_returns_scoped_code_in_the_claim_response(self) -> None:
         """Use the saved title to recover source without another discovery command."""
@@ -222,8 +314,10 @@ class CoordinationWorkflowTests(unittest.TestCase):
         self.assertIn("indexed project", json.loads(missing)["error"]["message"])
         self.assertEqual(self.work.show(task["id"])["revision"], task["revision"])
 
-        (self.root / "invoice.py").write_text("def calculate_invoice_total(amounts):\n    return sum(amounts)\n",
-                                              encoding="utf-8")
+        invoice = self.root / "invoice.py"
+        header = "def calculate_invoice_total(amounts):\n"
+        body = "    return sum(amounts)\n"
+        invoice.write_text(header + body, encoding="utf-8")
         graph = MemoryGraph.open(self.storage)
         try:
             self.assertFalse(graph.compile_project(self.root).run.errors)
@@ -252,7 +346,8 @@ class CoordinationWorkflowTests(unittest.TestCase):
         self.assertNotIn("work_context", result)
         source = result["source_context"]["payload"]
         self.assertIn(failure["id"], {row["id"] for row in source["engineering_context"]["records"]})
-        self.assertIn("return sum(amounts)", source["snippets"][0]["text"])
+        self.assertEqual(source["snippets"], [])
+        self.assertIn("invoice.py", {row["path"] for row in source["read_plan"]})
         code, repeated = self._claim_cli(task["id"], "calculate_invoice_total")
         self.assertEqual(code, 0, repeated)
         self.assertEqual(json.loads(repeated)["claimed_task"], claimed)
@@ -264,8 +359,22 @@ class CoordinationWorkflowTests(unittest.TestCase):
         self.assertEqual(text.count(failure["id"]), 2)  # Dependency link and its work record.
         self.assertIn("evidence unknown", text)
         self.assertNotIn("## Relevant failures", text)
-        self.assertIn("def calculate_invoice_total(amounts)", text)
+        self.assertIn(header.rstrip(), text)
         self.assertEqual(self.work.show(task["id"])["revision"], claimed["revision"])
+
+        comments = "".join(f"    # Preserve fractional precision for invoice line {line:03}.\n" for line in range(500))
+        invoice.write_text(header + comments + body, encoding="utf-8")
+        with closing(MemoryGraph.open(self.storage)) as graph:
+            self.assertFalse(graph.compile_project(self.root).run.errors)
+        code, compact = self._claim_cli(task["id"], "calculate_invoice_total")
+        self.assertEqual(code, 0, compact)
+        payload = json.loads(compact)["source_context"]["payload"]
+        self.assertEqual(payload["snippets"], [])
+        self.assertIn(("invoice.py", 502), {(row["path"], row["line_end"]) for row in payload["read_plan"]})
+        code, explicit = self._claim_cli(task["id"], "calculate_invoice_total", source=True)
+        self.assertEqual(code, 0, explicit)
+        self.assertGreater(len(explicit) - len(compact), 25_000)
+        self.assertIn(body.strip(), json.loads(explicit)["source_context"]["payload"]["snippets"][0]["text"])
 
     def test_claim_with_source_reports_committed_revision_if_graph_becomes_unavailable(self) -> None:
         """Return the durable claim receipt on a partial failure so agents can recover safely."""
@@ -454,23 +563,27 @@ class CoordinationWorkflowTests(unittest.TestCase):
             agent.reject_approach(" ", "Stale results")
         self.assertEqual(self.work.show(first["id"])["revision"], 1)
 
-    def test_history_and_terminal_retention_preserve_active_and_referenced_evidence(self) -> None:
+    def test_finish_preserves_all_revisions_terminal_work_and_session_evidence(self) -> None:
         agent = self.agent("retention")
+        work = agent.coordination
         item = agent.record("observation", "Current finding")["node"]
         for number in range(12):
             item = self.update(agent, item, rationale=f"Evidence {number}")
-        self.assertEqual(len(item["history"]), MAX_REVISIONS)
-        old = agent.add_task("Old outcome")["node"]
-        agent.complete_task(old["id"], "Tested")
-        active = agent.add_task("Follow-up", depends_on=[old["id"]])["node"]
-        # A smaller limit exercises the actual maintenance policy without 200 writes.
-        from unittest.mock import patch
-        with patch("memory.services.coordination.MAX_TERMINAL_RECORDS", 2):
-            for number in range(5):
-                agent.record("change", f"Completed {number}", status="done")
-            self.assertEqual(self.work.prune(), 3)
-        ids = {record["id"] for record in self.work.records()}
-        self.assertTrue({item["id"], old["id"], active["id"]}.issubset(ids))
+        terminal = {work.put("change", f"Earlier unreferenced outcome {number}", status="done",
+                             agent_id="agent:past", session_id="past")["node"]["id"]
+                    for number in range(205)}
+        open_work = [agent.add_task(f"Follow-up {number}", next_action=f"Action {number} " + "continue " * 20)["node"]
+                     for number in range(35)]
+        summary = "The session saved its evidence. " * 150 + "End of handoff."
+        finish = agent.finish(summary)
+        reopened = CoordinationStore.for_project(self.storage)
+        self.assertEqual([row["revision"] for row in reopened.show(item["id"])["history"]], list(range(1, 13)))
+        self.assertTrue(terminal <= {row["id"] for row in reopened.records()})
+        checkpoint = reopened.show(finish["checkpoint"]["id"])
+        self.assertEqual(checkpoint["content"], summary)
+        self.assertEqual(set(checkpoint["summarizes"]), {item["id"], *(row["id"] for row in open_work)})
+        self.assertGreater(len(checkpoint["next_action"]), 4000)
+        self.assertCountEqual(checkpoint["next_action"].split("; "), [row["next_action"] for row in open_work])
 
     def test_compiled_code_context_and_mcp_share_scoped_engineering_evidence(self) -> None:
         agent = self.agent("integration")

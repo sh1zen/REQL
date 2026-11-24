@@ -4,22 +4,23 @@ from __future__ import annotations
 from collections.abc import Iterator
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 from typing import Any
 
-from ..artifacts.fingerprint import read_bounded_file
 from .models import LineObservation
 
-MAX_REPORT_BYTES = 32 * 1024 * 1024
-_PYTEST_ID = re.compile(r"(?P<path>[^|:]+\.py)::(?P<name>(?:[A-Za-z_]\w*::)*test\w*)(?:\[[^\r\n]*\])?")
+_NODE_ID = re.compile(r"(?P<path>(?:[A-Za-z]:[\\/])?[^|:\r\n]+)::(?P<name>\w+(?:::\w+)*)(?:\[[^\r\n]*\])?")
 
 
 def local_path(root: Path, value: str | Path) -> Path:
     """Confine inputs and reported paths to the registered project."""
     if "\0" in str(value):
         raise ValueError("Path cannot contain NUL bytes")
-    path = (root / value).resolve()
+    normalized = str(value).replace("\\", "/")
+    if PureWindowsPath(normalized).drive and not Path(normalized).is_absolute():
+        raise ValueError("Coverage paths must be within the registered project")
+    path = (root / normalized).resolve()
     if not path.is_relative_to(root):
         raise ValueError("Coverage paths must be within the registered project")
     return path
@@ -30,11 +31,9 @@ def read_coverage_json(root: Path, input_path: str | Path) -> tuple[dict[str, An
     if not path.is_file():
         raise ValueError("Coverage input must be a regular project-local file")
     try:
-        raw = read_bounded_file(path, MAX_REPORT_BYTES)
+        raw = path.read_bytes()
     except OSError as exc:
         raise ValueError(f"Cannot read coverage input {path.relative_to(root)}: {exc.strerror}") from exc
-    if raw is None:
-        raise ValueError("Coverage input exceeds the 32 MiB limit")
     data = json.loads(raw)
     if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
         raise ValueError("Coverage JSON must contain a files object")
@@ -42,7 +41,19 @@ def read_coverage_json(root: Path, input_path: str | Path) -> tuple[dict[str, An
 
 
 def observations(root: Path, report: dict[str, Any]) -> Iterator[LineObservation]:
-    """Accept pytest node IDs and pytest-cov's run phase as per-test identities."""
+    """Resolve per-test contexts before verifying them against compiled symbols."""
+    metadata = report.get("reql", {})
+    addresses = metadata.get("test_contexts", {}) if isinstance(metadata, dict) else None
+    if not isinstance(addresses, dict):
+        raise ValueError("reql.test_contexts must map context strings to test paths and names")
+    explicit: dict[str, tuple[str, str]] = {}
+    for context, address in addresses.items():
+        if (not context or not isinstance(address, dict) or set(address) != {"path", "name"}
+                or not all(isinstance(value, str) and value.strip() for value in address.values())):
+            raise ValueError("Each reql.test_contexts entry requires a non-empty path and name")
+        explicit[context] = local_path(root, address["path"]).relative_to(root).as_posix(), address["name"]
+
+    identities: dict[str, tuple[str, str] | None] = dict(explicit)
     for filename, entry in report["files"].items():
         path = local_path(root, filename).relative_to(root).as_posix()
         if not isinstance(entry, dict) or not isinstance(entry.get("contexts", {}), dict):
@@ -59,8 +70,14 @@ def observations(root: Path, report: dict[str, Any]) -> Iterator[LineObservation
             if line not in executed_lines:
                 continue
             for context in contexts:
-                test = _PYTEST_ID.fullmatch(context.removesuffix("|run"))
-                if test is None:
+                if context.endswith(("|setup", "|teardown")):
                     continue
-                test_path = local_path(root, test["path"]).relative_to(root).as_posix()
-                yield LineObservation(test_path, test["name"].replace("::", "."), path, line, context)
+                if context not in identities:
+                    test = _NODE_ID.fullmatch(context.removesuffix("|run"))
+                    identities[context] = (
+                        (local_path(root, test["path"]).relative_to(root).as_posix(), test["name"].replace("::", "."))
+                        if test is not None else None
+                    )
+                identity = identities[context]
+                if identity is not None:
+                    yield LineObservation(*identity, path, line, context)

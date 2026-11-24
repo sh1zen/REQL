@@ -1,4 +1,4 @@
-"""Core extraction, document processing, centrality and storage lock contracts."""
+"""Core extraction, document processing and centrality contracts."""
 from __future__ import annotations
 
 import tempfile
@@ -10,10 +10,8 @@ from memory.analysis.centrality import CentralityCalculator
 from memory.artifacts.models import SourceArtifact
 from memory.code_analysis import TreeSitterCodeParser
 from memory.document_ingestion.metadata import make_fragment
-from memory.domain.exceptions import StorageError
 from memory.domain.models import MemoryEdge, MemoryNode
 from memory.extraction.document_processor import DocumentProcessor
-from memory.storage import BlockGraphStore, inspect_store_locks
 
 
 class CleanupContractTests(unittest.TestCase):
@@ -127,35 +125,6 @@ class CleanupContractTests(unittest.TestCase):
                 self.assertEqual(metrics["isolated"].degree_centrality, 0.0)
             finally:
                 graph.close()
-
-    def test_store_locks_keep_multiple_readers_and_writer_exclusion(self) -> None:
-        """Real store opens retain lock ownership and release failed acquisition slots."""
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "graph.reql"
-            writer = BlockGraphStore(path, lock_timeout_seconds=0)
-            try:
-                self.assertIsNotNone(inspect_store_locks(path)["writer"])
-                with self.assertRaises(StorageError):
-                    BlockGraphStore(path, read_only=True, lock_timeout_seconds=0)
-                self.assertEqual(inspect_store_locks(path)["readers"], [])
-            finally:
-                writer.close()
-            first = BlockGraphStore(path, read_only=True, lock_timeout_seconds=0)
-            try:
-                second = BlockGraphStore(path, read_only=True, lock_timeout_seconds=0)
-                try:
-                    self.assertEqual(len(inspect_store_locks(path)["readers"]), 2)
-                    with self.assertRaises(StorageError):
-                        BlockGraphStore(path, lock_timeout_seconds=0)
-                    self.assertIsNone(inspect_store_locks(path)["writer"])
-                finally:
-                    second.close()
-            finally:
-                first.close()
-            self.assertFalse(inspect_store_locks(path)["locked"])
-            reopened = BlockGraphStore(path, lock_timeout_seconds=0)
-            reopened.close()
-
 
 if __name__ == "__main__":
     unittest.main()

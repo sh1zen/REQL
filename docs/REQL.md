@@ -40,14 +40,14 @@ resolve against node properties first-class, so artifact fields such as
 `artifact_type` and symbol fields such as `name` can be filtered directly.
 
 `FIND`, typed listings, and `MATCH` apply predicates and ordering to the complete
-eligible type scope before `LIMIT`. The limit controls returned rows, not a
-candidate window. Type filters and equality comparisons are case-insensitive;
-native fields, custom or nested properties, and source-span aliases share the
+eligible type scope before `LIMIT`. Omit the clause to return all rows.
+Type filters and equality comparisons are case-insensitive.
+Native fields, custom or nested properties, and source-span aliases share the
 same field resolution. Explicit `SYMBOLS TYPE` lists retain every requested type.
 `STATS TYPE` uses the same type matching.
 
-`LIMIT`, `TOP`, and `DEPTH` require non-negative integers; fractional numbers and
-booleans are errors. `LIMIT 0` returns no rows. Numeric comparisons and ordering
+`LIMIT`, `TOP`, and `DEPTH` require non-negative integers. `LIMIT 0`
+returns no rows. Numeric comparisons and ordering
 preserve integer precision. Mixed sort values order nulls before numbers and
 numbers before text in ascending order.
 
@@ -146,6 +146,8 @@ texts by default, and returns rows that can be consumed by agents or scripts.
 Ask for only the columns needed for the next decision, include `LIMIT`, and add
 `relative_path`, `line_start`, `line_end`, `source_for`, `relation`, or
 `direction` when provenance matters.
+Omit `TOP`, `DEPTH`, `LIMIT`, and `MAX TEXT` to use the complete
+ranked scope and return the full text of each matching row.
 
 ```text
 RETRIEVE "payment validation" LIMIT 8
@@ -161,6 +163,14 @@ Find a bounded path between text-selected concepts:
 ```text
 PATH FROM TEXT "incremental compiler" TO TEXT "activation engine" DEPTH 5
 ```
+
+`PATH` follows relationships in both directions and returns paths that visit
+each node at most once. Parallel relationships produce distinct paths. Add
+`DEPTH` to set the maximum number of edges in a path. Add `LIMIT` to return
+the highest-scoring paths from the full search. On a dense graph, the number
+of simple paths can grow exponentially. Use `VIA` to select relationship types.
+The bundled graph query policy defines the scoring weights and default columns.
+[Configuration guide](CONFIGURATION.md#extraction-retrieval-and-query-policies)
 
 ## Graph Schema
 
@@ -309,9 +319,9 @@ Leiden, or an LLM.
 
 ### Communities
 
-Community detection uses bounded deterministic label propagation over active
-graph nodes. It ignores maintenance records such as reports, deltas, cache
-entries, and prior community nodes. The detector writes `Community` nodes with:
+Community detection propagates labels over eligible nodes until they settle.
+Each community takes its name from a representative member. The detector
+writes `Community` nodes with the following fields.
 
 - `id`
 - `project_id`
@@ -324,7 +334,8 @@ entries, and prior community nodes. The detector writes `Community` nodes with:
 - `updated_at`
 
 Members are connected with `BELONGS_TO_COMMUNITY`. Nodes that touch neighboring
-communities receive `BRIDGES_COMMUNITY` edges.
+communities receive `BRIDGES_COMMUNITY` edges. Python callers can set
+`max_iterations` in the detection options for a partial result.
 
 ### Hub Analysis
 
@@ -366,12 +377,12 @@ Hub analysis updates node properties:
 - `hub_rank`
 - `hub_reason`
 
-For scalability, `HUBS` does not run full community detection by default and
-does not materialize the whole graph. It first asks the storage adapter for a
-bounded top-degree candidate set, then computes centrality over the candidate
-subgraph with bounded incident-edge queries. Existing `BELONGS_TO_COMMUNITY`
-edges are still used for community bridge scoring. Run `COMMUNITIES` explicitly
-when community assignments need to be refreshed before hub analysis.
+`HUBS` scores all eligible nodes and uses their incident relationships and
+stored `BELONGS_TO_COMMUNITY` edges. Run `COMMUNITIES` to refresh community
+assignments before hub analysis. `LIMIT` controls the rows returned after
+filtering and ordering. `ACTIVATE` processes eligible neighbors and updates
+activation and usage in the graph. Bridge detection uses the strongest evidence
+from each neighboring community and all eligible cross-community connections.
 
 ### Commands
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from ..artifacts.compiler import _typed_edge
+from ..artifacts.context_scope import matches_test_case_name
 from ..artifacts.models import ArtifactCompilationResult
 from ..domain.models import MemoryNode
 from ..storage.graph_store import GraphStore
@@ -12,19 +13,22 @@ TEST_NODE_TYPES = {"Function", "Method", "Test"}
 
 
 def is_test_case(node: MemoryNode) -> bool:
-    name = str(node.properties.get("name") or "")
-    return (node.properties.get("context_scope") == "test" and (
-        node.type == "Test" or node.type in {"Function", "Method"}
-        and (name.startswith("test_") or name == "test"
-             or (name.startswith("test") and name[4:5].isupper())
-             or (node.properties.get("metadata") or {}).get("test_case"))
-    ) and not node.properties.get("ambiguous_declaration"))
+    """Use the compiled case label, or recognize the case in a legacy index."""
+    if (node.properties.get("context_scope") != "test" or node.type not in TEST_NODE_TYPES
+            or node.properties.get("ambiguous_declaration")):
+        return False
+    if node.type == "Test":
+        return True
+    if "test_case" in node.properties:
+        return node.properties["test_case"] is True
+    return bool((node.properties.get("metadata") or {}).get("test_case")
+                or matches_test_case_name(str(node.properties.get("name") or "")))
 
 
 def refresh_static_links(store: GraphStore, project_id: str) -> ArtifactCompilationResult:
     """Reconcile active test edges after the project's code relations settle."""
     result = ArtifactCompilationResult(artifact_id="*")
-    prior = {edge.id: edge for edge in store.find_edges_by_property("project_id", project_id, type_="TESTS", limit=100000, clone=False)
+    prior = {edge.id: edge for edge in store.find_edges_by_property("project_id", project_id, type_="TESTS", limit=None, clone=False)
              if edge.properties.get("resolver") == RESOLVER}
     tests = [
         node for kind in sorted(TEST_NODE_TYPES)

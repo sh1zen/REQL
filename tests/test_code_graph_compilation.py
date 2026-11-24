@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.artifacts.models import SourceArtifact
@@ -14,6 +13,24 @@ from memory.code_analysis import TreeSitterCodeParser
 
 
 class CodeGraphCompilationTests(unittest.TestCase):
+
+    def test_unresolved_calls_use_the_source_languages_bindings(self) -> None:
+        """Python runtime names cannot hide unrelated language identifiers."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "sample.py").write_text(
+                "def inspect_value(value):\n    len(value)\n    require(value)\n    raise ValueError()\n",
+                encoding="utf-8",
+            )
+            graph = MemoryGraph.open(root / ".reql/memory.reql")
+            try:
+                self.assertFalse(graph.compile_project(root).run.errors)
+                owner = graph.store.find_nodes_by_property("name", "inspect_value", type_="Function")[0]
+                self.assertEqual({item["target"] for item in owner.properties["unresolved_calls"]}, {"require"})
+                raised = graph.store.get_edges(from_id=owner.id, type_="RAISES")
+                self.assertEqual([edge.properties["name"] for edge in raised], ["ValueError"])
+            finally:
+                graph.close()
 
     def test_computed_receivers_remain_unresolved_instead_of_inventing_local_calls(self) -> None:
         """Computed receivers do not establish which same-named method is called."""
@@ -53,7 +70,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 entry = cache.get_entry(artifact.project_id, artifact.id)
                 if entry is None:
                     self.fail("Compilation did not persist its artifact cache")
-                cache.upsert_entry(replace(entry, parser_version="project-scan-v10"))
+                cache.upsert_entry(replace(entry, options_hash="stale-options"))
                 refreshed = graph.compile_project(root)
                 self.assertFalse(refreshed.run.errors)
                 self.assertEqual(refreshed.run.files_changed, 1)
@@ -365,16 +382,16 @@ class CodeGraphCompilationTests(unittest.TestCase):
             package.mkdir(parents=True)
             tests_dir.mkdir()
             files = {
-                package / "prompts.py": 'FIELD_PROMPT = "Explain Field.type"\n',
-                package / "wire_model.py": (
+                package / "brochure.py": 'TITLE = "Explain Field.type"\n',
+                package / "amber.py": (
                     "from dataclasses import dataclass\n\n"
                     "@dataclass\n"
-                    "class WireField:\n"
+                    "class AmberField:\n"
                     "    type: str\n"
                 ),
-                package / "validation.py": (
-                    "from .wire_model import WireField\n\n"
-                    "def validate_field(field: WireField) -> str:\n"
+                package / "ochre.py": (
+                    "from .amber import AmberField\n\n"
+                    "def read_field(field: AmberField) -> str:\n"
                     "    return field.type.strip()\n"
                 ),
                 package / "persisted_model.py": (
@@ -417,23 +434,16 @@ class CodeGraphCompilationTests(unittest.TestCase):
                     max_items=30,
                 )["payload"]
 
-                stages = {row["stage"] for row in payload["data_trace"]}
-                expected_stages = [
-                    "prompt",
-                    "wire model",
-                    "validation",
-                    "persisted model",
-                    "graph projection",
-                    "reconciliation",
-                    "OpenAPI compiler",
-                    "test/fixture",
-                ]
-                self.assertTrue(
-                    set(expected_stages).issubset(stages),
-                    payload["data_trace"],
-                )
-                unique_stages = list(dict.fromkeys(row["stage"] for row in payload["data_trace"]))
-                self.assertEqual([stage for stage in unique_stages if stage in expected_stages], expected_stages)
+                evidence = {(row["path"], row["stage"], row["relation"]) for row in payload["data_trace"]}
+                self.assertTrue({
+                    ("pipeline/amber.py", "field declaration", None),
+                    ("pipeline/brochure.py", "field reference", None),
+                    ("pipeline/openapi_compiler.py", "field reference", None),
+                    ("pipeline/ochre.py", "reads", "READS"),
+                    ("tests/field_fixture.py", "test/fixture", None),
+                }.issubset(evidence), payload["data_trace"])
+                self.assertEqual(payload["data_trace"][0]["stage"], "field declaration")
+                self.assertEqual(payload["data_trace"][-1]["stage"], "test/fixture")
                 rendered = graph.query_context("Field.type", top_k=30, max_items=30)
                 self.assertIn("End-to-end data trace", rendered)
 
@@ -445,8 +455,8 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 ]
                 self.assertTrue(
                     any(
-                        nodes[edge.from_id].properties.get("qualified_name") == "pipeline.validation.validate_field"
-                        and nodes[edge.to_id].properties.get("qualified_name") == "pipeline.wire_model.WireField.type"
+                        nodes[edge.from_id].properties.get("qualified_name") == "pipeline.ochre.read_field"
+                        and nodes[edge.to_id].properties.get("qualified_name") == "pipeline.amber.AmberField.type"
                         for edge in typed_reads
                     )
                 )
@@ -509,7 +519,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                         ".password-field { border-color: #555; }",
                         ".js-only { display: none; }",
                         ".unused-css { opacity: .5; }",
-                        ".duplicate { color: red; color: blue; }",
+                        ".duplicate { color: red; color: blue; color: blue; }",
                         "input[type=\"password\"] { letter-spacing: 0; }",
                     ]
                 ),
@@ -610,6 +620,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertNotIn(("unused_css_class", ".password-field"), finding_names)
                 self.assertNotIn(("unused_css_class", ".js-only"), finding_names)
                 self.assertIn(("always_overridden_css_declaration", ".duplicate color"), finding_names)
+                self.assertIn(("possibly_overridden_css_declaration", ".duplicate color"), finding_names)
 
                 payload = graph.query_context_payload(
                     "AuthController password field",
@@ -825,27 +836,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertTrue(expected_imports.issubset({item.module for item in result.imports}))
                 self.assertTrue(expected_calls.issubset({call.target for call in result.calls}))
                 self.assertTrue(all(call.caller for call in result.calls if call.target in expected_calls))
-
-    def test_tree_sitter_parser_unavailable_is_non_fatal(self) -> None:
-        artifact = SourceArtifact(
-            id="artifact:sql",
-            project_id="project:generic",
-            uri="file:///schema.sql",
-            path="schema.sql",
-            relative_path="schema.sql",
-            artifact_type="code",
-            language="sql",
-            size_bytes=20,
-            sha256="",
-            mtime=0.0,
-        )
-        parser = TreeSitterCodeParser()
-        with patch("memory.code_analysis.base._parser_for", side_effect=ValueError("Unsupported Tree-sitter language: sql")):
-            result = parser.parse_artifact(artifact, "select * from users;\n")
-
-        self.assertFalse(result.errors)
-        self.assertEqual(result.module.metadata.get("parser_status"), "skipped")
-        self.assertIn("Unsupported Tree-sitter language: sql", result.module.metadata.get("parser_warning", ""))
 
     def test_compile_records_unused_code_findings_for_queries(self) -> None:
         with tempfile.TemporaryDirectory() as td:

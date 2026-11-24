@@ -1,6 +1,7 @@
 """Python Tree-sitter extraction."""
 from __future__ import annotations
 
+import ast
 from typing import Any
 
 from ..base import (
@@ -29,7 +30,21 @@ from ..base import (
     _text,
     stable_id,
 )
-from ..models import CodeSymbol, SymbolKind
+from ..models import CodeRoute, CodeSymbol, SymbolKind
+
+
+_HTTP_CONSTRUCTORS = {
+    "fastapi.FastAPI": "",
+    "fastapi.applications.FastAPI": "",
+    "fastapi.APIRouter": "prefix",
+    "fastapi.routing.APIRouter": "prefix",
+    "flask.Flask": "",
+    "flask.Blueprint": "url_prefix",
+    "flask.blueprints.Blueprint": "url_prefix",
+    "starlette.applications.Starlette": "",
+    "starlette.routing.Router": "",
+}
+_HTTP_METHODS = {"CONNECT", "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE"}
 
 
 class PythonTreeSitterExtractor(TreeSitterExtractorBase):
@@ -37,6 +52,8 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
     tree_sitter_module = "tree_sitter_python"
 
     def _walk_root(self, root: Any) -> None:
+        self._http_imports: dict[str, str | None] = {}
+        self._http_receivers: dict[str, str | None] = {}
         self._extract_python_module_docstring(root)
         self._walk_python(root, [])
 
@@ -54,6 +71,10 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
                 self._add_python_docstring(symbol, definition)
                 if str(getattr(definition, "type", "")) == "function_definition":
                     self._python_signature_references(definition, scope)
+                    for decorator in symbol.decorators:
+                        routes = self._python_routes(decorator, scope)
+                        if routes:
+                            self.routes.setdefault(symbol.id, []).extend(routes)
                 self._walk_python_body(definition, [*scope, symbol])
             return
         if node_type in {"function_definition", "class_definition"}:
@@ -69,7 +90,17 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
             start = len(self.imports)
             self._python_import(node)
             for item in self.imports[start:]:
-                item.metadata["binding_scope"] = _parent(self.module, scope)
+                parent = _parent(self.module, scope)
+                item.metadata["binding_scope"] = parent
+                if item.module and item.name != "*":
+                    binding = item.alias or item.name or item.module.split(".", 1)[0]
+                    if item.name:
+                        imported = f"{item.module}.{item.name}"
+                    else:
+                        imported = item.module if item.alias else binding
+                    key = f"{parent}.{binding}"
+                    self._http_imports[key] = imported if item.level == 0 else None
+                    self._http_receivers[key] = None
             return
         if node_type in {"assignment", "augmented_assignment"}:
             self._python_assignment(node, scope)
@@ -194,13 +225,97 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
         for name, alias in names:
             self.imports.append(_import(self.artifact, module, name, alias, _line(node), raw, level=level))
 
+    def _http_binding(self, bindings: dict[str, str | None], name: str, scope: list[CodeSymbol]) -> str | None:
+        """Resolve a source-local binding in the nearest known scope."""
+        for owner in reversed(scope):
+            key = f"{owner.qualified_name}.{name}"
+            if key in bindings or name in owner.args:
+                return bindings.get(key)
+        return bindings.get(f"{self.module.name}.{name}")
+
+    def _http_receiver_prefix(self, value: Any, scope: list[CodeSymbol]) -> str | None:
+        """Recognize receivers constructed from a statically imported HTTP framework."""
+        if value is None:
+            return None
+        if value.type == "identifier":
+            return self._http_binding(self._http_receivers, _node_text(self.source, value), scope)
+        if value.type != "call":
+            return None
+        target = _call_target(self.source, _field(value, "function"))
+        if not target:
+            return None
+        binding, dot, member = target.partition(".")
+        imported = self._http_binding(self._http_imports, binding, scope)
+        if imported is None:
+            return None
+        constructor = f"{imported}{dot}{member}"
+        option = _HTTP_CONSTRUCTORS.get(constructor)
+        if option is None:
+            return None
+        if not option:
+            return ""
+        call = _static_call(_node_text(self.source, value))
+        if call is None:
+            return None
+        if any(item.arg is None for item in call.keywords):
+            return None
+        prefix_value = _keyword(call, option, ast.Constant(value=""))
+        if option == "url_prefix" and isinstance(prefix_value, ast.Constant) and prefix_value.value is None:
+            return ""
+        prefix = _literal_string(prefix_value)
+        return prefix.rstrip("/") if prefix is not None and (not prefix or prefix.startswith("/")) else None
+
+    def _python_routes(self, decorator: str, scope: list[CodeSymbol]) -> list[CodeRoute]:
+        """Extract only literal routes from a known receiver or the bare route convention."""
+        call = _static_call(decorator)
+        if call is None:
+            return []
+        function = call.func
+        if isinstance(function, ast.Name) and function.id == "route":
+            operation, prefix, default_method = "route", "", "ANY"
+        elif isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+            operation = function.attr
+            prefix = self._http_binding(self._http_receivers, function.value.id, scope)
+            default_method = "GET"
+        else:
+            return []
+        if prefix is None:
+            return []
+        path = _literal_string(call.args[0] if call.args else _keyword(call, "path", _keyword(call, "rule")))
+        if path is None or not path.startswith("/"):
+            return []
+        method = operation.upper()
+        if method in _HTTP_METHODS and operation.islower():
+            methods = [method]
+        elif operation in {"websocket", "websocket_route"}:
+            methods = ["WEBSOCKET"]
+        elif operation in {"route", "api_route"}:
+            if any(item.arg is None for item in call.keywords):
+                return []
+            declared = _keyword(call, "methods")
+            if declared is None or isinstance(declared, ast.Constant) and declared.value is None:
+                methods = [default_method]
+            elif isinstance(declared, (ast.List, ast.Tuple, ast.Set)):
+                methods = [name.upper() for element in declared.elts if (name := _literal_string(element))]
+                if len(methods) != len(declared.elts):
+                    return []
+            else:
+                return []
+        else:
+            return []
+        return [CodeRoute(method, prefix + path, decorator) for method in dict.fromkeys(methods)
+                if method in _HTTP_METHODS or method in {"ANY", "WEBSOCKET"}]
+
     def _python_assignment(self, node: Any, scope: list[CodeSymbol]) -> None:
         target_node = _field(node, "left") or _first_named_child(node)
         value_node = _field(node, "right")
         annotation = _clean_type_text(_node_text(self.source, _field(node, "type")))
+        prefix = self._http_receiver_prefix(value_node, scope) if target_node is not None and target_node.type == "identifier" else None
         for name, target in _assignment_names(self.source, target_node):
             parent = _parent(self.module, scope)
             qualified = f"{parent}.{name}" if parent else name
+            self._http_receivers[qualified] = prefix
+            self._http_imports[qualified] = None
             symbol = CodeSymbol(
                 id=stable_id("code-symbol", self.artifact.id, "variable", qualified, _line(target)),
                 artifact_id=self.artifact.id,
@@ -281,6 +396,23 @@ def _string_value(source: bytes, node: Any) -> str:
         quote = raw[:3] if raw.startswith(("'''", '"""')) else raw[0]
         return raw.removeprefix(quote).removesuffix(quote)
     return raw
+
+
+def _static_call(source: str) -> ast.Call | None:
+    """Read an expression without importing or evaluating project code."""
+    try:
+        expression = ast.parse(source, mode="eval").body
+    except SyntaxError:
+        return None
+    return expression if isinstance(expression, ast.Call) else None
+
+
+def _keyword(call: ast.Call, name: str, default: ast.expr | None = None) -> ast.expr | None:
+    return next((item.value for item in call.keywords if item.arg == name), default)
+
+
+def _literal_string(value: ast.expr | None) -> str | None:
+    return value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else None
 
 
 def _decorator_text(source: bytes, node: Any) -> str:

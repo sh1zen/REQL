@@ -121,3 +121,5 @@ ACTIVE_STATUSES = {"candidate", "latent", "active", "reinforced", "mature", "pro
 INACTIVE_STATUSES = {"archived", "deleted", "rejected", "dismissed"}
 
 DEFAULT_MEMORY_SCOPE = "default"
+
+PROJECT_USAGE_ARCHIVE_REASON = "project_wide_usage_detected"

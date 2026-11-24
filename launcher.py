@@ -29,6 +29,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from api import MemoryGraph
+from memory.config import load_effective_config
+from memory.domain.exceptions import StorageError
 from memory.reporting.html_graph import write_graph_html
 
 
@@ -54,7 +56,7 @@ class Launcher:
         self.storage_path = storage_path
         self.user_id = user_id
         self.debug = debug
-        self.graph = MemoryGraph.open(storage_path)
+        self.graph = MemoryGraph.open(storage_path, config=load_effective_config(start_dir=storage_path.parent))
 
     def close(self) -> None:
         self.graph.close()
@@ -62,7 +64,7 @@ class Launcher:
     def reopen(self, storage_path: Path) -> None:
         self.graph.close()
         self.storage_path = storage_path
-        self.graph = MemoryGraph.open(storage_path)
+        self.graph = MemoryGraph.open(storage_path, config=load_effective_config(start_dir=storage_path.parent))
 
     def run_menu(self) -> int:
         return GuidedMenu(self).run()
@@ -92,12 +94,13 @@ class Launcher:
             [OptionSpec("--json", "json", takes_value=False, default=False, cast=bool)],
         )
         _reject_extra(extra)
-        nodes = self.graph.store.all_nodes(self.user_id)
-        edges = self.graph.store.all_edges(self.user_id)
-        by_type: dict[str, int] = {}
-        for node in nodes:
-            by_type[node.type] = by_type.get(node.type, 0) + 1
-        payload = {"user": self.user_id, "nodes": len(nodes), "edges": len(edges), "node_types": by_type}
+        by_type = self.graph.store.node_type_counts()
+        payload = {
+            "user": self.user_id,
+            "nodes": sum(by_type.values()),
+            "edges": self.graph.store.count_edges(),
+            "node_types": by_type,
+        }
         if options["json"]:
             _print_json(payload)
         else:
@@ -108,7 +111,6 @@ class Launcher:
         return 0
 
     def _export(self, tail: str) -> int:
-        payload = self.graph.export_json(user_id=self.user_id)
         options, extra = _parse_options(
             tail,
             [
@@ -116,8 +118,9 @@ class Launcher:
                 OptionSpec("--json", "json", takes_value=False, default=False, cast=bool),
             ],
         )
+        payload = self.graph.export_json()
         if options["html"]:
-            html_path = write_graph_html(payload, _graph_html_path(extra or None))
+            html_path = write_graph_html(payload, _graph_html_path(extra or None), config=self.graph.config)
             print(html_path)
             if options["json"]:
                 json_path = html_path.with_name("graph.json")
@@ -185,11 +188,13 @@ class GuidedMenu:
         print(f"Storage:  {self.launcher.storage_path}")
         print(f"User:     {self.launcher.user_id}")
         try:
-            nodes = len(self.launcher.graph.store.all_nodes(self.launcher.user_id))
-            edges = len(self.launcher.graph.store.all_edges(self.launcher.user_id))
+            nodes = self.launcher.graph.store.count_nodes()
+            edges = self.launcher.graph.store.count_edges()
             print(f"Status:   {nodes} nodes, {edges} edges")
-        except Exception:
-            print("Status:   storage not initialized")
+        except (StorageError, OSError) as exc:
+            print(f"Status:   cannot read storage: {exc}", file=sys.stderr)
+            if self.launcher.debug:
+                traceback.print_exc()
         print("-" * 78)
 
     def _run(self, label: str, action: Callable[[], int | None]) -> int | None:
@@ -305,9 +310,9 @@ class GuidedMenu:
         print("Format: REQL block storage")
 
         if _resolve(path) == _resolve(self.launcher.storage_path):
-            nodes = len(self.launcher.graph.store.all_nodes(self.launcher.user_id))
-            edges = len(self.launcher.graph.store.all_edges(self.launcher.user_id))
-            print(f"Content for active user '{self.launcher.user_id}': {nodes} nodes, {edges} edges")
+            nodes = self.launcher.graph.store.count_nodes()
+            edges = self.launcher.graph.store.count_edges()
+            print(f"Graph content: {nodes} nodes, {edges} edges")
 
     def _delete_memory(self, path: Path) -> int:
         if not _is_managed_memory(path):
@@ -547,8 +552,9 @@ class GuidedMenu:
         print("The REQL MCP server supports local stdio and HTTP with an API key for network sharing.")
         read_only = _confirm("Use read-only mode for agents?", True)
         http_transport = _confirm("Use HTTP transport with host/port?", False)
-        host = "127.0.0.1"
-        port = 8765
+        config = load_effective_config().mcp if http_transport else None
+        host = config.host if config else ""
+        port = config.port if config else 0
         api_key = ""
         if http_transport:
             host = _prompt("HTTP host (127.0.0.1 local, 0.0.0.0 network)", host)
@@ -563,7 +569,7 @@ class GuidedMenu:
         print(f"  {self.launcher.storage_path.resolve().as_posix()}")
         print()
         print("Example tool argument:")
-        _print_json({"storage_path": self.launcher.storage_path.resolve().as_posix(), "query": "context for the current task", "user_id": self.launcher.user_id})
+        _print_json({"storage_path": self.launcher.storage_path.resolve().as_posix(), "query": "context for the current task"})
         if _confirm("Start the MCP server in this terminal now?", False):
             from mcp.server import main as mcp_main
 
@@ -573,7 +579,7 @@ class GuidedMenu:
             return mcp_main(args)
         return 0
 
-    def _print_mcp_connection(self, *, read_only: bool, http_transport: bool = False, host: str = "127.0.0.1", port: int = 8765) -> None:
+    def _print_mcp_connection(self, *, read_only: bool, http_transport: bool, host: str, port: int) -> None:
         args_list = '["--read-only"]' if read_only else "[]"
         suffix = " --read-only" if read_only else ""
         if http_transport:

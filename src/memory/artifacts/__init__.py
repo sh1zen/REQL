@@ -5,7 +5,6 @@ from typing import Any
 
 from .models import (
     ArtifactCompilationResult,
-    ArtifactFingerprint,
     GraphRegistrationSummary,
     Project,
     ScanError,
@@ -16,7 +15,6 @@ from .models import (
 from .options import CompilationOptions, DocumentPolicy
 
 __all__ = [
-    "ArtifactFingerprint",
     "ArtifactCache",
     "ArtifactCacheEntry",
     "artifact_cache_path",

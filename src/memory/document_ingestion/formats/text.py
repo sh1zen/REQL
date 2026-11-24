@@ -10,7 +10,6 @@ from ..models import DocumentParseResult
 
 class PlainTextParser(BaseDocumentParser):
     parser_name = "plain_text"
-    parser_version = "text-v1"
     artifact_types = frozenset({"text", "code", "config", "data", "unknown"})
 
     def __init__(self, *, max_chars: int = 3000) -> None:

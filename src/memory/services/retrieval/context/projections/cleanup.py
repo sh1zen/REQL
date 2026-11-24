@@ -4,9 +4,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any
 
+from .....artifacts.context_scope import is_documentation_context, is_test_context
 from .....domain.models import MemoryEdge, MemoryNode, MemorySubgraph, RankedNode
 from .....extraction.normalization import tokenize
-from ...common import _expanded_tokens
 
 
 class CleanupContextProjectionMixin:
@@ -218,10 +218,9 @@ class CleanupContextProjectionMixin:
 
     @staticmethod
     def _cleanup_reference_read_kind(edge: MemoryEdge, node: MemoryNode, path: str) -> str:
-        normalized = path.replace("\\", "/").casefold()
-        if normalized.startswith("tests/") or "/tests/" in normalized or edge.type == "TESTS":
+        if edge.type == "TESTS" or is_test_context(node.type, node.properties, path):
             return "test_ref"
-        if normalized.startswith("docs/") or "/docs/" in normalized or normalized == "readme.md" or node.type in {"Docstring", "Comment"}:
+        if is_documentation_context(node.type, node.properties, path):
             return "doc_ref"
         if edge.type in {"IMPORTS", "IMPORTS_FROM", "RE_EXPORTS"}:
             return "importer_ref"
@@ -288,7 +287,7 @@ class CleanupContextProjectionMixin:
         max_items: int,
     ) -> list[dict[str, Any]]:
         ranked_by_id = {item.node.id: item for item in ranked}
-        query_tokens = set(_expanded_tokens(subgraph.query.text))
+        query_tokens = set(self._search_tokens(subgraph.query.text))
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for node in [*(item.node for item in ranked), *subgraph.nodes]:

@@ -11,7 +11,7 @@ from ..domain.models import MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
 from .compile_identity import ArtifactCompileIdentity
-from .fingerprint import DEFAULT_CHUNKING_VERSION, DEFAULT_PARSER_VERSION, options_hash
+from .fingerprint import options_hash
 from .models import ScanResult, SourceArtifact
 
 ARTIFACT_CACHE_FILENAME = "artifact-cache.json"
@@ -27,8 +27,6 @@ class ArtifactCacheEntry:
     sha256: str
     size_bytes: int
     mtime: float
-    parser_version: str
-    chunking_version: str
     options_hash: str
     compiled_at: str
     status: str = "active"
@@ -63,18 +61,12 @@ class ArtifactCache:
         store: GraphStore,
         *,
         cache_path: str | Path | None = None,
-        parser_version: str = DEFAULT_PARSER_VERSION,
-        chunking_version: str = DEFAULT_CHUNKING_VERSION,
         compile_options: dict[str, object] | None = None,
         identity: ArtifactCompileIdentity | None = None,
     ) -> None:
         self.store = store
         self.disk = DiskArtifactCache(cache_path) if cache_path is not None else None
-        self.identity = identity if identity is not None else ArtifactCompileIdentity(
-            parser_version, chunking_version, options_hash(compile_options),
-        )
-        self.parser_version = self.identity.parser_version
-        self.chunking_version = self.identity.chunking_version
+        self.identity = identity if identity is not None else ArtifactCompileIdentity(options_hash(compile_options))
         self.options_hash = self.identity.options_digest
 
     def entry_id(self, project_id: str, artifact_id: str) -> str:
@@ -95,7 +87,7 @@ class ArtifactCache:
         if self.disk is not None:
             for entry in self.disk.project_entries(project_id, active_only=active_only):
                 entries_by_artifact[entry.artifact_id] = entry
-        for node in self.store.find_nodes_by_property("project_id", project_id, type_="ArtifactCacheEntry", limit=100000, clone=False):
+        for node in self.store.find_nodes_by_property("project_id", project_id, type_="ArtifactCacheEntry", limit=None, clone=False):
             if active_only and node.status != "active":
                 continue
             entry = _entry_from_node(node)
@@ -109,13 +101,15 @@ class ArtifactCache:
         return entries
 
     def entry_matches_artifact(self, entry: ArtifactCacheEntry, artifact: SourceArtifact) -> bool:
-        return artifact_cache_entry_matches(
-            entry,
-            artifact,
-            parser_version=self.parser_version,
-            chunking_version=self.chunking_version,
-            expected_options_hash=self.options_hash,
-        ) and self._compiled_artifact_matches(artifact)
+        """Check both cache metadata and the authoritative compilation fingerprint."""
+        return (
+            entry.sha256 == artifact.sha256
+            and entry.size_bytes == artifact.size_bytes
+            and float(entry.mtime) == float(artifact.mtime)
+            and entry.options_hash == self.options_hash
+            and entry.status == "active"
+            and self._compiled_artifact_matches(artifact)
+        )
 
     def _compiled_artifact_matches(self, artifact: SourceArtifact) -> bool:
         """Verify cached or recoverable work against the graph's completed compilation."""
@@ -191,13 +185,28 @@ class ArtifactCache:
             sha256=artifact.sha256,
             size_bytes=artifact.size_bytes,
             mtime=artifact.mtime,
-            parser_version=self.parser_version,
-            chunking_version=self.chunking_version,
             options_hash=self.options_hash,
             compiled_at=now,
             status="active",
         )
-        self.store.upsert_node(_entry_node(entry), return_clone=False)
+        # A cache entry is a snapshot of the last successful compile.
+        properties = entry.to_dict()
+        if self.store.update_node_fields(
+            entry.id, label=entry.relative_path, status=entry.status, properties=properties,
+        ) is None:
+            self.store.upsert_node(
+                MemoryNode(
+                    id=entry.id,
+                    type="ArtifactCacheEntry",
+                    label=entry.relative_path,
+                    canonical_key=f"{entry.project_id}:{entry.artifact_id}",
+                    properties=properties,
+                    salience=0.05,
+                    confidence=1.0,
+                    status=entry.status,
+                ),
+                return_clone=False,
+            )
         if persist_disk and self.disk is not None:
             self.disk.upsert_entry(entry)
         return entry
@@ -358,39 +367,6 @@ def artifact_cache_path(project_root: str | Path) -> Path:
     return Path(project_root).expanduser().resolve(strict=False) / ".reql" / ARTIFACT_CACHE_FILENAME
 
 
-def artifact_cache_entry_matches(
-    entry: ArtifactCacheEntry,
-    artifact: SourceArtifact,
-    *,
-    parser_version: str,
-    chunking_version: str,
-    expected_options_hash: str,
-) -> bool:
-    """Return whether a disk cache entry proves an artifact is unchanged."""
-    return (
-        entry.sha256 == artifact.sha256
-        and entry.size_bytes == artifact.size_bytes
-        and float(entry.mtime) == float(artifact.mtime)
-        and entry.parser_version == parser_version
-        and entry.chunking_version == chunking_version
-        and entry.options_hash == expected_options_hash
-        and entry.status == "active"
-    )
-
-
-def _entry_node(entry: ArtifactCacheEntry) -> MemoryNode:
-    return MemoryNode(
-        id=entry.id,
-        type="ArtifactCacheEntry",
-        label=entry.relative_path,
-        canonical_key=f"{entry.project_id}:{entry.artifact_id}",
-        properties=entry.to_dict(),
-        salience=0.05,
-        confidence=1.0,
-        status=entry.status,
-    )
-
-
 def _entry_from_node(node: MemoryNode) -> ArtifactCacheEntry:
     data = dict(node.properties)
     return _entry_from_mapping({**data, "id": data.get("id") or node.id, "status": data.get("status") or node.status})
@@ -405,8 +381,6 @@ def _entry_from_mapping(data: dict[str, Any]) -> ArtifactCacheEntry:
         sha256=str(data["sha256"]),
         size_bytes=int(data["size_bytes"]),
         mtime=float(data["mtime"]),
-        parser_version=str(data["parser_version"]),
-        chunking_version=str(data["chunking_version"]),
         options_hash=str(data["options_hash"]),
         compiled_at=str(data["compiled_at"]),
         status=str(data.get("status") or "active"),

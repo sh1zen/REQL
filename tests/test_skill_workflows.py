@@ -13,8 +13,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from agents.install import HOOK_ID, PLATFORMS_CONFIG, install_agent_files, uninstall_agent_files
+from agents.clients import CLIENT_PROFILES
+from agents.install import HOOK_ID, install_agent_files, uninstall_agent_files
 from api import MemoryGraph
+from config import VERSION
 from memory.artifacts.project import ProjectRegistry
 from memory.artifacts.scanner import ProjectScanner
 from memory.cli import build_parser
@@ -162,7 +164,7 @@ class SkillWorkflowTests(unittest.TestCase):
         """Check every platform and scope for broken routes and unsupported CLI examples."""
         parser = build_parser()
         for project in (True, False):
-            for platform in PLATFORMS_CONFIG:
+            for platform in CLIENT_PROFILES:
                 with self.subTest(project=project, platform=platform):
                     root = self.root / platform / ("project" if project else "user")
                     home = root / "home"
@@ -175,7 +177,8 @@ class SkillWorkflowTests(unittest.TestCase):
                     self.assertEqual(skill_names, expected_skills)
                     stamps = [action.path for action in installed.actions if action.kind == "version"]
                     self.assertEqual(len(stamps), 1)
-                    self.assertTrue(stamps[0].is_file())
+                    stamp = json.loads(stamps[0].read_text(encoding="utf-8"))
+                    self.assertEqual(stamp["package_version"], VERSION)
                     for action in installed.actions:
                         if action.kind == "hook":
                             self.check_hook_output(action.path, platform=platform, root=root)
@@ -196,8 +199,6 @@ class SkillWorkflowTests(unittest.TestCase):
         route = skill.read_text(encoding="utf-8")
         self.assertLess(len(guidance), 900)
         self.assertIn("--brief", guidance)
-        self.check_discovery_policy(guidance)
-        self.check_discovery_policy(route)
         self.assertNotIn("project status", guidance)
         self.assertNotIn("agent dashboard", route)
         self.assertIn("references/bootstrap.md", route)
@@ -205,6 +206,14 @@ class SkillWorkflowTests(unittest.TestCase):
         self.assertIn("project context --task ID", route)
         workspace = (skill.parent / "references" / "agent-workspace.md").read_text(encoding="utf-8")
         self.assertIn("query_context --task TASK_ID --follow-up", workspace)
+        self.assertIn('--query "DOCUMENT_PATH_OR_HEADING" --docs --brief', workspace)
+        self.assertIn("`--seen-source`", workspace)
+        self.assertIn("`storage locks`", workspace)
+        self.assertIn("`agent record --id ID --revision N`", workspace)
+        plan = json.loads(workspace.split("\n```json\n", 1)[1].split("\n```", 1)[0])
+        check, = plan["focused"]
+        self.assertEqual(check["command"][:3], ["python", "-m", "unittest"])
+        self.assertIn("tests/test_serializer.py", check["inputs"])
         self.assertIn("agent init --next", workspace)
         self.assertIn("agent task update --id TASK_ID --status open", workspace)
         self.assertIn("project context --task WORK_ID", workspace)

@@ -76,7 +76,9 @@ Supported platforms are `codex`, `claude`, `opencode`, `kilo`, `cursor`,
 auto-detection. Auto-detection only uses real assistant profile signals or
 assistant commands whose install targets are known. Generic root directories
 such as `.codex`, `.github`, and `.agents` are ignored. Codex detection requires
-paths such as `.codex/skills` or `.codex/hooks.json`. Copilot detection requires
+paths such as `.codex/skills` or `.codex/hooks.json`. Claude Code uses
+`CLAUDE_CONFIG_DIR` for both detection and user-level installation when set.
+Copilot detection requires
 Copilot-specific paths such as `~/.copilot/skills`,
 `.github/copilot-instructions.md`, or `.github/instructions`. Generic
 Agent-Skills detection uses `~/.agents/skills` or `./.agents/skills`. Project
@@ -135,6 +137,8 @@ Run project commands from the project root. Compilation and
 including `scan.max_file_size_mb`. See [Configuration](CONFIGURATION.md#behavior)
 for scan patterns and nested scope, and the [compilation pipeline](PIPELINE.md)
 for supported inputs, cache fingerprints, stage order and failures.
+Use `reql project compile --lock-timeout SECONDS` to wait for graph access
+when another process is using the store.
 
 A successful manifest change creates an immutable `ProjectRevision` with a tree
 hash, parent revision and file transitions containing old and new SHA-256
@@ -208,7 +212,7 @@ reql query "FINDINGS WHERE finding_type = 'possibly_orphan_directory' RETURN rel
 It is informative by default and returns matching nodes, file/line references,
 source links, owner candidates, cleanup candidates, working-set records, and
 targeted reads. Use `--code`, `--docs`, or `--test` to limit context to a
-scope. Default code text lists files, owners, associated tests, and the small
+scope. Default code text lists files, owners, associated tests and the
 source previews already retrieved. Its bounded **Change boundaries** section shows
 indexed `WRAPS`, `OVERRIDES`, `INHERITS`, caller and public-surface relations near
 the selected owners. `payload.impact.implementation_links` retains source/target
@@ -219,20 +223,18 @@ When a source path is displayed, symbol labels omit its exact dotted module
 prefix. Class/method names and file locations remain visible; JSON keeps full
 qualified names. Labels without that path context remain fully qualified.
 
-Previews preserve indentation and complete
-lines within 16 lines/900 characters. Their ranges describe actual disk text;
-`requested_line_end`, `truncated` and `next_line` identify any missing part.
+Previews preserve indentation and show the selected source range.
+`requested_line_end`, `truncated` and `next_line` identify incomplete ranges.
 Graph fallback text is labeled as indexed graph evidence and never counts as
-complete current source. Preview reads share the 4 MiB file ceiling used by
-verified excerpts and reuse one file snapshot per request. JSON retains the full
+complete current source. Previews and verified excerpts reuse one file snapshot
+per request. JSON retains the full
 `read_plan` with file paths and line ranges for targeted reads.
 
 Add `--source` with `--code` or `--test` to embed current source bodies directly.
 Python and MCP expose the same opt-in `include_source=True` field. This requires
-explicit code/test scopes without docs. Overlapping spans are merged, each file
-is read once, and the response shares limits of three files, six regions,
-120 source lines, and 6,000 source characters. Files larger than 4 MiB are not
-read in full. Source paths must resolve inside their registered project root,
+explicit code or test scopes. REQL merges overlapping spans and reads each
+selected file once.
+Source paths must resolve inside their registered project root,
 even when the graph store or current directory is elsewhere.
 
 JSON `snippets` report `source_status` (`verified`, `stale`, or `unavailable`).
@@ -244,6 +246,9 @@ uncovered ranges directly. Changed or missing files, uncommitted metadata, and
 read failures return a reason without falling back to old graph text. Detected
 source changes mark graph freshness stale unless a refresh is already running.
 Queries do not compile or mutate the graph. Files can change after capture.
+Use `query_context --lock-timeout SECONDS` to wait for a shared graph lease
+when another worker is writing. A query without this option reports a busy
+graph immediately.
 
 Use `--cleanup` for dead-code and unused-symbol cleanup. Cleanup output
 is always conservative and shows safe-remove findings plus medium-priority
@@ -258,9 +263,12 @@ budget defaults (`top_k=20`, `max_depth=3`, `max_items=20`). JSON output is the
 canonical `ContextResult` envelope: `schema_version`, `graph_revision`,
 `source_revision`, `freshness` and `confidence` are top-level fields. Trace
 metadata and projected context are nested under `payload`.
+The `payload.ranking_profile` field reports the REQL release that ranked the results.
 In text, the displayed file path supplies its module identity; `(module)` avoids
 repeating the qualified module name. Tests already shown in `Files` are identified
 as such in `Associated tests`, without repeating their file rows.
+When a brief lists exact test files under `Requested files`, lexical test
+candidates come from those files. Indexed test associations remain available.
 
 For an unscoped informative query, REQL relates documentation and implementation
 files in the same project when indexed evidence shares query terms. Structured
@@ -289,27 +297,25 @@ reql query_memories --query "payment service" --limit 8 --json
 reql query_memories --query "payment service" --no-sources
 ```
 
-It uses the same seed search and bounded graph expansion as the retrieval
+It uses the same seed search and request depth as the retrieval
 pipeline. JSON output includes trace id, seed ids, ranked nodes, nodes, edges,
 sources, parameters, and counts.
 
 For coding agents, `query_context --code --brief` renders owners, spans, boundaries,
-associated tests, and matched work. A high-confidence literal symbol or up to two
-strong owners for a focused query can return complete, hash-verified bodies
-within a shared budget of 32 lines and 1,600 characters. A compound query can
-include the best separated owner. Complete, verified bodies appear first. When
+associated tests and matched work. A high-confidence literal symbol or strong
+owners for a focused query can return complete, hash-verified bodies. A compound query can
+include the best separated owner. Complete, verified bodies appear first when
+they fit the source budget. A larger body keeps its verified line range. When
 a verified body names an indexed project-relative Markdown section such as
 `docs/guide.md#setup`, brief context can show its verified line range for a
 targeted read. Reuse displayed source and read missing spans only. Brief output
 keeps linked tests, groups calls to the same target within one file while
-retaining caller spans, and limits unverified suggestions when it embeds an
-owner. Without `--task`, matching observations and checkpoints appear as short
+retaining caller spans. Without `--task`, matching observations and checkpoints appear as short
 summaries with IDs. Use `reql agent show ID --json` for their details. Decisions,
 constraints, and failures retain their evidence within the brief budget.
-Broader queries retain the
-working set and ambiguous or oversized bodies retain source locations. Stale and unavailable
-source still carries a reason. Use `--source` to request the full verified excerpt
-budget. Use `--json` for the structured envelope, including exact revisions
+Broader queries retain the working set and ambiguous matches retain source
+locations. Stale and unavailable source carries a reason. Use `--source` to
+request verified bodies for the selected reads. Use `--json` for the structured envelope, including exact revisions
 and source spans. `--brief` applies only to text output. Add
 `--task WORK_ID` to recover a known task or checkpoint and its causal work in
 the same response. This is a read-only alternative to a separate work-context
@@ -318,27 +324,23 @@ JSON output also includes `read_plan` and `change_chain` so another
 agent can follow the intended intervention path without opening whole files or
 patching around missing project context.
 
-Dotted field queries such as `Field.type` also return an end-to-end
-`data_trace`. REQL seeds these queries from both symbols and code-body source
-fragments, resolves typed parameter field reads across imported models, and
-orders matching locations into recognizable layers such as prompts, wire
-models, validation, persisted models, graph projections, reconciliation,
-OpenAPI compilation, and tests or fixtures. The rendered context shows the
+Dotted field queries such as `Field.type` can return an end-to-end
+`data_trace`. It starts with indexed field declarations and literal references,
+then shows related locations in order of graph distance. Labels come from the
+recorded relationships and indexed test scope. The rendered context shows the
 same records under `End-to-end data trace`. The `serialization_paths` explore
 view follows `READS`, `WRITES`, `RETURNS`, `RAISES`, `REFERENCES`, and source
 evidence for the requested depth instead of stopping after the first adjacent
 edge.
 
-See [storage locking](STORAGE.md#readerwriter-locking) for concurrent
-readers, the usage journal and lock recovery. Expected storage failures
-return exit code `1`. A writer lock reports the recovery command
-`reql storage locks --recover-stale`.
+Storage failures return exit code `1`. If the store is busy, retry after the
+active command finishes. Use `reql storage locks` to check the current lock mode.
+See [storage locking](STORAGE.md#readerwriter-locking).
 
 ## Test evidence
 
 Run project tests directly and update the graph with `reql project compile`.
-`reql agent finish` runs an assigned task's saved checks. See
-[Verification handoff](COORDINATION.md#verification-handoff).
+Include the outcome in the task's [verification handoff](COORDINATION.md#verification-handoff).
 
 ```bash
 reql tests for --symbol SYMBOL_ID --json
@@ -356,10 +358,18 @@ association cites per-test coverage. A `candidate` matches a convention and is
 always unverified. The lookup commands read evidence without executing tests.
 
 The coverage.py adapter reads reports generated with `coverage json
---show-contexts`. It recognizes project-relative pytest node IDs and the
-pytest-cov `|run` context suffix. Suite totals and setup or teardown phases
-cannot establish an association for a single test. The report and all
-referenced paths must resolve inside the compiled project.
+--show-contexts`. It resolves `path::case` and `path::Class::case` IDs
+against indexed test cases, including parameterized IDs and the pytest-cov
+`|run` suffix. Project-local absolute paths and Windows separators are
+supported. For producers with other context formats, supply a
+`reql.test_contexts` object that maps each context string to
+`{"path": "quality/checks.py", "name": "Check.test_invoice"}`. The name
+can also be the indexed fully qualified case name. Only executed lines with
+a resolved case contribute evidence. Setup and teardown phases are ignored.
+The report and all referenced paths must resolve inside the compiled project.
+
+See [test configuration](CONFIGURATION.md#test-discovery-and-evidence)
+for test directory expressions and evidence order.
 
 To verify source freshness, include a capture-time `reql.source_hashes` object
 in the report. Map project-relative source and test paths to their SHA-256
@@ -368,16 +378,18 @@ without those hashes remain unverified. If a captured digest disagrees with
 the compiled bytes at import, REQL skips that mapping. An unrelated file
 change leaves verified observations current.
 
-The import is transactional and an identical report creates no duplicate
-observations. The default sidecar is `.reql/test-evidence.reql`.
+Imports serialize on the test evidence store. Each import runs as a transaction,
+and an identical report creates no duplicate observations. The default sidecar
+is `.reql/test-evidence.reql`.
 
 ## Source Edits
 
-`reql edit --plan edits.json` applies bounded line edits to UTF-8 files against
-the project's latest compiled revision. Run `reql project compile` to create
+`reql edit --plan edits.json` applies line edits to UTF-8 and recognized UTF-16
+files against the project's latest compiled revision. Run `reql project compile` to create
 the first revision. Use `--plan -` for stdin. Pass a JSON array and copy unique
 complete lines from a verified excerpt into `find`. Preserve indentation
-and use LF in the JSON strings.
+and use LF in the JSON strings. Plans accept any number of edits and have
+no built-in file or plan size ceiling.
 
 ```json
 [{"path":"README.md","find":"Old usage.","text":"Updated usage."}]
@@ -402,6 +414,8 @@ plan entries before replacing files and reports any previously replaced paths
 if an error interrupts the batch. After a successful write, the command
 refreshes the graph through the incremental compiler. A plan that changes no
 files skips compilation.
+Use `--lock-timeout SECONDS` to set the wait for each graph open during edit and
+refresh.
 
 With `--json`, the output includes `changed`, `unchanged` and a `refresh`
 result with status `completed`, `skipped` or `failed`. A refresh
@@ -412,7 +426,7 @@ to refresh the graph.
 ## Agent Workspace
 
 The [coordination guide](COORDINATION.md) covers work records, claim and
-completion behavior, verification receipts and retention. This reference lists
+completion behavior, handoffs and retention. This reference lists
 the CLI forms and return fields.
 
 ```bash
@@ -438,19 +452,24 @@ repeated `--file`, `--workstream`, `--parent`, repeated `--depends-on`,
 `--contradicts`, `--supersedes`, `--summarizes`, `--next` and `--importance 1..3`.
 
 `project context` accepts `--query`, repeated `--file`, `--workstream`, `--task`,
-`--history`, `--limit 1..40` and `--json`. `project overview --limit 1..20`
-bounds each section. See [retrieval and overview](COORDINATION.md#retrieval-and-overview)
-for evidence, `--details` and marked omissions.
+`--history`, `--limit N` and `--json`. Both `project context` and `project overview`
+return all matching work by default. Set `--limit N` to limit rows per overview
+section or context result. See [retrieval and overview](COORDINATION.md#retrieval-and-overview)
+for evidence, `--details`, and marked omissions.
 
 `agent init --next` claims ready work. Add `--workstream NAME` to select a
 queue or `--query "literal terms"` to override the task title as the source query.
 JSON includes `assignment_status` and `claimed_task`, with
 `source_context_retry` when a committed claim needs a separate source lookup.
+Use `--source` to include current source bodies in the JSON result.
 
 `agent init --task ID` claims an agreed assignment and shows shared work and
 any file overlaps. Add `--query "literal terms"` to retrieve code with the
-claim. On success, JSON includes `source_context` for that lookup. If graph
-retrieval fails after the claim, exit status 2 comes with the committed claim,
+claim. On success, JSON includes `source_context` with source locations.
+Add `--source` with `--query` to embed verified bodies. If graph
+storage is busy, the command waits after committing the claim. Use
+`--lock-timeout SECONDS` to limit this wait. If graph retrieval fails after
+the claim, exit status 2 comes with the committed claim,
 available shared work, `source_context_error`, and `source_context_retry`.
 Task JSON includes `claim` with the owning agent and session, or null for
 unclaimed work. The top-level agent and session describe the latest writer.
@@ -461,19 +480,32 @@ For an assigned brief, use exact symbols in the task's edit files. REQL prefers
 their verified bodies and shows indexed ranges when the bodies exceed the
 brief. A claim with a pending prerequisite still returns source evidence and
 identifies what must finish first.
+When assigned Markdown files have no selected passage, the brief shows
+verified headings and line ranges within one shared section budget.
 
-Once you have the brief, `query_context --task ID --follow-up --query "literal terms" --code --brief`
-retrieves the requested evidence without loading the task handoff, pinned
-ranges, or saved checks again. Use a regular task query to recover a changed
-assignment, or to restore context in a new session. This option is for brief
-text output.
+After the brief, use a follow-up for missing evidence. Pass the task ID and
+use brief text output.
 
-Apply changes before running `agent finish SUMMARY --task ID`. For bounded line
-edits, use [the standalone edit command](#source-edits). When the task has a
-saved source check, edit files directly and finish before refreshing the graph.
-Finish runs the task's current saved checks and refreshes the graph before
-completion. See the [verification handoff](COORDINATION.md#verification-handoff)
-for receipts and retry behavior.
+```bash
+reql query_context --task ID --follow-up --query "SYMBOL_OR_SOURCE_PATH" --code --test --brief
+reql query_context --task ID --follow-up --query "DOCUMENT_PATH_OR_HEADING" --docs --brief
+```
+
+Reuse the brief's `--seen-source PATH#LSTART-LEND@SHA256` options for code
+and test ranges you already saw. REQL skips these bodies while the hashes
+match. A literal file name or project-relative path takes precedence over
+related symbols. If the reply gives only an indexed range, read those lines.
+Use a regular task query to recover a changed assignment or to restore
+context in a new session.
+
+For bounded line edits, use [the standalone edit command](#source-edits).
+Refresh the graph after direct edits. Use `agent verify --plan FILE` to run
+focused checks before broad checks. Pass `-` as the plan path to read JSON
+from standard input. Exit status 0 means all checks passed. Exit status 1
+means a check failed. Exit status 2 reports a plan or input error.
+Use
+`agent finish SUMMARY --task ID` to record the result and complete the task.
+See [verification handoff](COORDINATION.md#verification-handoff).
 
 Plain `agent finish SUMMARY` saves a checkpoint and releases unfinished
 claims without completing them. Assigned finish also releases any other claims
@@ -482,27 +514,32 @@ the checkpoint id and revision and the released claim count. Recover with
 `project context --task CHECKPOINT_ID`. Plain writes return compact receipts.
 Use `--json` for structured results and `agent show ID --json` for history.
 
+Use `agent wait ID --timeout SECONDS` after independent work to wait for a
+prerequisite. It waits up to 60 seconds by default for `done` or `resolved`.
+Repeat `--status` to select other statuses. Exit code 1 means no selected
+status was reached. JSON reports `matched` and the latest available `node`.
+
 Identity selection prefers `--agent`/`REQL_AGENT_ID` over activity-derived
 identity (`--activity`, `REQL_AGENT_ACTIVITY_ID`, `CODEX_THREAD_ID`).
 For explicit scoping, use `reql agent --agent AGENT_ID --activity ACTIVITY_ID init --name NAME`.
 Use the host's activity ID for `ACTIVITY_ID`. Ambiguous
 private selection fails with guidance. `agent dashboard` shows owned work and
-private notes; `agent task list --all` and `agent list --all` include retained
-completed entries.
+private notes. The dashboard shows five rows per section by default. Use
+`agent dashboard --limit N` to set a positive row count. Use `agent task list --all`
+or `agent list --all` to include retained completed entries.
 
 `agent note` is private scratch; `note --agent ID` is directed scratch and
 `note --public` publishes a dashboard message. `agent search QUERY` searches
 work and messages with attribution. Use `--limit` to bound matches and
 `--json` for structured results.
 `agent status` shows the selected private identity and current session.
-Use `agent task done ID MESSAGE` to record a reviewed completion
-without running saved checks. Use assigned finish to run those checks.
+Use `agent task done ID MESSAGE` to record a reviewed completion. Use
+assigned finish to complete the task and close the current activity.
 `agent terminate ID` closes a stale agent's activities. Reconcile and release
 its claims explicitly. `agent reset` discards private scratch and preserves
 shared work. Save a checkpoint with `agent finish` before a deliberate close.
 
-Long-running agent calls report progress to stderr. JSON goes to stdout. While verification and refresh
-run, wait on the existing process with a long timeout. See the
+Long-running agent calls report progress to stderr. JSON goes to stdout. See the
 [coordination guide](COORDINATION.md#planning-and-continuation) for managing
 parallel work and for claim and finish workflows.
 
@@ -550,7 +587,7 @@ The output contains:
 - `capabilities`: purpose, responsibilities, primary paths, dependencies,
   owners, tests, and ranking score;
 - `workflows`: schema-version-2 semantic entities with name, intent, trigger,
-  inputs, outputs, invariants, participants, and source-backed evidence;
+  inputs, outputs, indexed exception conditions, participants, and source-backed evidence;
 - `change_guide`: focus-ranked starting points and verification paths.
 
 Every code evidence record contains a graph node id, node type, label, relative
@@ -573,12 +610,11 @@ The service derives the view without model calls:
 3. Detect a dominant source package and group code below that boundary into
    stable capability areas.
 4. Rank owners with graph degree and optional lexical focus matches.
-5. Assign architectural layers from package and directory roles.
+5. Assign architectural layers from indexed roles and project configuration.
 6. Resolve inter-capability dependencies from technical graph edges and local
    resolved imports.
-7. Admit workflows only from explicit endpoints, entrypoint roles, or public
-   functions and methods at interface boundaries. Focus affects ranking but
-   never turns a symbol into a workflow trigger.
+7. Select workflow triggers from indexed endpoints, explicit entrypoint roles
+   and project-configured entry conventions. Focus adjusts workflow ranking.
 8. Aggregate implementing participants from all outgoing `CALLS`,
    `HANDLES_ROUTE`, `INSTANTIATES`, and `WRAPS` evidence, then corroborate them
    with semantically aligned imported symbols referenced in implementation
@@ -592,11 +628,10 @@ Stable ids for capabilities and workflows are derived from the project and
 their graph-backed members. The projection itself is not stored, so running it
 does not change node counts, edge counts, salience, or usage.
 
-The projection evaluates every matching active node, degree-ranked node,
-lexical match, and relevant relationship in the selected project. It does not
-apply hidden per-type, hub, relationship, or per-node edge-count limits.
-Workflow membership uses a documented four-hop semantic boundary to avoid
-absorbing unrelated shared utilities into one use case.
+The projection evaluates every matching active node, lexical match and relevant
+relationship in the selected project. Workflow membership follows eligible
+indexed calls and corroborated imports through the reachable graph.
+Configure workflow names and layer precedence in [analysis settings](CONFIGURATION.md#analysis-and-report-policies).
 `max_capabilities` and `max_workflows` only control the size of the rendered
 result after the complete graph evidence has been evaluated.
 
@@ -628,8 +663,10 @@ reql project pipeline --code --out reports/
 
 `project pipeline` reads an already compiled project and writes a deterministic
 high-level flow view. It admits explicit routes, handlers, commands, public API
-boundaries, and conventional process entrypoints; if none exist, public roots
-of the call graph are marked as inferred triggers. Calls, route handling,
+boundaries, and conventional process entrypoints. When no explicit entrypoint
+exists, the export marks public roots as inferred triggers, including one
+representative for each independent cyclic flow with a public symbol. Archived
+relationships are excluded. Calls, route handling,
 instantiation, wrappers, resolved imports, writes, returns, emissions, and
 raises provide the evidence. Test-local symbols are excluded, while private
 symbols needed to connect an observed flow remain available in component
@@ -642,12 +679,13 @@ you may pass a matching `.html`/`.htm` or `.mmd`/`.mermaid` file. Relative
 explicit output paths are resolved from the current directory. Existing files
 are replaced atomically and the command prints only the absolute output path.
 
-The HTML view embeds the projection data and uses the same pinned
-`vis-network` CDN runtime as the generic graph export. It supports pan/zoom,
+The HTML view embeds the projection data and the same vis-network 10.1.5
+runtime as the generic graph export. It opens offline and supports pan/zoom,
 fit/reset, search, workflow and architectural-layer filters, and source-symbol
 inspection. Dense stages use taller columns, and long pipelines continue on
 additional rows. Mermaid output is a `flowchart LR` with shared components, observed
-outcomes, source-location comments, and dashed feedback edges. Runtime-only or
+outcomes, source-location comments, and dashed feedback edges. The HTML details
+panel lists all distinct results for the selected outcome. Runtime-only or
 dynamic paths are never invented; an observed terminal means only that static
 evidence ends there. The command does not compile missing projects or open a
 browser automatically.
@@ -659,9 +697,9 @@ reql project report --output reports/
 reql project report --output reports/ --json
 ```
 
-Reports read the graph and project-local cache metadata. The generator also
-attempts community and hub analysis. Sections without matching data show
-`No data yet`. With `--json` the command prints the generated paths as
+Reports read the graph and project-local cache metadata. The generator computes
+community and hub analysis in memory. On an uncompiled project, the report shows
+scan and cache diagnostics with empty graph sections. With `--json` the command prints the generated paths as
 `graph_report`, `graph_deltas` and `cache_report`.
 
 ### Graph report
@@ -683,8 +721,7 @@ attempts community and hub analysis. Sections without matching data show
 - `God nodes / hubs` with ranked hub score and reasons when hub analysis returns
   results;
 - generic hub warnings when analysis detects overly generic high-degree nodes;
-- memory health counts for stale, archived, and overly generic nodes, plus
-  recommended actions.
+- memory health counts for stale and archived nodes, plus recommended actions.
 
 ### Graph deltas
 
@@ -698,12 +735,12 @@ added/updated/archived edge counts, and affected node ids.
 
 - project id;
 - cached, dirty, deleted, and skipped artifact counts;
-- parser version counts;
-- chunking version counts;
-- up to 50 cache entries sorted by relative path, including status, compiled
-  timestamp, and parser version.
+- cache entries sorted by relative path, including status and the time each
+  artifact was compiled. The default display limit is 50.
 
-The report reads current cache metadata.
+The report reads current cache metadata. Markdown lists state how many items
+they omit. Use [report settings](CONFIGURATION.md#analysis-and-report-policies)
+to raise or remove display limits.
 
 ### HTML and JSON graph export
 
@@ -719,10 +756,14 @@ without an `.html` suffix receives `graph.html`. Add `--json` to write
 `graph.json` next to it, or use `--json` alone to write the complete graph to
 disk. The machine-readable export includes test nodes.
 
-The browser opens on detected entrypoints. Each click expands or collapses
+The browser opens on detected entrypoints and uses the pipeline's root
+selection for inferred entrypoints on stored workflow relationships. When no
+workflow entrypoints are available, the browser opens on the graph itself.
+Each click expands or collapses
 one depth of connected nodes. A collapsed branch remains visible where it is
 reachable through another expanded path. Test-local nodes are omitted.
-Controls include reset, fit, search, cluster filters and node details.
+Controls include reset, fit, search across the graph, cluster filters and node
+details. Search and detail budgets use the project's HTML report settings.
 See [project pipeline export](#project-pipeline-export) for the entrypoint-based
 view grouped by component.
 
@@ -740,7 +781,7 @@ reql config init
 reql config show
 ```
 
-`config init` creates a project `reql.conf` and `config show` prints
+`config init` creates a short project override file. `config show` prints all
 effective settings. `reql config set compile.documents.markdown true` updates
 a validated local option.
 

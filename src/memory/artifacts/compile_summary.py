@@ -5,10 +5,13 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Iterable
 
+from ..config.policies import TestDiscoveryPolicy
 from ..domain.models import MemoryNode
 from ..storage.graph_store import GraphStore
+from .context_scope import is_test_context_path, matches_test_case_name
 from .delta import GraphDelta
 from .revision import ProjectRevision
+from .testing_conventions import candidate_test_stems, project_test_paths, test_path_stem
 
 CODE_SYMBOL_TYPES = {"Module", "Function", "Class", "Interface", "Method", "Endpoint"}
 ASSOCIATION_EDGE_TYPES = {
@@ -23,9 +26,8 @@ ASSOCIATION_EDGE_TYPES = {
     "RETURNS",
     "TESTS",
 }
-MAX_ASSOCIATION_SEEDS = 250
-MAX_LEXICAL_TESTS = 8
 LEXICAL_ASSOCIATION_NODE_TYPES = {"Module", "Function", "Class", "Method", "Test", "SourceFragment"}
+_LEXICAL_TEST_PATH_LIMIT = 8
 _NON_SEMANTIC_SYMBOL_FIELDS = {
     "line",
     "column",
@@ -98,13 +100,19 @@ def build_compilation_summary(
     revision: ProjectRevision | None,
     delta: GraphDelta,
     previous_symbol_state: SymbolState | None = None,
+    discovery: TestDiscoveryPolicy | None = None,
 ) -> CompilationSummary:
     """Build a summary from the revision and the graph delta just persisted."""
-    changed_files = [change.to_dict() for change in revision.changes] if revision is not None else []
+    if revision is None:
+        return CompilationSummary()
+    changed_files = [change.to_dict() for change in revision.changes]
     changed_paths = {_normalize_path(str(item["path"])) for item in changed_files}
     node_status = _node_statuses(delta)
     nodes = store.get_nodes(sorted(node_status), clone=False)
-    changed_nodes = [node for node in nodes if _relative_path(node) in changed_paths]
+    changed_nodes = [
+        node for node in nodes
+        if node.properties.get("project_id") == revision.project_id and _relative_path(node) in changed_paths
+    ]
     current_symbol_state = capture_symbol_state(
         store,
         (str(item.get("artifact_id") or "") for item in changed_files),
@@ -127,7 +135,10 @@ def build_compilation_summary(
         )
     ]
     updated_symbols.sort(key=lambda item: (item.relative_path, item.line_start or 0, item.type, item.name, item.id))
-    associated_tests = _associated_tests(store, changed_paths=changed_paths, seed_nodes=changed_nodes)
+    associated_tests = _associated_tests(
+        store, revision=revision, changed_paths=changed_paths, seed_nodes=changed_nodes,
+        discovery=discovery,
+    )
     return CompilationSummary(
         changed_files=changed_files,
         updated_symbols=updated_symbols,
@@ -197,65 +208,67 @@ def _node_statuses(delta: GraphDelta) -> dict[str, str]:
 def _associated_tests(
     store: GraphStore,
     *,
+    revision: ProjectRevision,
     changed_paths: set[str],
     seed_nodes: list[MemoryNode],
+    discovery: TestDiscoveryPolicy | None,
 ) -> list[AssociatedTest]:
-    reasons: dict[str, str] = {path: "changed test file" for path in changed_paths if _is_test_path(path)}
-    source_nodes = [node for node in seed_nodes if not _is_test_path(_relative_path(node))]
-    for node in sorted(source_nodes, key=lambda item: item.id)[:MAX_ASSOCIATION_SEEDS]:
-        for _edge, neighbor in store.neighbors(
-            node.id,
-            direction="both",
-            edge_types=ASSOCIATION_EDGE_TYPES,
-            limit=200,
-        ):
-            path = _relative_path(neighbor)
-            if _is_test_path(path):
-                reasons.setdefault(path, "direct graph relationship")
+    """Find test evidence within the project that produced the revision."""
+    if not changed_paths:
+        return []
+    project_id = revision.project_id
+    test_paths = set(project_test_paths(store, project_id))
+    changed_tests = {path for path in changed_paths if path in test_paths
+                     or (path not in revision.manifest and is_test_context_path(path, discovery))}
+    reasons = dict.fromkeys(changed_tests, "changed test file")
+    sources = changed_paths - changed_tests
+    source_nodes = [node for node in seed_nodes if _relative_path(node) in sources]
+    source_ids = {node.id for node in source_nodes}
+    neighbors = {
+        other for edge in store.incident_edges(sorted(source_ids), edge_types=ASSOCIATION_EDGE_TYPES,
+                                               limit=None, clone=False)
+        if edge.properties.get("status") != "archived"
+        for other in (edge.from_id, edge.to_id) if other not in source_ids
+    } if source_ids else set()
+    for neighbor in store.get_nodes(sorted(neighbors), clone=False):
+        path = _relative_path(neighbor)
+        if neighbor.status == "active" and neighbor.properties.get("project_id") == project_id and path in test_paths:
+            reasons.setdefault(path, "direct graph relationship")
 
-    for path in sorted(changed_paths):
-        for candidate in _conventional_test_paths(path):
-            if candidate in reasons:
-                continue
-            if store.find_nodes_by_property("relative_path", candidate, status="active", limit=1, clone=False):
-                reasons[candidate] = "matching test filename"
+    stems = {stem for path in sources for stem in candidate_test_stems(path)}
+    for path in test_paths:
+        if test_path_stem(path) in stems:
+            reasons.setdefault(path, "matching test filename")
 
-    terms = _association_terms(changed_paths, source_nodes)
+    terms = _association_terms(sources, source_nodes)
     if terms:
         lexical_tests = 0
         for node, _score in store.lexical_search(
             " ".join(terms),
-            top_k=100,
+            top_k=None,
             node_types=LEXICAL_ASSOCIATION_NODE_TYPES,
+            project_id=project_id,
+            clone=False,
         ):
             path = _relative_path(node)
-            if not _is_test_path(path) or path in reasons or not _node_matches_terms(node, terms):
+            if path not in test_paths or path in reasons or not _node_matches_terms(node, terms):
                 continue
             reasons[path] = "changed symbol match"
             lexical_tests += 1
-            if lexical_tests >= MAX_LEXICAL_TESTS:
+            if lexical_tests >= _LEXICAL_TEST_PATH_LIMIT:
                 break
 
     return [AssociatedTest(path=path, reason=reasons[path]) for path in sorted(reasons)]
 
 
-def _conventional_test_paths(path: str) -> tuple[str, ...]:
-    normalized = _normalize_path(path)
-    if _is_test_path(normalized):
-        return ()
-    stem = PurePosixPath(normalized).stem
-    if not stem or stem == "__init__":
-        return ()
-    return (f"tests/test_{stem}.py", f"test/test_{stem}.py")
-
-
-def _association_terms(changed_paths: set[str], nodes: list[MemoryNode]) -> list[str]:
-    terms = {PurePosixPath(path).stem for path in changed_paths if not _is_test_path(path)}
+def _association_terms(paths: set[str], nodes: list[MemoryNode]) -> list[str]:
+    """Collect deterministic lexical terms from changed source paths and symbols."""
+    terms = {PurePosixPath(path).stem for path in paths}
     for node in nodes:
         if node.type not in CODE_SYMBOL_TYPES:
             continue
         name = _symbol_name(node).rsplit(".", 1)[-1].strip("_")
-        if len(name) >= 4 and not name.startswith("test_"):
+        if len(name) >= 4 and not matches_test_case_name(name):
             terms.add(name)
     return sorted(terms)[:40]
 
@@ -293,9 +306,4 @@ def _line_start(node: MemoryNode) -> int | None:
 
 
 def _normalize_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
-
-
-def _is_test_path(path: str) -> bool:
-    normalized = _normalize_path(path)
-    return normalized.startswith(("tests/", "test/"))
+    return path.replace("\\", "/").removeprefix("./")

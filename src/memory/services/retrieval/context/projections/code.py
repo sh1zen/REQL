@@ -3,40 +3,33 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from .....artifacts.context_scope import is_test_context_path
+from .....artifacts.context_scope import (
+    application_surface_kind, is_documentation_context, is_documentation_path, is_test_context, is_test_context_path,
+)
 from .....artifacts.revision import ProjectRevision
+from .....artifacts.text_encoding import decode_text
+from .....domain.constants import INACTIVE_STATUSES
 from .....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from .....domain.query_context import SeenSourceRange
 from .....extraction.normalization import canonicalize, tokenize
-from .....testing import TestIntelligenceService
 from ...common import (
-    CALLER_EDGE_TYPES,
     CODE_CONTEXT_EDGE_TYPES,
     CODE_CONTEXT_NODE_TYPES,
-    PUBLIC_SURFACE_EDGE_TYPES,
-    QUERY_CONTEXT_MAX_RENDERED_FILES,
+    FIELD_REFERENCE_PATTERN,
     QUERY_CONTEXT_MODES,
     QUERY_CONTEXT_SCOPES,
     SOURCE_NODE_TYPES,
-    SERIALIZATION_EDGE_TYPES,
     TECHNICAL_NODE_TYPES,
-    _code_context_query_tokens,
-    _expanded_tokens,
+    source_contract_references,
+    source_symbol_references,
 )
+from ...search import symbol_lookup_key
 from ..models import QueryProfile
-from ..source import _read_bounded_source, capture_source_excerpts, locate_linked_section
-
-
-_CONTRACT_REFERENCE = re.compile(
-    r"\b((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)(?=\s*\()|\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\b",
-)
-_CONTRACT_IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*\b")
-_MAX_CONTRACT_LOOKUPS = 8
-_MAX_CONTRACT_MATCHES = 16
-_MAX_CONTRACT_READS = 3
-_MAX_CONTRACT_LINES = 24
+from ..source import _read_source_file, capture_source_excerpts, locate_linked_section
 
 
 class CodeContextProjectionMixin:
@@ -47,16 +40,27 @@ class CodeContextProjectionMixin:
         query_mode: str,
         max_items: int,
         include_source: bool = False,
+        include_previews: bool = True,
         brief: bool = False,
         source_snapshots: dict[str, dict[str, Any]] | None = None,
         source_revisions: dict[str, ProjectRevision | None] | None = None,
+        seen_source: Sequence[SeenSourceRange] = (),
     ) -> dict[str, Any]:
         compact_items = min(max_items, 6)
         ranked = [item for item in subgraph.ranked_nodes if self._is_code_context_node(item.node)]
+        exact_paths: tuple[str, ...] = ()
+        if brief and not include_source and query_mode == "informative":
+            exact_paths = subgraph.exact_paths
+            if exact_paths:
+                ranked = [item for item in ranked if self._node_relative_path(item.node) in exact_paths]
+        include_secondary = self._includes_secondary_context(subgraph)
         path_rows = self._code_working_set_rows(
             ranked, list(subgraph.nodes), query_text=subgraph.query.text, max_items=max_items,
             edges=subgraph.edges if query_mode == "informative" else (),
+            cleanup=query_mode == "cleanup", include_secondary=include_secondary,
         )
+        if exact_paths:
+            path_rows = [row for row in path_rows if row["path"] in exact_paths]
         working_paths = {str(row["path"]) for row in path_rows}
         owner_candidates = self._code_owner_candidates(ranked, subgraph, working_paths, max_items=max_items)
         owner_candidate_ids = {str(item["id"]) for item in owner_candidates}
@@ -85,40 +89,46 @@ class CodeContextProjectionMixin:
         if query_mode == "cleanup":
             cleanup_reads = self._code_cleanup_targeted_reads(cleanup_candidates, subgraph, working_paths, max_items=compact_items)
             targeted_reads = self._merge_targeted_reads(cleanup_reads, max_items=max(compact_items * 4, 12))
-            snippets = [] if include_source else self._code_snippet_payload(targeted_reads, subgraph, max_items=max_items)
+            snippets = [] if include_source or not include_previews else self._code_snippet_payload(
+                targeted_reads, subgraph, max_items=max_items,
+            )
         else:
-            targeted_reads = self._code_targeted_reads(display_ranked, subgraph, working_paths, query_text=subgraph.query.text, max_items=compact_items)
-            snippets = [] if include_source or brief else self._code_informative_snippet_payload(
+            targeted_reads = self._code_targeted_reads(
+                display_ranked, subgraph, working_paths, include_secondary=include_secondary, max_items=max_items,
+            )
+            snippets = [] if include_source or brief or not include_previews else self._code_informative_snippet_payload(
                 targeted_reads,
                 subgraph,
-                path_rows=path_rows,
                 max_items=max_items,
             )
         linked_section = None
         if include_source:
             snippets = capture_source_excerpts(
                 self.store, targeted_reads, snapshots=source_snapshots, revisions=source_revisions,
+                seen_source=seen_source,
             )
-        elif brief and query_mode == "informative":
+        elif brief and query_mode == "informative" and not exact_paths:
             focused = self._brief_source_owners(subgraph, display_ranked, owner_candidates)
             candidates = [
                 row for row in targeted_reads if row["node_id"] in focused
-                and type(row["line_end"]) is int and row["line_end"] - row["line_start"] < 32
             ]
             if candidates:
                 snapshots = {} if source_snapshots is None else source_snapshots
                 revisions = {} if source_revisions is None else source_revisions
                 snippets = capture_source_excerpts(
                     self.store, candidates, complete_only=True, snapshots=snapshots, revisions=revisions,
+                    max_chars=self.policy.source.brief_max_source_chars,
+                    seen_source=seen_source,
                 )
-                linked_section = locate_linked_section(
-                    self.store, snippets, snapshots=snapshots, revisions=revisions,
-                )
+                if subgraph.query.context_scopes != {"test"}:
+                    linked_section = locate_linked_section(
+                        self.store, snippets, snapshots=snapshots, revisions=revisions,
+                    )
         cleanup_plan = self._code_cleanup_plan_lines(cleanup_candidates, path_rows, max_items=compact_items) if query_mode == "cleanup" else []
         contracts = self._code_contract_payload(display_ranked, subgraph, working_paths, max_items=compact_items)
         impact = self._code_impact_payload(subgraph, owner_candidates, working_paths, max_items=compact_items)
         test_targets = self._code_test_targets(
-            subgraph, path_rows, query_text=subgraph.query.text, max_items=max_items,
+            subgraph, path_rows, exact_paths=exact_paths, include_secondary=include_secondary, max_items=max_items,
         )
         read_plan = self._code_read_plan_payload(targeted_reads, snippets=snippets, max_items=max_items)
         change_chain = self._code_change_chain_payload(
@@ -142,6 +152,7 @@ class CodeContextProjectionMixin:
         )
         return {
             "kind": "code",
+            **({"exact_paths": list(exact_paths)} if exact_paths else {}),
             "query": subgraph.query.text,
             "query_mode": query_mode,
             "cleanup_filter": self._cleanup_filter_payload(
@@ -156,7 +167,7 @@ class CodeContextProjectionMixin:
             "working_set": self._code_working_set_payload(
                 path_rows,
                 query_mode=query_mode,
-                max_items=min(max_items, QUERY_CONTEXT_MAX_RENDERED_FILES),
+                max_items=max_items,
             ),
             "contracts": contracts,
             "impact": impact,
@@ -183,17 +194,16 @@ class CodeContextProjectionMixin:
         ranked: Sequence[RankedNode],
         owners: Sequence[dict[str, Any]],
     ) -> set[str]:
-        """Embed small bodies only when lookup intent narrows to one or two owners."""
+        """Select complete bodies when the lookup has strong owner evidence."""
         query = subgraph.query.text.strip()
-        term = {query.casefold()}
+        term = {symbol_lookup_key(query)}
         exact = {item.node.id for item in subgraph.ranked_nodes if self._exact_symbol_match(item.node, term)}
         if exact:
             return {item.node.id for item in ranked if item.node.id in exact and item.score >= 0.65} if len(exact) == 1 else set()
         query_terms = set(tokenize(query))
         if not 2 <= len(query_terms) <= 5 or not owners:
             return set()
-        # Nearby functions in the same file should not exhaust the brief's
-        # owner budget. Pick the strongest directly matched span per file.
+        # Pick the strongest directly matched span per file.
         direct_by_path = {}
         for owner in owners:
             if owner["reason"] == "direct query match":
@@ -204,7 +214,7 @@ class CodeContextProjectionMixin:
             if owner["score"] >= max(0.95, lead["score"] - 0.15)
         }
         if focused:
-            return focused if len(focused) <= 2 else set()
+            return focused
         # Compound requests can dilute the absolute score of their strongest
         # code match. Use its separation from the other owners and still verify
         # the source on disk before embedding it.
@@ -215,35 +225,32 @@ class CodeContextProjectionMixin:
         return set()
 
     def assigned_exact_reads(
-        self, query: str, files: Sequence[str], revision: ProjectRevision,
+        self, query: MemoryQuery, files: Sequence[str], revision: ProjectRevision,
     ) -> list[dict[str, Any]]:
-        """Select bounded, unambiguous named symbols inside the assigned files."""
+        """Select unambiguous named symbols inside the assigned files."""
         paths = set(files) & revision.manifest.keys()
         if not paths:
             return []
         # Keep qualified references as one lookup and match standalone names as written.
-        references = dict.fromkeys(re.findall(r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", query))
+        references = dict.fromkeys(source_symbol_references(query.text))
+        scopes = query.context_scopes
         reads: dict[str, dict[str, Any]] = {}
-        for reference in list(references)[:8]:
-            name = reference.rsplit(".", 1)[-1]
+        for reference in references:
+            qualified_reference = reference.replace("::", ".")
+            name = qualified_reference.rsplit(".", 1)[-1]
+            key = symbol_lookup_key(qualified_reference, ignore_case=False)
             matches = []
-            for kind in ("Function", "Method", "Class", "Interface", "Variable"):
-                nodes = self.store.find_nodes_by_property(
-                    "name", name, type_=kind, limit=_MAX_CONTRACT_MATCHES + 1, clone=False,
-                )
-                if len(nodes) > _MAX_CONTRACT_MATCHES:
-                    matches = []
-                    break
-                for node in nodes:
-                    props = node.properties
-                    path = props.get("relative_path")
-                    if (node.status != "active" or path not in paths
-                            or props.get("artifact_id") != revision.manifest[path]["artifact_id"]
-                            or props.get("ambiguous_declaration") or self._is_generated_context_path(path)):
-                        continue
-                    qualified = str(props.get("qualified_name") or "")
-                    if "." not in reference or qualified == reference or qualified.endswith(f".{reference}"):
-                        matches.append(node)
+            for node in self._named_symbol_nodes(name, ("Function", "Method", "Class", "Interface", "Variable")):
+                props = node.properties
+                path = props.get("relative_path")
+                if (node.status != "active" or path not in paths
+                        or props.get("artifact_id") != revision.manifest[path]["artifact_id"]
+                        or (scopes and not self._node_matches_query_context_scope(node, scopes))
+                        or props.get("ambiguous_declaration") or self._is_generated_context_path(path)):
+                    continue
+                qualified = symbol_lookup_key(str(props.get("qualified_name") or ""), ignore_case=False)
+                if name == qualified_reference or qualified == key or qualified.endswith(f".{key}"):
+                    matches.append(node)
             if len(matches) != 1:
                 continue
             node = matches[0]
@@ -251,9 +258,13 @@ class CodeContextProjectionMixin:
             if type(start) is int and type(end) is int and 0 < start <= end:
                 reads[node.id] = {"path": node.properties["relative_path"], "node_id": node.id,
                                   "line_start": start, "line_end": end, "label": reference}
-            if len(reads) == 3:
-                break
-        return list(reads.values())
+        # The explicitly named inner definition is more useful than its containing body.
+        return [row for row in reads.values() if not any(
+            inner["path"] == row["path"] and row["line_start"] <= inner["line_start"]
+            and inner["line_end"] <= row["line_end"]
+            and (row["line_start"], row["line_end"]) != (inner["line_start"], inner["line_end"])
+            for inner in reads.values()
+        )]
 
     def assigned_source_read(
         self, query: str, files: Sequence[str], revision: ProjectRevision, shown: Sequence[dict[str, Any]],
@@ -273,18 +284,14 @@ class CodeContextProjectionMixin:
             if path in covered:
                 return None
             targets.append((path, artifact.id))
-            if len(targets) > 3:
-                return None
-        terms = _code_context_query_tokens(query)
+        terms = set(self._search_tokens(query))
         if not targets or not terms:
             return None
         exact_term = {query.strip().casefold()}
         best_score = (False, 0)
         best: tuple[str, MemoryNode] | None = None
         for path, artifact_id in targets:
-            definitions = self.store.get_edges(from_id=artifact_id, type_="DEFINES", limit=65, clone=False)
-            if len(definitions) == 65:
-                return None  # Uninspected definitions could be better matches.
+            definitions = self.store.get_edges(from_id=artifact_id, type_="DEFINES", limit=None, clone=False)
             for node in self.store.get_nodes([edge.to_id for edge in definitions], clone=False):
                 if (node.status != "active" or node.properties.get("artifact_id") != artifact_id
                         or node.type not in {"Function", "Method", "Class", "Interface"}):
@@ -308,7 +315,7 @@ class CodeContextProjectionMixin:
         self, snippets: Sequence[dict[str, Any]], paths: set[str], instructions: str,
     ) -> dict[str, Any] | None:
         """Recover the leading declaration of an explicitly named containing type."""
-        names = set(re.findall(r"\b[A-Za-z_][A-Za-z_0-9]*\b", instructions))
+        names = set(source_symbol_references(instructions, qualified=False))
         for row in snippets:
             if row.get("type") != "Method" or row.get("path") not in paths or not row.get("text"):
                 continue
@@ -319,9 +326,9 @@ class CodeContextProjectionMixin:
             if (parent is None or parent.status != "active" or parent.properties.get("name") not in names
                     or parent.properties.get("artifact_id") != row.get("artifact_id")):
                 continue
-            methods = self.store.get_edges(from_id=parent.id, type_="METHOD", limit=65, clone=False)
+            methods = self.store.get_edges(from_id=parent.id, type_="METHOD", limit=None, clone=False)
             starts = [edge.properties.get("line_start") for edge in methods]
-            if not starts or len(starts) == 65 or any(type(line) is not int for line in starts):
+            if not starts or any(type(line) is not int for line in starts):
                 continue
             start, _ = self._line_span(parent)
             end = min(starts) - 1
@@ -341,21 +348,11 @@ class CodeContextProjectionMixin:
         candidates: dict[tuple[str, tuple[str, ...]], list[MemoryNode]] = {}
 
         def resolve(reference: str, kinds: tuple[str, ...], paths: set[str] | None = None) -> MemoryNode | None:
+            reference = symbol_lookup_key(reference, ignore_case=False)
             name = reference.rsplit(".", 1)[-1]
             key = (name, kinds)
             if key not in candidates:
-                if len(candidates) >= _MAX_CONTRACT_LOOKUPS:
-                    return None
-                matches = []
-                for kind in kinds:
-                    found = self.store.find_nodes_by_property(
-                        "name", name, type_=kind, limit=_MAX_CONTRACT_MATCHES + 1, clone=False,
-                    )
-                    if len(found) > _MAX_CONTRACT_MATCHES:
-                        matches = []  # An uninspected declaration might be an exact match.
-                        break
-                    matches.extend(found)
-                candidates[key] = matches
+                candidates[key] = self._named_symbol_nodes(name, kinds)
             matches = []
             for node in candidates[key]:
                 props = node.properties
@@ -367,7 +364,7 @@ class CodeContextProjectionMixin:
                         or (paths is not None and path not in paths)
                         or self._is_generated_context_path(path)):
                     continue
-                qualified = props.get("qualified_name", "")
+                qualified = symbol_lookup_key(str(props.get("qualified_name") or ""), ignore_case=False)
                 if "." not in reference or qualified == reference or qualified.endswith(f".{reference}"):
                     matches.append(node)
             return matches[0] if len(matches) == 1 else None
@@ -375,7 +372,7 @@ class CodeContextProjectionMixin:
         def add(node: MemoryNode) -> None:
             start, end = self._line_span(node)
             path = node.properties["relative_path"]
-            if (start is not None and end is not None and 0 <= end - start < _MAX_CONTRACT_LINES
+            if (start is not None and end is not None and 0 < start <= end
                     and not any(lo <= start and end <= hi for lo, hi in covered.get(path, ()))):
                 reads[node.id] = {"path": path, "node_id": node.id, "line_start": start, "line_end": end}
 
@@ -384,32 +381,26 @@ class CodeContextProjectionMixin:
             if not paths:
                 continue
             text = f"{record['content']}\n{record['rationale']}\n{record['next_action']}"
-            named = set(_CONTRACT_IDENTIFIER.findall(text))
-            mentions = _CONTRACT_REFERENCE.findall(text)
-            references = dict.fromkeys([*(call for call, _ in mentions if call),
-                                        *(qualified for _, qualified in mentions if qualified)])
+            named = {symbol_lookup_key(value, ignore_case=False) for value in source_symbol_references(text, qualified=False)}
+            references = dict.fromkeys(source_contract_references(text))
             for reference in references:
                 node = resolve(reference, ("Function", "Method"), paths)
                 if node is None:
                     continue
                 add(node)
-                for name in dict.fromkeys(_CONTRACT_IDENTIFIER.findall(str(node.properties.get("returns") or ""))):
-                    if name not in named:
+                returns = str(node.properties.get("returns") or "")
+                for name in dict.fromkeys(source_symbol_references(returns, qualified=False)):
+                    if symbol_lookup_key(name, ignore_case=False) not in named:
                         continue
                     declaration = resolve(name, ("Class", "Interface"))
                     if declaration is not None:
                         add(declaration)
-                if len(reads) >= _MAX_CONTRACT_READS:
-                    return list(reads.values())[:_MAX_CONTRACT_READS]
         return list(reads.values())
 
     def _code_data_trace_payload(self, subgraph: MemorySubgraph, *, max_items: int) -> list[dict[str, Any]]:
         """Project a dotted field query into an ordered, cross-layer source chain."""
 
-        matches = re.findall(
-            r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])",
-            subgraph.query.text,
-        )
+        matches = FIELD_REFERENCE_PATTERN.findall(subgraph.query.text)
         if not matches:
             return []
         # A whole indexed path already has exact-file intent. Its extension is
@@ -417,88 +408,97 @@ class CodeContextProjectionMixin:
         if any(self._node_matches_exact_query_path(item.node, subgraph.query.text) for item in subgraph.ranked_nodes):
             return []
         family, field_name = matches[-1]
-        family_folded = family.casefold()
+        family_tokens = set(self._search_tokens(self._search_identifier_text(family)))
         field_folded = field_name.casefold()
         ordered_nodes: OrderedDict[str, MemoryNode] = OrderedDict(
             (node.id, node)
             for node in [*(item.node for item in subgraph.ranked_nodes), *subgraph.nodes]
         )
-        trace_query = MemoryQuery(
-            text=subgraph.query.text,
-            top_k=max(20, max_items * 2),
-            max_depth=0,
-            include_archived=subgraph.query.include_archived,
-            context_scopes=subgraph.query.context_scopes,
-            store_trace=False,
-        )
+        trace_query = replace(subgraph.query, max_depth=0, store_trace=False)
         scopes = set(subgraph.query.context_scopes or {"code", "test"}) & {"code", "test"}
         for node, _score in self._scoped_lexical_search(
             trace_query,
             self._query_profile(subgraph.query.text),
             lexical_node_types=("SourceFragment",),
             scopes=scopes or {"code", "test"},
-            top_k=trace_query.top_k,
         ):
             ordered_nodes.setdefault(node.id, node)
-        selected: set[str] = set()
         field_ids: set[str] = set()
-        exact = f"{family}.{field_name}".casefold()
+        reference_ids: set[str] = set()
+        exact = (family.casefold(), field_folded)
         for node in ordered_nodes.values():
-            if node.type == "SourceFragment" and exact in str(node.text or "").casefold():
-                selected.add(node.id)
+            if node.type == "SourceFragment" and exact in FIELD_REFERENCE_PATTERN.findall(str(node.text or "").casefold()):
+                reference_ids.add(node.id)
                 continue
             if node.type != "Variable" or str(node.properties.get("name") or "").casefold() != field_folded:
                 continue
-            parent = str(node.properties.get("parent_qualified_name") or "").rsplit(".", 1)[-1].casefold()
-            if family_folded in parent:
-                selected.add(node.id)
+            parent = str(node.properties.get("parent_qualified_name") or "")
+            short_parent = parent.rsplit(".", 1)[-1]
+            if "." in family:
+                parent_matches = parent.casefold() == family.casefold() or parent.casefold().endswith("." + family.casefold())
+            else:
+                parent_tokens = self._search_tokens(self._search_identifier_text(short_parent))
+                parent_matches = short_parent.casefold() == family.casefold() or bool(
+                    family_tokens and family_tokens.issubset(parent_tokens)
+                )
+            if parent_matches:
                 field_ids.add(node.id)
 
         if not field_ids:
             return []
 
         relation_by_node: dict[str, str] = {}
-        frontier = set(selected)
-        visited = set(selected)
-        for _ in range(max(1, int(subgraph.query.max_depth))):
-            if not frontier:
-                break
+        frontier = field_ids | reference_ids
+        depth_by_node = dict.fromkeys(frontier, 0)
+        serialization_edges = set(self.policy.explore.serialization_edges)
+        max_depth = subgraph.query.max_depth
+        depth = 0
+        while serialization_edges and frontier and (max_depth is None or depth < max_depth):
+            depth += 1
             next_frontier: set[str] = set()
-            for edge in self.store.incident_edges(
+            edges = self.store.incident_edges(
                 sorted(frontier),
-                edge_types=SERIALIZATION_EDGE_TYPES,
-                limit=max(1000, max_items * 100),
-            ):
-                other_id = edge.to_id if edge.from_id in frontier else edge.from_id if edge.to_id in frontier else ""
-                if not other_id:
+                edge_types=serialization_edges,
+                limit=None,
+            )
+            for edge in sorted(edges, key=lambda edge: (edge.type, edge.id)):
+                if not subgraph.query.include_archived and edge.properties.get("status") in INACTIVE_STATUSES:
+                    continue
+                other_id = edge.to_id if edge.from_id in frontier else edge.from_id
+                if other_id in depth_by_node:
                     continue
                 node = ordered_nodes.get(other_id) or self.store.get_node(other_id)
                 if node is None or (node.type not in CODE_CONTEXT_NODE_TYPES and node.type not in SOURCE_NODE_TYPES):
                     continue
+                if not trace_query.allows_project(node):
+                    continue
+                if scopes == {"test"} and not self._node_matches_query_context_scope(node, scopes):
+                    continue
+                if not subgraph.query.include_archived and node.status in INACTIVE_STATUSES:
+                    continue
                 ordered_nodes.setdefault(node.id, node)
-                relation_by_node.setdefault(node.id, edge.type)
-                if other_id not in visited:
-                    visited.add(other_id)
-                    next_frontier.add(other_id)
+                relation_by_node[node.id] = edge.type
+                depth_by_node[node.id] = depth
+                next_frontier.add(node.id)
             frontier = next_frontier
-        selected.update(visited)
 
         rows: list[dict[str, Any]] = []
-        seen_locations: set[tuple[str, int | None, str]] = set()
-        for node_id in selected:
-            node = ordered_nodes.get(node_id)
-            if node is None:
-                continue
+        for node_id in depth_by_node:
+            node = ordered_nodes[node_id]
             path = self._node_relative_path(node)
             if not path:
                 continue
             line_start = self._optional_int(node.properties.get("line_start") or node.properties.get("start_line"))
             line_end = self._optional_int(node.properties.get("line_end") or node.properties.get("end_line"))
-            stage, stage_order = self._data_trace_stage(path, self._node_label(node))
-            key = (path, line_start, stage)
-            if key in seen_locations:
-                continue
-            seen_locations.add(key)
+            relation = relation_by_node.get(node_id)
+            if is_test_context(node.type, node.properties, path):
+                stage, order = "test/fixture", 3
+            elif node_id in field_ids:
+                stage, order = "field declaration", 0
+            elif relation is None:
+                stage, order = "field reference", 1
+            else:
+                stage, order = relation.casefold().replace("_", " "), 2
             rows.append(
                 {
                     "stage": stage,
@@ -508,14 +508,18 @@ class CodeContextProjectionMixin:
                     "node_id": node.id,
                     "type": node.type,
                     "label": self._node_label(node),
-                    "relation": relation_by_node.get(node.id),
-                    "_order": stage_order,
+                    "relation": relation,
+                    "_order": order,
                 }
             )
-        rows.sort(key=lambda row: (int(row["_order"]), str(row["path"]), int(row["line_start"] or 0), str(row["label"])))
+        rows.sort(key=lambda row: (
+            row["_order"], depth_by_node[row["node_id"]], row["path"], row["line_start"] or 0, row["node_id"],
+        ))
+        locations = {}
         for row in rows:
             row.pop("_order", None)
-        return rows[:max_items] if len({row["stage"] for row in rows}) >= 2 else []
+            locations.setdefault((row["path"], row["line_start"], row["stage"]), row)
+        return list(locations.values())[:max_items] if len({row["stage"] for row in rows}) >= 2 else []
 
     @staticmethod
     def _optional_int(value: object) -> int | None:
@@ -523,28 +527,6 @@ class CodeContextProjectionMixin:
             return int(value) if value is not None else None
         except (TypeError, ValueError):
             return None
-
-    @staticmethod
-    def _data_trace_stage(path: str, label: str) -> tuple[str, int]:
-        normalized_path = path.replace("\\", "/").casefold()
-        value = f"{normalized_path} {label.casefold()}"
-        if normalized_path.startswith(("tests/", "test/")) or "fixture" in value:
-            return "test/fixture", 70
-        if "prompt" in value:
-            return "prompt", 0
-        if "wire" in value or "transport" in value or "dto" in value:
-            return "wire model", 10
-        if "validat" in value or "normaliz" in value:
-            return "validation", 20
-        if "persist" in value or "record" in value or "storage" in value:
-            return "persisted model", 30
-        if "graph" in value and ("project" in value or "projection" in value):
-            return "graph projection", 40
-        if "reconcil" in value or "merge" in value:
-            return "reconciliation", 50
-        if "openapi" in value or "swagger" in value:
-            return "OpenAPI compiler", 60
-        return "data flow", 35
 
     def _code_read_plan_payload(
         self,
@@ -657,16 +639,19 @@ class CodeContextProjectionMixin:
         ranked = [item for item in subgraph.ranked_nodes if self._is_code_context_node(item.node)]
         if not ranked:
             return False
-        rows = self._code_working_set_rows(ranked, list(subgraph.nodes), query_text=subgraph.query.text, max_items=max_items)
+        rows = self._code_working_set_rows(
+            ranked, list(subgraph.nodes), query_text=subgraph.query.text, max_items=max_items,
+            include_secondary=self._includes_secondary_context(subgraph),
+        )
         if not rows:
             return False
         return not (
-            all(is_test_context_path(str(row.get("path") or "")) for row in rows)
+            all(is_test_context_path(str(row.get("path") or ""), self.test_discovery) for row in rows)
             and self._has_direct_general_evidence(subgraph)
         )
 
     def _has_direct_general_evidence(self, subgraph: MemorySubgraph) -> bool:
-        query_tokens = set(_expanded_tokens(subgraph.query.text))
+        query_tokens = set(self._search_tokens(subgraph.query.text))
         if not query_tokens:
             return False
         nodes: OrderedDict[str, MemoryNode] = OrderedDict((item.node.id, item.node) for item in subgraph.ranked_nodes)
@@ -676,7 +661,7 @@ class CodeContextProjectionMixin:
             if node.type in TECHNICAL_NODE_TYPES or self._is_code_context_node(node):
                 continue
             searchable = " ".join(part for part in (node.label, node.text, node.canonical_key) if part)
-            if query_tokens & set(_expanded_tokens(searchable)):
+            if query_tokens & set(self._search_tokens(searchable)):
                 return True
         return False
 
@@ -688,11 +673,11 @@ class CodeContextProjectionMixin:
         query_text: str,
         max_items: int,
         edges: Sequence[MemoryEdge] = (),
+        cleanup: bool = False,
+        include_secondary: bool = False,
     ) -> list[dict[str, Any]]:
         rows: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        query_tokens = _code_context_query_tokens(query_text)
-        raw_query_tokens = set(tokenize(query_text))
-        cleanup_query = bool(raw_query_tokens & {"cleanup", "dead", "delete", "remove", "removal", "unused"})
+        query_tokens = set(self._search_tokens(query_text))
 
         def add(node: MemoryNode, score: float, *, edit_candidate: bool = False, reason: str | None = None) -> None:
             path = self._node_relative_path(node)
@@ -715,9 +700,6 @@ class CodeContextProjectionMixin:
             if node.id not in row["node_ids"]:
                 row["node_ids"].append(node.id)
             line_start, line_end = self._line_span(node)
-            if line_start is not None and line_end is not None and line_end - line_start > 160:
-                line_start = None
-                line_end = None
             if line_start is not None:
                 row["line_start"] = line_start if row["line_start"] is None else min(int(row["line_start"]), line_start)
             if line_end is not None:
@@ -735,9 +717,10 @@ class CodeContextProjectionMixin:
             direct = float(item.reasons.get("match_score", 0.0) or 0.0)
             if direct >= 0.04 or (item.node.type == "StaticAnalysisFinding" and direct > 0.0):
                 overlap = self._owner_query_overlap(item.node, query_tokens)
-                if overlap <= 0 and not (item.node.type == "StaticAnalysisFinding" and cleanup_query):
+                exact = bool(item.reasons.get("exact_match"))
+                if not exact and overlap <= 0 and not (item.node.type == "StaticAnalysisFinding" and cleanup):
                     continue
-                actionable_overlap = self._is_actionable_owner_overlap(overlap, query_tokens)
+                actionable_overlap = exact or self._is_actionable_owner_overlap(overlap, query_tokens)
                 edit_candidate = item.node.type == "StaticAnalysisFinding" or (
                     item.node.type in {"Module", "Function", "Class", "Interface", "Method", "Endpoint", "Schema", "Config", "Test"}
                     and actionable_overlap
@@ -763,7 +746,7 @@ class CodeContextProjectionMixin:
             if (
                 self._is_owner_symbol_node(node)
                 and self._is_actionable_owner_overlap(overlap, query_tokens)
-                and (not secondary or self._query_requests_secondary_code_context(query_text))
+                and (not secondary or include_secondary)
             ):
                 add(node, 0.30 + min(0.12, overlap * 0.03), edit_candidate=not secondary, reason="owner/query overlap")
 
@@ -783,7 +766,7 @@ class CodeContextProjectionMixin:
                 for edge in edges:
                     if edge.properties.get("relation") != "shared_surface_identifier" or edge.properties.get("status") == "archived":
                         continue
-                    if not any(query_tokens.intersection(_expanded_tokens(value)) for value in edge.properties.get("identifiers", [])):
+                    if not any(query_tokens.intersection(self._search_tokens(value)) for value in edge.properties.get("identifiers", [])):
                         continue
                     left, right = by_id.get(edge.from_id), by_id.get(edge.to_id)
                     if left is None or right is None:
@@ -800,17 +783,16 @@ class CodeContextProjectionMixin:
         }
         ordered.sort(key=lambda row: row["path"] not in essential)
         primary_rows = [row for row in ordered if row["edit_candidate"] and not self._is_secondary_code_path(str(row["path"]))]
-        if primary_rows and not self._query_requests_secondary_code_context(query_text):
+        if primary_rows and not include_secondary:
             primary_paths = {str(row["path"]) for row in primary_rows}
             ordered = [
                 row
                 for row in ordered
                 if str(row["path"]) in primary_paths
-                or (bool(row["edit_candidate"]) and self._is_application_surface_path(str(row["path"])))
+                or (bool(row["edit_candidate"]) and application_surface_kind(str(row["path"])) is not None)
             ]
-        if not cleanup_query:
-            essential_count = sum(row["path"] in essential for row in ordered)
-            return ordered[:min(max_items, max(4, essential_count))]
+        if not cleanup:
+            return ordered[:max_items]
         return ordered[: max(max_items, 8)]
 
     def _code_owner_candidates(
@@ -861,13 +843,12 @@ class CodeContextProjectionMixin:
                 }
             )
         candidates.sort(key=lambda item: (not self._is_secondary_code_path(str(item.get("path") or "")), float(item["score"])), reverse=True)
-        return candidates[: min(max_items, 3)]
+        return candidates[:max_items]
 
-    @classmethod
-    def _owner_query_overlap(cls, node: MemoryNode, query_tokens: set[str]) -> int:
+    def _owner_query_overlap(self, node: MemoryNode, query_tokens: set[str]) -> int:
         if not query_tokens:
             return 0
-        node_tokens = set(_expanded_tokens(cls._node_search_text(node)))
+        node_tokens = set(self._search_tokens(self._node_search_text(node)))
         return len(query_tokens & node_tokens)
 
     @staticmethod
@@ -876,19 +857,27 @@ class CodeContextProjectionMixin:
             return False
         return len(query_tokens) < 4 or overlap >= 2
 
-    @staticmethod
-    def _is_secondary_code_path(path: str) -> bool:
-        normalized = path.replace("\\", "/").casefold()
-        return normalized.startswith(("tests/", "docs/")) or normalized == "readme.md" or "/docs/" in normalized
+    def _is_secondary_code_path(self, path: str) -> bool:
+        return is_test_context_path(path, self.test_discovery) or is_documentation_path(path)
 
     def _is_application_surface_node(self, node: MemoryNode) -> bool:
         path = self._node_relative_path(node) or ""
-        return bool(path and self._is_application_surface_path(path))
+        return application_surface_kind(path) is not None
 
-    @staticmethod
-    def _query_requests_secondary_code_context(query_text: str) -> bool:
-        tokens = set(tokenize(query_text))
-        return bool(tokens & {"test", "tests", "testing", "unittest", "pytest", "spec", "docs", "doc", "documentation", "readme"})
+    def _includes_secondary_context(self, subgraph: MemorySubgraph) -> bool:
+        """Include supplemental source for a requested scope or an exact source lookup."""
+        if set(subgraph.query.context_scopes or ()) & {"docs", "test"}:
+            return True
+        text = subgraph.query.text.strip()
+        names = {text.casefold()}
+        for item in subgraph.ranked_nodes:
+            node = item.node
+            path = self._node_relative_path(node) or ""
+            if (is_test_context(node.type, node.properties, path) or is_documentation_context(node.type, node.properties, path)) and (
+                self._node_matches_exact_query_path(node, text) or self._exact_symbol_match(node, names)
+            ):
+                return True
+        return False
 
     @staticmethod
     def _normalize_query_context_mode(query_mode: str) -> str:
@@ -925,13 +914,21 @@ class CodeContextProjectionMixin:
                 node_by_id.setdefault(node.id, node)
         included_ids = set(node_by_id)
         edges = [edge for edge in subgraph.edges if edge.from_id in included_ids and edge.to_id in included_ids]
+        exact_paths = subgraph.exact_paths
+        if exact_paths and scopes != subgraph.query.context_scopes:
+            exact_paths = tuple(sorted({
+                path for node in self.store.get_nodes(subgraph.seed_node_ids, clone=False)
+                if self._node_matches_query_context_scope(node, scopes)
+                and (path := self._node_relative_path(node)) is not None and path in exact_paths
+            }))
         return MemorySubgraph(
-            query=subgraph.query,
+            query=replace(subgraph.query, context_scopes=scopes),
             ranked_nodes=ranked,
             nodes=list(node_by_id.values()),
             edges=edges,
             seed_node_ids=[node_id for node_id in subgraph.seed_node_ids if node_id in included_ids],
             trace_id=subgraph.trace_id,
+            exact_paths=exact_paths,
         )
 
     def _node_matches_query_context_scope(self, node: MemoryNode, scopes: set[str]) -> bool:
@@ -961,12 +958,9 @@ class CodeContextProjectionMixin:
         max_items: int,
     ) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
-        for row in path_rows[: min(max_items, QUERY_CONTEXT_MAX_RENDERED_FILES)]:
+        for row in path_rows[:max_items]:
             line_start = row.get("line_start")
             line_end = row.get("line_end")
-            if line_start is not None and line_end is not None and int(line_end) - int(line_start) > 160:
-                line_start = None
-                line_end = None
             role = "read"
             if query_mode == "cleanup" and row["edit_candidate"]:
                 role = "cleanup"
@@ -1078,7 +1072,7 @@ class CodeContextProjectionMixin:
                     implementation_links.append({"source": self._compact_node_ref(source), "target": self._compact_node_ref(target),
                                                  "edge_id": edge.id, "edge_type": edge.type,
                                                  "reason": "indexed implementation relation; verify the behavior owner in current source"})
-            if edge.type in CALLER_EDGE_TYPES and edge.to_id in target_ids and edge.from_id not in seen_callers:
+            if edge.type in self.policy.explore.caller_edges and edge.to_id in target_ids and edge.from_id not in seen_callers:
                 caller = nodes.get(edge.from_id)
                 target = nodes.get(edge.to_id)
                 if caller is not None and target is not None:
@@ -1092,7 +1086,7 @@ class CodeContextProjectionMixin:
                             "reason": f"incoming {edge.type}",
                         }
                     )
-            if edge.type in PUBLIC_SURFACE_EDGE_TYPES and (edge.from_id in target_ids or edge.to_id in target_ids):
+            if edge.type in self.policy.explore.public_surface_edges and (edge.from_id in target_ids or edge.to_id in target_ids):
                 surface_id = edge.from_id if edge.from_id not in target_ids else edge.to_id
                 surface = nodes.get(surface_id)
                 if surface is not None and surface.id not in seen_surface:
@@ -1144,15 +1138,13 @@ class CodeContextProjectionMixin:
         subgraph: MemorySubgraph,
         working_paths: set[str],
         *,
-        query_text: str,
+        include_secondary: bool,
         max_items: int,
     ) -> list[dict[str, Any]]:
         if not working_paths:
             return []
         reads: OrderedDict[tuple[str, int | None, int | None, str], dict[str, Any]] = OrderedDict()
         primary_owner_available = any(not self._is_secondary_code_path(path) for path in working_paths)
-        include_secondary = self._query_requests_secondary_code_context(query_text)
-
         def add(node: MemoryNode, reason: str) -> None:
             path = self._node_relative_path(node)
             if not path:
@@ -1165,8 +1157,6 @@ class CodeContextProjectionMixin:
                 return
             line_start, line_end = self._line_span(node)
             if line_start is None:
-                return
-            if line_end is not None and line_end - line_start > 160:
                 return
             key = (path, line_start, line_end, node.id)
             reads.setdefault(
@@ -1185,22 +1175,25 @@ class CodeContextProjectionMixin:
 
         for item in ranked:
             add(item.node, "owner symbol")
+            if len(reads) >= max_items:
+                return list(reads.values())
         for node in subgraph.nodes:
             if node.type in SOURCE_NODE_TYPES:
                 add(node, "linked source evidence")
             elif self._is_code_context_node(node):
                 add(node, "related code context")
-            if len(reads) >= min(max_items, 10):
-                break
-        if working_paths and len(working_paths) <= 3 and len(reads) < min(max_items, 10):
-            for node in self._matching_source_fragments_for_query(query_text, working_paths, max_items=max_items):
+            if len(reads) >= max_items:
+                return list(reads.values())
+        if len(reads) < max_items:
+            for node in self._matching_source_fragments_for_query(subgraph.query, working_paths, max_items=max_items):
                 add(node, "exact source phrase")
-                if len(reads) >= min(max_items, 10):
+                if len(reads) >= max_items:
                     break
-        return list(reads.values())[: min(max_items, 10)]
+        return list(reads.values())
 
-    def _matching_source_fragments_for_query(self, query_text: str, working_paths: set[str], *, max_items: int) -> list[MemoryNode]:
-        query_profile = self._query_profile(query_text)
+    def _matching_source_fragments_for_query(self, query: MemoryQuery, working_paths: set[str], *, max_items: int) -> list[MemoryNode]:
+        query_profile = self._query_profile(query.text)
+        scopes = query.context_scopes or {"code"}
         candidates: dict[str, MemoryNode] = {}
         for path in sorted(working_paths):
             for node_type in sorted(SOURCE_NODE_TYPES):
@@ -1217,29 +1210,26 @@ class CodeContextProjectionMixin:
             path = self._node_relative_path(node)
             if not path or path not in working_paths or self._is_generated_context_path(path):
                 continue
-            if not self._node_matches_query_context_scope(node, {"code"}):
+            if not query.allows_project(node) or not self._node_matches_query_context_scope(node, scopes):
                 continue
-            line_start, line_end = self._line_span(node)
+            line_start, _ = self._line_span(node)
             if line_start is None:
                 continue
-            if line_end is not None and line_end - line_start > 80:
-                continue
-            if not self._source_fragment_is_strong_query_match(node, query_text, query_profile=query_profile):
+            if not self._source_fragment_is_strong_query_match(node, query.text, query_profile=query_profile):
                 continue
             metrics = self._node_match_metrics(node, query_profile)
             matches.append((metrics.match_score, node))
         matches.sort(key=lambda item: (item[0], item[1].salience, self._location_summary(item[1]) or ""), reverse=True)
-        return [node for _, node in matches[: min(max_items, 5)]]
+        return [node for _, node in matches[:max_items]]
 
     def _code_informative_snippet_payload(
         self,
         targeted_reads: list[dict[str, Any]],
         subgraph: MemorySubgraph,
         *,
-        path_rows: list[dict[str, Any]],
         max_items: int,
     ) -> list[dict[str, Any]]:
-        if not targeted_reads or len(path_rows) > 3:
+        if not targeted_reads:
             return []
         nodes = {item.node.id: item.node for item in subgraph.ranked_nodes}
         nodes.update({node.id: node for node in subgraph.nodes})
@@ -1254,9 +1244,9 @@ class CodeContextProjectionMixin:
             if not self._source_fragment_is_strong_query_match(node, subgraph.query.text):
                 continue
             selected.append(read)
-            if len(selected) >= min(max_items, 2):
+            if len(selected) >= max_items:
                 break
-        return self._code_snippet_payload(selected, subgraph, max_items=min(max_items, 2)) if selected else []
+        return self._code_snippet_payload(selected, subgraph, max_items=max_items) if selected else []
 
     def _source_fragment_is_strong_query_match(
         self,
@@ -1330,20 +1320,10 @@ class CodeContextProjectionMixin:
             if not text:
                 text = node.text if node and node.text else ""
                 source = "graph"
-            source_lines = str(text).splitlines()
-            selected_lines: list[str] = []
-            used_chars = 0
-            for line in source_lines[:16]:
-                cost = len(line) + bool(selected_lines)
-                if used_chars + cost > 900:
-                    break
-                selected_lines.append(line)
-                used_chars += cost
-            text = "\n".join(selected_lines)
             if not text:
                 continue
-            actual_end = start + len(selected_lines) - 1
-            truncated = len(selected_lines) < len(source_lines) or (source == "disk" and actual_end < end)
+            actual_end = start + len(str(text).splitlines()) - 1
+            truncated = source == "disk" and actual_end < end
             snippets.append(
                 {
                     "path": path,
@@ -1360,7 +1340,7 @@ class CodeContextProjectionMixin:
                     "text": text,
                 }
             )
-            if len(snippets) >= min(max_items, 3):
+            if len(snippets) >= max_items:
                 break
         return snippets
 
@@ -1385,7 +1365,7 @@ class CodeContextProjectionMixin:
         path_index: dict[str, Path],
         source_cache: dict[Path, list[str] | None],
     ) -> str:
-        """Slice one bounded file snapshot, reused by all previews in this request."""
+        """Slice one file snapshot, reused by all previews in this request."""
         if line_start <= 0 or line_end < line_start:
             return ""
         candidate = path_index.get(path, Path(path))
@@ -1393,41 +1373,46 @@ class CodeContextProjectionMixin:
             candidate = Path.cwd() / candidate
         if candidate not in source_cache:
             try:
-                content = _read_bounded_source(candidate)
+                content = _read_source_file(candidate)
             except OSError:
                 source_cache[candidate] = None
             else:
-                source_cache[candidate] = content.decode("utf-8-sig", errors="replace").splitlines() if content is not None else None
+                source_cache[candidate] = decode_text(content, errors="replace").splitlines()
         lines = source_cache[candidate]
         if not lines or line_start > len(lines):
             return ""
         return "\n".join(lines[line_start - 1 : min(line_end, len(lines))])
 
-    def _code_test_targets(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, query_text: str, max_items: int) -> list[dict[str, Any]]:
+    def _code_test_targets(
+        self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *,
+        exact_paths: tuple[str, ...], include_secondary: bool, max_items: int,
+    ) -> list[dict[str, Any]]:
+        """Project ranked test candidates and enrich them with association evidence."""
+        query_text = subgraph.query.text
         ranked_by_id = {item.node.id: item for item in subgraph.ranked_nodes}
         candidate_nodes: OrderedDict[str, MemoryNode] = OrderedDict(
             (node.id, node) for node in [*subgraph.nodes, *(item.node for item in subgraph.ranked_nodes)]
         )
-        if not any(is_test_context_path(self._node_relative_path(node) or "") for node in candidate_nodes.values()):
-            test_query = MemoryQuery(
-                text=query_text,
-                top_k=max(8, min(max_items * 2, 20)),
-                max_depth=0,
-                include_archived=subgraph.query.include_archived,
-                context_scopes={"test"},
-                store_trace=False,
-            )
+        exact_test_paths = set(exact_paths)
+        if exact_test_paths and exact_test_paths != {
+            path for node in candidate_nodes.values()
+            if (path := self._node_relative_path(node)) is not None and path in exact_test_paths
+            and is_test_context(node.type, node.properties, path)
+        }:
+            exact_test_paths.clear()
+        if not any(is_test_context(node.type, node.properties, self._node_relative_path(node) or "")
+                   for node in candidate_nodes.values()):
+            test_query = replace(subgraph.query, max_depth=0, context_scopes={"test"}, store_trace=False)
             test_matches = self._scoped_lexical_search(
                 test_query,
                 self._query_profile(query_text),
                 lexical_node_types=tuple(sorted(CODE_CONTEXT_NODE_TYPES)),
                 scopes={"test"},
-                top_k=test_query.top_k,
             )
             for node, score in test_matches:
                 ranked_by_id[node.id] = RankedNode(node=node, score=score, reasons={"match_score": score})
                 candidate_nodes.setdefault(node.id, node)
-        query_tokens = set(_expanded_tokens(query_text))
+        query_tokens = set(self._search_tokens(query_text))
         working_node_ids = {
             str(node_id)
             for row in path_rows
@@ -1444,12 +1429,11 @@ class CodeContextProjectionMixin:
         targets: dict[str, dict[str, Any]] = {}
         for node in candidate_nodes.values():
             path = self._node_relative_path(node)
-            if not path:
+            if not path or (exact_test_paths and path not in exact_test_paths):
                 continue
-            normalized = path.replace("\\", "/")
-            if is_test_context_path(normalized):
+            if is_test_context(node.type, node.properties, path):
                 kind = "test"
-            elif normalized.startswith("docs/") or normalized == "README.md":
+            elif is_documentation_context(node.type, node.properties, path):
                 kind = "docs"
             else:
                 continue
@@ -1469,6 +1453,7 @@ class CodeContextProjectionMixin:
                 else 1_000_000
             )
             priority = (is_owner_symbol, score, -span_size)
+            normalized = path.replace("\\", "/")
             previous = targets.get(normalized)
             if previous is None or priority > tuple(previous["_priority"]):
                 symbol = str(
@@ -1493,16 +1478,18 @@ class CodeContextProjectionMixin:
             item.pop("_priority", None)
         test_rows = [item for item in ordered if item["kind"] == "test"]
         doc_rows = [item for item in ordered if item["kind"] == "docs"]
-        selected = test_rows[: min(max_items, 4)]
-        if not selected and self._query_requests_secondary_code_context(query_text):
-            selected.extend(doc_rows[: min(max_items, 2)])
-        return TestIntelligenceService(self.store).enrich_projection(
+        selected = test_rows[:max_items]
+        if not selected and include_secondary:
+            selected = doc_rows[:max_items]
+        return self.test_intelligence.enrich_projection(
             selected, (node for node in candidate_nodes.values() if node.id in working_node_ids),
-            limit=min(max_items, 4),
+            limit=max_items,
         )
 
     def _code_follow_up_payload(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, max_items: int) -> list[dict[str, str]]:
         query = self._reql_string(subgraph.query.text)
+        depth = subgraph.query.max_depth
+        depth_option = f" --max-depth {depth}" if depth is not None else ""
         retrieve_label = "Retrieve ranked rows" if path_rows else "Retrieve source rows"
         graph_label = "Expand code graph" if path_rows else "Expand graph context"
         followups = [
@@ -1513,7 +1500,7 @@ class CodeContextProjectionMixin:
             },
             {
                 "label": graph_label,
-                "command": f"reql query_graph --query {query} --max-depth {subgraph.query.max_depth} --json",
+                "command": f"reql query_graph --query {query}{depth_option} --json",
                 "purpose": "expanded code graph context",
             },
             {

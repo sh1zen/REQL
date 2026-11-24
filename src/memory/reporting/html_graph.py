@@ -1,26 +1,43 @@
 """Standalone HTML graph visualization export."""
 from __future__ import annotations
 
+from collections import defaultdict
+from dataclasses import asdict
 import json
 from pathlib import Path
 from typing import Any
 
+from ..artifacts.context_scope import is_test_context
+from ..code_analysis.entrypoints import (
+    WORKFLOW_NODE_TYPES,
+    entrypoint_reason,
+    is_workflow_root_candidate,
+    select_workflow_entries,
+    workflow_edge_ids,
+)
+from ..config import REQLConfig, default_config
+from ..config.models import HTMLReportPolicy, WorkflowPolicy
+from ..domain.constants import INACTIVE_STATUSES
 from ..security import sanitize_label
+from .html_assets import vis_network_script
 
 
-def write_graph_html(payload: dict[str, Any], output_path: str | Path) -> Path:
+def write_graph_html(
+    payload: dict[str, Any], output_path: str | Path, *, config: REQLConfig | None = None,
+) -> Path:
     """Write a standalone interactive HTML visualization for an exported graph."""
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_graph_html(payload), encoding="utf-8")
+    path.write_text(render_graph_html(payload, config=config), encoding="utf-8")
     return path
 
 
-def render_graph_html(payload: dict[str, Any]) -> str:
+def render_graph_html(payload: dict[str, Any], *, config: REQLConfig | None = None) -> str:
     """Render a REQL HTML page from graph export data."""
 
-    payload = _safe_graph_payload(_visual_graph_payload(payload))
+    config = config if config is not None else default_config()
+    payload = _visual_graph_payload(payload, config.reporting.html, config.analysis.workflow)
     data = _safe_json(payload)
     source_counts = payload.get("source_counts") if isinstance(payload.get("source_counts"), dict) else {}
     node_count = int(source_counts.get("nodes") or len(payload.get("nodes", [])))
@@ -31,9 +48,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>REQL Memory Graph</title>
-  <script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"
-          integrity="sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1"
-          crossorigin="anonymous"></script>
+  <script>__VIS_NETWORK__</script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -359,6 +374,8 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   <script>
 (() => {
   const payload = JSON.parse(document.getElementById("graph-data").textContent);
+  const limits = payload.display;
+  const entryPointIds = payload.entrypoint_ids;
   const container = document.getElementById("graph");
   const search = document.getElementById("search");
   const searchResults = document.getElementById("search-results");
@@ -381,7 +398,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     ["Project", "document"], ["Concept", "concept"]
   ]);
   if (!window.vis || !window.vis.Network) {
-    container.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#aaa;font-size:13px;">vis-network failed to load. Check your connection to unpkg.com.</div>';
+    container.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#aaa;font-size:13px;">vis-network failed to load. The embedded graph viewer is unavailable.</div>';
     return;
   }
   const nodesRaw = Array.isArray(payload.nodes) ? payload.nodes : [];
@@ -415,15 +432,14 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     byId.get(edge.to_id).degree += 1;
   }
   const renderableNodes = graphNodes;
-  const renderableIds = new Set(renderableNodes.map((node) => node.id));
-  const renderableEdges = graphEdges.filter((edge) => renderableIds.has(edge.from_id) && renderableIds.has(edge.to_id));
+  const renderableEdges = graphEdges;
   const communities = buildCommunities();
   const colorByCommunity = new Map(communities.map((item, index) => [item.id, palette[index % palette.length]]));
   const adjacency = buildAdjacency();
-  const entryPointIds = findEntryPointIds();
+  const initialNodeIds = entryPointIds.length ? entryPointIds : renderableNodes.map((node) => node.id);
   let selectedCommunities = new Set(communities.map((item) => item.id));
   let expandedNodeIds = new Set();
-  let revealedNodeIds = new Set(entryPointIds);
+  let revealedNodeIds = new Set(initialNodeIds);
   let activeNodes = [];
   let activeEdges = [];
   let nodeItems = [];
@@ -572,29 +588,9 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     return connected;
   }
 
-  function findEntryPointIds() {
-    const explicit = renderableNodes
-      .filter((node) => node.entrypoint && (adjacency.get(node.id) || []).length > 0)
-      .sort((a, b) => labelFor(a).localeCompare(labelFor(b)) || a.id.localeCompare(b.id));
-    if (explicit.length) return explicit.map((node) => node.id);
-
-    const incoming = new Map(renderableNodes.map((node) => [node.id, 0]));
-    for (const edge of renderableEdges) incoming.set(edge.to_id, (incoming.get(edge.to_id) || 0) + 1);
-    const executableTypes = new Set(["Endpoint", "Function", "Method"]);
-    let roots = renderableNodes.filter((node) =>
-      executableTypes.has(node.type) && node.degree > 0 && (incoming.get(node.id) || 0) === 0
-    );
-    if (!roots.length) roots = renderableNodes.filter((node) => node.degree > 0 && (incoming.get(node.id) || 0) === 0);
-    if (!roots.length) roots = renderableNodes.filter((node) => node.degree > 0);
-    return roots
-      .sort((a, b) => b.degree - a.degree || labelFor(a).localeCompare(labelFor(b)) || a.id.localeCompare(b.id))
-      .slice(0, 24)
-      .map((node) => node.id);
-  }
-
   function rebuildRevealedNodes() {
-    const next = new Set(entryPointIds);
-    const queue = [...entryPointIds];
+    const next = new Set(initialNodeIds);
+    const queue = [...initialNodeIds];
     const traversed = new Set();
     while (queue.length) {
       const nodeId = queue.shift();
@@ -680,7 +676,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   function applyFilters(fitAfterUpdate = false) {
     const query = search.value.trim().toLowerCase();
     activeNodes = renderableNodes.filter((node) =>
-      revealedNodeIds.has(node.id) && selectedCommunities.has(node.community) && (!query || searchText(node).includes(query))
+      selectedCommunities.has(node.community) && (query ? searchText(node).includes(query) : revealedNodeIds.has(node.id))
     );
     const activeIds = new Set(activeNodes.map((node) => node.id));
     activeEdges = renderableEdges.filter((edge) => activeIds.has(edge.from_id) && activeIds.has(edge.to_id));
@@ -708,7 +704,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
       searchResults.innerHTML = "";
       return;
     }
-    const matches = activeNodes.slice(0, 20);
+    const matches = activeNodes.slice(0, limits.graph_search_limit || undefined);
     searchResults.innerHTML = "";
     for (const node of matches) {
       const item = document.createElement("div");
@@ -818,7 +814,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
 
     if (adjacent.length) {
       const section = menuSection("Links");
-      for (const edge of adjacent.slice(0, 40)) {
+      for (const edge of adjacent.slice(0, limits.graph_detail_edge_limit || undefined)) {
         const direction = edgeDirectionFor(edge, nodeId);
         const other = byId.get(direction.otherId);
         if (!other) continue;
@@ -860,7 +856,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   function compactProperties(properties) {
     return Object.entries(properties)
       .filter(([, value]) => value !== null && value !== undefined && typeof value !== "object")
-      .slice(0, 8)
+      .slice(0, limits.graph_menu_edge_limit || undefined)
       .map(([key, value]) => [key, String(value)]);
   }
 
@@ -985,9 +981,10 @@ def render_graph_html(payload: dict[str, Any]) -> str:
 </html>
 """
     return (
-        template.replace("__GRAPH_DATA__", data)
+        template.replace("__VIS_NETWORK__", vis_network_script(), 1)
         .replace("__NODE_COUNT__", str(node_count))
         .replace("__EDGE_COUNT__", str(edge_count))
+        .replace("__GRAPH_DATA__", data, 1)
     )
 
 
@@ -1000,31 +997,6 @@ def _safe_json(payload: dict[str, Any]) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
-
-
-def _safe_graph_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    safe = dict(payload)
-    nodes: list[dict[str, Any]] = []
-    for raw in payload.get("nodes", []) or []:
-        if not isinstance(raw, dict):
-            continue
-        node = dict(raw)
-        if "label" in node:
-            node["label"] = sanitize_label(node.get("label"))
-        if "type" in node:
-            node["type"] = sanitize_label(node.get("type"), max_chars=80)
-        nodes.append(node)
-    edges: list[dict[str, Any]] = []
-    for raw in payload.get("edges", []) or []:
-        if not isinstance(raw, dict):
-            continue
-        edge = dict(raw)
-        if "type" in edge:
-            edge["type"] = sanitize_label(edge.get("type"), max_chars=80)
-        edges.append(edge)
-    safe["nodes"] = nodes
-    safe["edges"] = edges
-    return safe
 
 
 _NODE_PROPERTY_KEYS = {
@@ -1057,16 +1029,11 @@ _NODE_PROPERTY_KEYS = {
     "status",
     "symbol_name",
 }
-_ENTRYPOINT_NODE_TYPES = {"Endpoint", "Function", "Method"}
-_ENTRYPOINT_NAMES = {"_main", "execute", "handle", "main", "run"}
-_ENTRYPOINT_ROLE_TOKENS = {"command", "controller", "endpoint", "entrypoint", "handler", "public-api", "route"}
-_TEST_PATH_PARTS = {"test", "tests", "__tests__"}
-_NODE_TEXT_MAX_CHARS = 420
-_LABEL_MAX_CHARS = 180
-_PROPERTY_VALUE_MAX_CHARS = 180
 
 
-def _visual_graph_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _visual_graph_payload(
+    payload: dict[str, Any], policy: HTMLReportPolicy, workflow: WorkflowPolicy,
+) -> dict[str, Any]:
     """Return a compact, progressively explorable HTML graph payload."""
 
     source_nodes = [node for node in payload.get("nodes", []) or [] if isinstance(node, dict)]
@@ -1078,6 +1045,8 @@ def _visual_graph_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for edge in source_edges
         if str(edge.get("from_id") or "") in node_ids and str(edge.get("to_id") or "") in node_ids
     ]
+    entrypoint_ids = _graph_entrypoint_ids(nodes, edges, workflow)
+    entrypoints = set(entrypoint_ids)
     return {
         "format": "reql-memory-visual-export-v1",
         "source_format": payload.get("format"),
@@ -1095,32 +1064,35 @@ def _visual_graph_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "nodes": None,
             "edges": None,
         },
-        "nodes": [_visual_node(node) for node in nodes],
+        "entrypoint_ids": entrypoint_ids,
+        "display": asdict(policy),
+        "nodes": [_visual_node(node, policy, entrypoints) for node in nodes],
         "edges": [_visual_edge(edge) for edge in edges],
     }
 
 
-def _visual_node(node: dict[str, Any]) -> dict[str, Any]:
+def _visual_node(node: dict[str, Any], policy: HTMLReportPolicy, entrypoints: set[str]) -> dict[str, Any]:
     properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     compact = {
-        "id": _compact_text(node.get("id"), max_chars=220),
-        "type": _compact_text(node.get("type"), max_chars=80),
-        "label": _compact_text(node.get("label") or properties.get("name") or properties.get("qualified_name") or node.get("id"), max_chars=_LABEL_MAX_CHARS),
-        "text": _compact_text(node.get("text"), max_chars=_NODE_TEXT_MAX_CHARS),
-        "canonical_key": _compact_text(node.get("canonical_key"), max_chars=_LABEL_MAX_CHARS),
+        "id": node.get("id"),
+        "type": sanitize_label(node.get("type"), max_chars=80),
+        "label": sanitize_label(
+            node.get("label") or properties.get("name") or properties.get("qualified_name") or node.get("id"),
+            max_chars=policy.graph_label_chars,
+        ),
+        "text": _compact_text(node.get("text"), max_chars=policy.graph_text_chars),
+        "canonical_key": _compact_text(node.get("canonical_key"), max_chars=policy.graph_label_chars),
         "status": _compact_text(node.get("status"), max_chars=40),
         "salience": _round_float(node.get("salience")),
         "confidence": _round_float(node.get("confidence")),
         "activation": _round_float(node.get("activation")),
-        "entrypoint": _is_entrypoint_node(node),
-        "properties": _visual_properties(properties),
+        "entrypoint": node.get("id") in entrypoints,
+        "properties": _visual_properties(properties, policy),
     }
     return {key: value for key, value in compact.items() if value not in (None, "", {})}
 
 
 def _is_test_node(node: dict[str, Any]) -> bool:
-    if str(node.get("type") or "").casefold() == "test":
-        return True
     properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
     path = str(
         properties.get("relative_path")
@@ -1128,49 +1100,81 @@ def _is_test_node(node: dict[str, Any]) -> bool:
         or properties.get("path")
         or ""
     ).replace("\\", "/")
-    if not path:
-        return False
-    parts = [part.casefold() for part in path.split("/") if part]
-    if any(part in _TEST_PATH_PARTS for part in parts[:-1]):
-        return True
-    filename = parts[-1] if parts else ""
-    stem = filename.rsplit(".", 1)[0]
-    return stem.startswith("test_") or stem.endswith("_test")
+    return is_test_context(str(node.get("type") or ""), properties, path)
 
 
-def _is_entrypoint_node(node: dict[str, Any]) -> bool:
-    node_type = str(node.get("type") or "")
-    if node_type not in _ENTRYPOINT_NODE_TYPES or _is_test_node(node):
-        return False
-    if node_type == "Endpoint":
-        return True
-    properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
-    if properties.get("is_entrypoint") is True:
-        return True
-    role_values: list[str] = []
-    for key in ("roles", "semantic_roles"):
-        value = properties.get(key)
-        if isinstance(value, str):
-            role_values.append(value)
-        elif isinstance(value, list | tuple):
-            role_values.extend(str(item) for item in value)
-    role_tokens = {
-        token
-        for value in role_values
-        for token in value.casefold().replace("_", "-").split()
-    }
-    if role_tokens & _ENTRYPOINT_ROLE_TOKENS:
-        return True
-    name = str(properties.get("name") or properties.get("qualified_name") or node.get("label") or "")
-    return name.rsplit(".", 1)[-1].casefold() in _ENTRYPOINT_NAMES
+def _graph_entrypoint_ids(
+    nodes: list[dict[str, Any]], edges: list[dict[str, Any]], workflow: WorkflowPolicy,
+) -> list[str]:
+    """Use the shared directed workflow selector for each project in an export."""
+    participants: dict[str, dict[str, Any]] = {}
+    projects: dict[str | None, list[str]] = defaultdict(list)
+    project_by_id: dict[str, str | None] = {}
+    keys: dict[str, tuple[str, int, str, str]] = {}
+    reasons: dict[str, str] = {}
+    for node in nodes:
+        node_id, node_type = node.get("id"), node.get("type")
+        if (not isinstance(node_id, str) or not isinstance(node_type, str)
+                or node_type not in WORKFLOW_NODE_TYPES or node.get("status", "active") != "active"):
+            continue
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        project_id = props.get("project_id")
+        if not isinstance(project_id, str):
+            project_id = None
+        participants[node_id] = node
+        projects[project_id].append(node_id)
+        project_by_id[node_id] = project_id
+        label = str(props.get("name") or props.get("qualified_name") or node.get("label") or node.get("text") or node_id)
+        path = str(props.get("relative_path") or props.get("source_file") or props.get("path") or "")
+        reason = entrypoint_reason(node_type, props, label, policy=workflow)
+        if reason is not None:
+            reasons[node_id] = reason
+        if reason or is_workflow_root_candidate(node_type, label, workflow):
+            line = str(props.get("line_start") or props.get("start_line") or "0")
+            keys[node_id] = (path.casefold(), int(line) if line.isascii() and line.isdecimal() and len(line) <= 12 else 0,
+                             label.casefold(), node_id)
+
+    outgoing: dict[str, list[str]] = defaultdict(list)
+    handled: set[str] = set()
+    for edge in edges:
+        source, target = edge.get("from_id"), edge.get("to_id")
+        if not isinstance(source, str) or not isinstance(target, str):
+            continue
+        if source not in participants or target not in participants or project_by_id[source] != project_by_id[target]:
+            continue
+        props = edge.get("properties")
+        if isinstance(props, dict) and props.get("status") in INACTIVE_STATUSES:
+            continue
+        edge_type = str(edge.get("type") or "")
+        target_type = participants[target]["type"]
+        link = workflow_edge_ids(source, target, edge_type, target_type)
+        if link is None:
+            continue
+        if edge_type == "HANDLES_ROUTE" and target_type == "Endpoint":
+            handled.add(source)
+        start, end = link
+        outgoing[start].append(end)
+
+    explicit: list[str] = []
+    inferred: list[str] = []
+    for node_ids in projects.values():
+        selected, used_fallback = select_workflow_entries(
+            {node_id: outgoing[node_id] for node_id in node_ids if node_id in outgoing},
+            {node_id: reasons[node_id] for node_id in node_ids if node_id in reasons},
+            {node_id: keys[node_id] for node_id in node_ids if node_id in keys},
+            handled,
+            infer_roots=workflow.infer_roots,
+        )
+        (inferred if used_fallback else explicit).extend(selected)
+    return sorted(explicit, key=keys.__getitem__) + sorted(inferred, key=keys.__getitem__)
 
 
 def _visual_edge(edge: dict[str, Any]) -> dict[str, Any]:
     compact = {
-        "id": _compact_text(edge.get("id"), max_chars=220),
-        "from_id": _compact_text(edge.get("from_id"), max_chars=220),
-        "to_id": _compact_text(edge.get("to_id"), max_chars=220),
-        "type": _compact_text(edge.get("type"), max_chars=80),
+        "id": edge.get("id"),
+        "from_id": edge.get("from_id"),
+        "to_id": edge.get("to_id"),
+        "type": sanitize_label(edge.get("type"), max_chars=80),
         "weight": _round_float(edge.get("weight")),
         "confidence": _round_float(edge.get("confidence")),
         "origin": _compact_text(edge.get("origin"), max_chars=40),
@@ -1178,33 +1182,32 @@ def _visual_edge(edge: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in compact.items() if value not in (None, "")}
 
 
-def _visual_properties(properties: dict[str, Any]) -> dict[str, Any]:
+def _visual_properties(properties: dict[str, Any], policy: HTMLReportPolicy) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key in sorted(_NODE_PROPERTY_KEYS):
         if key not in properties:
             continue
-        value = _compact_property_value(properties.get(key))
+        value = _compact_property_value(properties.get(key), policy)
         if value not in (None, "", [], {}):
             compact[key] = value
     return compact
 
 
-def _compact_property_value(value: Any) -> Any:
+def _compact_property_value(value: Any, policy: HTMLReportPolicy) -> Any:
     if isinstance(value, bool) or value is None:
         return value
     if isinstance(value, int | float):
         return _round_float(value)
-    if isinstance(value, list):
-        return [_compact_property_value(item) for item in value[:8]]
-    if isinstance(value, tuple):
-        return [_compact_property_value(item) for item in value[:8]]
+    limit = policy.graph_property_items or None
+    if isinstance(value, (list, tuple)):
+        return [_compact_property_value(item, policy) for item in value[:limit]]
     if isinstance(value, dict):
         return {
-            _compact_text(key, max_chars=80): _compact_property_value(item)
-            for key, item in list(value.items())[:8]
+            _compact_text(key, max_chars=80): _compact_property_value(item, policy)
+            for key, item in list(value.items())[:limit]
             if _compact_text(key, max_chars=80)
         }
-    return _compact_text(value, max_chars=_PROPERTY_VALUE_MAX_CHARS)
+    return _compact_text(value, max_chars=policy.graph_property_chars)
 
 
 def _compact_text(value: Any, *, max_chars: int) -> str | None:

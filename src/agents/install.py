@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
 from importlib.resources import as_file, files
 import importlib.util
 from pathlib import Path
@@ -15,17 +14,26 @@ import stat
 import subprocess
 import sys
 from types import ModuleType
-from typing import Iterable
+from typing import Iterable, TypedDict
+
+from config import VERSION
+
+from .clients import CLIENT_PROFILES, ClientPaths, ClientProfile
 
 
 SECTION_START = "<!-- REQL-INSTALL:START -->"
 SECTION_END = "<!-- REQL-INSTALL:END -->"
 HOOK_ID = "REQL_AGENT_HOOK_V1"
-INSTALLER_VERSION = "1"
 VERSION_FILE = ".reql_version"
 COMMAND_MARKER = "REQL-COMMAND-SHIM:V1"
 COMMAND_ENV = "REQL_COMMAND_DIR"
 _SKILL_GENERATOR: ModuleType | None = None
+
+# Compatibility view for callers that enumerate the supported platforms.
+PLATFORMS_CONFIG = {
+    name: {"label": profile.label, "is_all": profile.install_all}
+    for name, profile in CLIENT_PROFILES.items()
+}
 
 
 @dataclass(frozen=True)
@@ -60,24 +68,6 @@ class InstallResult:
         }
 
 
-PLATFORMS_CONFIG = {
-    "codex": {"label": "Codex", "is_all": True},
-    "claude": {"label": "Claude Code", "is_all": True},
-    "opencode": {"label": "OpenCode", "is_all": True},
-    "kilo": {"label": "Kilo Code", "is_all": True},
-    "cursor": {"label": "Cursor", "is_all": True},
-    "gemini": {"label": "Gemini CLI", "is_all": True},
-    "copilot": {
-        "label": "GitHub Copilot CLI and VS Code Copilot Chat",
-        "is_all": True,
-    },
-    "openclaw": {"label": "OpenClaw", "is_all": True},
-    "hermes": {"label": "Hermes", "is_all": True},
-    "kimi": {"label": "Kimi Code", "is_all": True},
-    "antigravity": {"label": "Google Antigravity", "is_all": True},
-    "agents": {"label": "generic AGENTS-compatible clients", "is_all": False},
-}
-
 def resolve_platforms(
     values: Iterable[str],
     *,
@@ -87,7 +77,7 @@ def resolve_platforms(
     project_dir: Path | None = None,
     home_dir: Path | None = None,
 ) -> tuple[str, ...]:
-    all_platforms = [name for name, cfg in PLATFORMS_CONFIG.items() if cfg["is_all"]]
+    all_platforms = [name for name, profile in CLIENT_PROFILES.items() if profile.install_all]
 
     raw: list[str] = []
     if install_all:
@@ -104,8 +94,8 @@ def resolve_platforms(
     for name in raw:
         candidates = all_platforms if name == "all" else (name,)
         for candidate in candidates:
-            if candidate not in PLATFORMS_CONFIG:
-                supported_list = ", ".join(PLATFORMS_CONFIG)
+            if candidate not in CLIENT_PROFILES:
+                supported_list = ", ".join(CLIENT_PROFILES)
                 raise ValueError(f"unknown platform '{candidate}'. Choose from: {supported_list}, all")
             if candidate not in resolved:
                 resolved.append(candidate)
@@ -114,75 +104,16 @@ def resolve_platforms(
 
 def detect_platforms(*, project: bool = False, project_dir: Path | None = None, home_dir: Path | None = None) -> tuple[str, ...]:
     """Detect supported coding-agent profiles or commands already present locally."""
-    home = (home_dir or Path.home()).expanduser()
-    root = (project_dir or Path(".")).resolve()
-    candidates: list[str] = []
-
-    def add(
-        name: str,
-        *,
-        project_paths: tuple[Path, ...] = (),
-        user_paths: tuple[Path, ...] = (),
-        commands: tuple[str, ...] = (),
-    ) -> None:
-        if name in candidates:
-            return
-        paths = project_paths if project else user_paths
-        command_signals = () if project else commands
-        if any(_is_agent_profile_signal(path) for path in paths) or any(shutil.which(command) for command in command_signals):
-            candidates.append(name)
-
-    claude_dir = _env_path("CLAUDE_CONFIG_DIR", home / ".claude")
-    add(
-        "codex",
-        user_paths=(home / ".codex" / "skills",),
-        project_paths=(root / ".codex" / "skills", root / ".codex" / "hooks.json"),
-    )
-    add(
-        "claude",
-        user_paths=(claude_dir / "skills", claude_dir / "CLAUDE.md"),
-        project_paths=(root / ".claude" / "skills", root / ".claude" / "CLAUDE.md", root / ".claude" / "settings.json"),
-        commands=("claude",),
-    )
-    add(
-        "opencode",
-        user_paths=(home / ".config" / "opencode" / "skills",),
-        project_paths=(root / ".opencode" / "skills",),
-        commands=("opencode",),
-    )
-    add(
-        "kilo",
-        user_paths=(home / ".kilocode" / "skills", home / ".config" / "kilo" / "skills"),
-        project_paths=(root / ".kilocode" / "skills", root / ".config" / "kilo" / "skills"),
-        commands=("kilo", "kilocode"),
-    )
-    add("cursor", user_paths=(home / ".cursor" / "rules",), project_paths=(root / ".cursor" / "rules",), commands=("cursor",))
-    add(
-        "gemini",
-        user_paths=(_gemini_user_dir(home) / "skills", home / ".gemini" / "skills", home / "GEMINI.md"),
-        project_paths=(root / ".gemini" / "skills", root / "GEMINI.md"),
-        commands=("gemini",),
-    )
-    add(
-        "copilot",
-        user_paths=(home / ".copilot" / "skills", home / ".github" / "copilot-instructions.md", home / ".github" / "instructions"),
-        project_paths=(root / ".github" / "copilot-instructions.md", root / ".github" / "instructions"),
-        commands=("copilot",),
-    )
-    add("openclaw", user_paths=(home / ".openclaw" / "skills",), project_paths=(root / ".openclaw" / "skills",), commands=("openclaw",))
-    add("hermes", user_paths=(home / ".hermes" / "skills",), project_paths=(root / ".hermes" / "skills",), commands=("hermes",))
-    add("kimi", user_paths=(home / ".kimi" / "skills",), project_paths=(root / ".kimi" / "skills",), commands=("kimi",))
-    add(
-        "antigravity",
-        user_paths=(home / ".gemini" / "config" / "skills",),
-        project_paths=(root / ".agents" / "skills", root / ".agents" / "rules", root / ".agents" / "workflows"),
-        commands=("antigravity",),
-    )
-    add("agents", user_paths=(home / ".agents" / "skills",), project_paths=(root / ".agents" / "skills",))
-
-    if project:
-        return tuple(candidates)
-    return tuple(name for name in candidates if name != "agents" or (home / ".agents" / "skills").exists())
+    root = (project_dir or Path(".")).resolve() if project else (home_dir or Path.home()).expanduser()
+    windows = host_platform.system() == "Windows"
+    detected = []
+    for name, profile in CLIENT_PROFILES.items():
+        paths = profile.paths(root, project=project, windows=windows)
+        if any(_is_agent_profile_signal(path) for path in paths.detection_paths(profile.signals)) or (
+            not project and any(shutil.which(command) for command in profile.commands)
+        ):
+            detected.append(name)
+    return tuple(detected)
 
 
 def _is_agent_profile_signal(path: Path) -> bool:
@@ -263,31 +194,26 @@ def install_agent_files(
 ) -> InstallResult:
     selected = tuple(platforms)
     scope = "project" if project else "user"
-    root = (project_dir or Path(".")).resolve()
+    root = (project_dir or Path(".")).resolve() if project else (home_dir or Path.home()).expanduser()
+    windows = host_platform.system() == "Windows"
     actions: list[InstallAction] = []
     command_plan = _command_plan(command_dir)
+    profiles = _selected_profiles(selected)
 
     for path, content in command_plan.files:
         status = _write_command_file(path, content, dry_run=dry_run)
         actions.append(InstallAction(platform="shared", scope=scope, kind="command", path=path, status=status))
 
-    for name in selected:
-        for kind, path, content in _planned_files(
-            name,
-            project=project,
-            project_dir=root,
-            home_dir=home_dir,
-            command_name=command_plan.command_name,
-            command_path=command_plan.primary_path,
-            fallback_command=command_plan.fallback_command,
-        ):
+    for name, profile in profiles:
+        paths = profile.paths(root, project=project, windows=windows)
+        planned = _planned_files(name, profile, paths, project=project, command=command_plan)
+        for kind, path, content in planned:
             status = _write_file(path, content, sectioned=kind == "instructions", dry_run=dry_run)
             actions.append(InstallAction(platform=name, scope=scope, kind=kind, path=path, status=status))
-        if hooks:
-            hook_action = _install_hook(name, project=project, project_dir=root, home_dir=home_dir, dry_run=dry_run)
-            if hook_action is not None:
-                actions.append(InstallAction(platform=name, scope=scope, kind="hook", path=hook_action[0], status=hook_action[1]))
-        for stamp_path in _version_stamp_paths(name, project=project, project_dir=root, home_dir=home_dir):
+        if hooks and paths.hook is not None:
+            status = _install_hook(paths.hook, report_event=profile.hook_reports_event, dry_run=dry_run)
+            actions.append(InstallAction(platform=name, scope=scope, kind="hook", path=paths.hook, status=status))
+        for stamp_path in _version_stamp_paths(planned):
             status = _write_file(
                 stamp_path,
                 _version_payload(name, scope, command_path=command_plan.primary_path),
@@ -310,152 +236,95 @@ def uninstall_agent_files(
 ) -> InstallResult:
     selected = tuple(platforms)
     scope = "project" if project else "user"
-    root = (project_dir or Path(".")).resolve()
-    home = (home_dir or Path.home()).expanduser()
+    root = (project_dir or Path(".")).resolve() if project else (home_dir or Path.home()).expanduser()
+    windows = host_platform.system() == "Windows"
     actions: list[InstallAction] = []
+    profiles = _selected_profiles(selected)
+    command_plan = _command_plan(command_dir)
     if command_dir is not None:
-        command_plan = _command_plan(command_dir)
         for path, _content in command_plan.files:
             status = _remove_command_file(path, dry_run=dry_run, stop=path.parent.parent)
             actions.append(InstallAction(platform="shared", scope=scope, kind="command", path=path, status=status))
 
-    for name in selected:
-        for kind, path, _content in _planned_files(name, project=project, project_dir=root, home_dir=home):
+    for name, profile in profiles:
+        paths = profile.paths(root, project=project, windows=windows)
+        planned = _planned_files(name, profile, paths, project=project, command=command_plan)
+        for kind, path, _content in planned:
             if kind == "instructions":
-                status = _remove_section_file(path, dry_run=dry_run, stop=root if project else home)
+                status = _remove_section_file(path, dry_run=dry_run, stop=root)
             else:
-                status = _remove_owned_file(path, dry_run=dry_run, stop=root if project else home)
+                status = _remove_owned_file(path, dry_run=dry_run, stop=root)
             actions.append(InstallAction(platform=name, scope=scope, kind=kind, path=path, status=status))
-        hook_action = _uninstall_hook(name, project=project, project_dir=root, home_dir=home, dry_run=dry_run)
-        if hook_action is not None:
-            actions.append(InstallAction(platform=name, scope=scope, kind="hook", path=hook_action[0], status=hook_action[1]))
-        for stamp_path in _version_stamp_paths(name, project=project, project_dir=root, home_dir=home):
-            status = _remove_owned_file(stamp_path, dry_run=dry_run, stop=root if project else home)
+        if paths.hook is not None:
+            status = _uninstall_hook(paths.hook, root=root, dry_run=dry_run)
+            actions.append(InstallAction(platform=name, scope=scope, kind="hook", path=paths.hook, status=status))
+        for stamp_path in _version_stamp_paths(planned):
+            status = _remove_owned_file(stamp_path, dry_run=dry_run, stop=root)
             actions.append(InstallAction(platform=name, scope=scope, kind="version", path=stamp_path, status=status))
             if not dry_run:
-                _cleanup_empty_dirs(stamp_path.parent, stop=root if project else home)
+                _cleanup_empty_dirs(stamp_path.parent, stop=root)
 
     return InstallResult(platforms=selected, scope=scope, actions=tuple(actions))
 
 
+def _selected_profiles(names: tuple[str, ...]) -> list[tuple[str, ClientProfile]]:
+    """Validate client names before changing any installation files."""
+    profiles = []
+    for name in names:
+        if name not in CLIENT_PROFILES:
+            raise ValueError(f"unknown platform '{name}'")
+        profiles.append((name, CLIENT_PROFILES[name]))
+    return profiles
+
+
+class _CommandOptions(TypedDict):
+    command_name: str
+    command_path: Path
+    fallback_command: str
+
+
 def _planned_files(
-    platform_name: str,
-    *,
-    project: bool,
-    project_dir: Path,
-    home_dir: Path | None = None,
-    command_name: str = "reql",
-    command_path: Path | None = None,
-    fallback_command: str | None = None,
+    name: str, profile: ClientProfile, paths: ClientPaths, *, project: bool, command: CommandPlan,
 ) -> list[tuple[str, Path, str]]:
-    home = (home_dir or Path.home()).expanduser()
-    command_path = command_path or _command_plan(None).primary_path
-    fallback_command = fallback_command or _launcher_fallback_command()
-    instructions = _instruction_section(platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-
-    if platform_name == "codex":
-        base = project_dir / ".codex" if project else home / ".codex"
-        files = _skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-        files.append(("instructions", (project_dir if project else home) / "AGENTS.md", instructions))
-        return files
-
-    if platform_name == "claude":
-        base = project_dir / ".claude" if project else _env_path("CLAUDE_CONFIG_DIR", home / ".claude")
-        files = _skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-        claude_md = (project_dir / ".claude" / "CLAUDE.md") if project else base / "CLAUDE.md"
-        files.append(("instructions", claude_md, instructions))
-        return files
-
-    if platform_name == "gemini":
-        base = project_dir / ".gemini" if project else _gemini_user_dir(home)
-        files = _skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-        target = (project_dir / "GEMINI.md") if project else home / "GEMINI.md"
-        files.append(("instructions", target, instructions))
-        return files
-
-    if platform_name == "cursor":
-        base = project_dir / ".cursor" / "rules" if project else home / ".cursor" / "rules"
-        return [
-            ("rule", base / "reql.mdc", _cursor_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-        ]
-
-    if platform_name == "copilot":
-        target = project_dir / ".github" / "copilot-instructions.md" if project else home / ".github" / "copilot-instructions.md"
-        vscode_target = project_dir / ".github" / "instructions" / "reql.instructions.md" if project else home / ".github" / "instructions" / "reql.instructions.md"
-        return [
-            ("instructions", target, instructions),
-            ("rule", vscode_target, _vscode_copilot_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-        ]
-
-    if platform_name == "opencode":
-        base = project_dir / ".opencode" if project else home / ".config" / "opencode"
-        files = _skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-        files.append(("instructions", (project_dir if project else base) / "AGENTS.md", instructions))
-        return files
-
-    if platform_name == "kilo":
-        base = project_dir / ".kilocode" if project else home / ".kilocode"
-        return [
-            *_skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command),
-            ("rule", base / "rules" / "reql.md", _markdown_rule("Kilo Code", command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-            ("instructions", (project_dir if project else base) / "AGENTS.md", instructions),
-        ]
-
-    if platform_name == "openclaw":
-        base = project_dir / ".openclaw" if project else home / ".openclaw"
-        files = _skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-        files.append(("instructions", (project_dir if project else base) / "AGENTS.md", instructions))
-        return files
-
-    if platform_name == "hermes":
-        base = project_dir / ".hermes" if project else home / ".hermes"
-        files = _skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-        files.append(("instructions", (project_dir if project else base) / "AGENTS.md", instructions))
-        return files
-
-    if platform_name == "kimi":
-        base = project_dir / ".kimi" if project else home / ".kimi"
-        files = [
-            *_skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command),
-            ("rule", base / "rules" / "reql.md", _markdown_rule("Kimi Code", command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-        ]
-        files.append(("instructions", (project_dir if project else base) / "AGENTS.md", instructions))
-        return files
-
-    if platform_name == "antigravity":
-        base = project_dir / ".antigravity" if project else home / ".antigravity"
-        files = [
-            *_skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command),
-            ("rule", base / "rules" / "reql.md", _markdown_rule("Google Antigravity", command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
-        ]
-        files.append(("instructions", (project_dir if project else base) / "AGENTS.md", instructions))
-        return files
-
-    if platform_name == "agents":
-        base = project_dir / ".agents" if project else home / ".agents"
-        return [
-            *_skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command),
-            ("instructions", (project_dir if project else base) / "AGENTS.md", instructions),
-        ]
-
-    raise ValueError(f"unknown platform '{platform_name}'")
+    """Render the resources described by a resolved client profile."""
+    command_options: _CommandOptions = {
+        "command_name": command.command_name,
+        "command_path": command.primary_path,
+        "fallback_command": command.fallback_command,
+    }
+    planned: list[tuple[str, Path, str]] = []
+    if paths.skills is not None:
+        planned.extend(_skill_files(base=paths.skills, platform_name=name, project=project, **command_options))
+    if paths.rule is not None and profile.rule is not None:
+        renderer = profile.rule[1]
+        if renderer == "cursor":
+            content = _cursor_rule(**command_options)
+        elif renderer == "copilot":
+            content = _vscode_copilot_rule(**command_options)
+        else:
+            content = _markdown_rule(profile.label, **command_options)
+        planned.append(("rule", paths.rule, content))
+    if paths.instructions is not None:
+        instruction = ("instructions", paths.instructions, _instruction_section(name, project=project, **command_options))
+        if paths.skills is None:
+            planned.insert(0, instruction)
+        else:
+            planned.append(instruction)
+    return planned
 
 
-def _version_stamp_paths(platform_name: str, *, project: bool, project_dir: Path, home_dir: Path | None = None) -> tuple[Path, ...]:
-    planned = _planned_files(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
+def _version_stamp_paths(planned: list[tuple[str, Path, str]]) -> tuple[Path, ...]:
+    """Place stamps alongside skills or the client's first managed resource."""
     paths = tuple(path.parent / VERSION_FILE for kind, path, _content in planned if kind == "skill")
-    if paths:
+    if paths or not planned:
         return paths
-    for kind, path, _content in planned:
-        return (path.parent / VERSION_FILE,)
-    return ()
+    return (planned[0][1].parent / VERSION_FILE,)
 
 
 def _version_payload(platform_name: str, scope: str, *, command_path: Path | None = None) -> str:
     payload = {
         "installer": "reql-install",
-        "installer_version": INSTALLER_VERSION,
-        "package_version": _package_version(),
+        "package_version": VERSION,
         "platform": platform_name,
         "scope": scope,
     }
@@ -463,23 +332,6 @@ def _version_payload(platform_name: str, scope: str, *, command_path: Path | Non
         payload["command"] = "reql"
         payload["command_path"] = str(command_path)
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
-
-
-def _package_version() -> str:
-    try:
-        return version("reql")
-    except PackageNotFoundError:
-        try:
-            from memory import __version__
-
-            return __version__
-        except Exception:
-            return "unknown"
-
-
-def _env_path(name: str, fallback: Path) -> Path:
-    value = os.environ.get(name)
-    return Path(value).expanduser() if value else fallback
 
 
 @dataclass(frozen=True)
@@ -492,13 +344,14 @@ class CommandPlan:
 
 def _command_plan(command_dir: Path | None) -> CommandPlan:
     directory = _command_dir(command_dir)
-    executable = "reql.cmd" if host_platform.system() == "Windows" else "reql"
+    executable = _command_file_names()[0]
     path = directory / executable
+    args = _launcher_args()
     return CommandPlan(
         command_name="reql",
         primary_path=path,
-        fallback_command=_launcher_fallback_command(),
-        files=((path, _command_script(path)),),
+        fallback_command=_format_command(args),
+        files=((path, _command_script(path, args)),),
     )
 
 
@@ -544,7 +397,7 @@ def _first_writable_user_command_dir() -> Path | None:
         if _is_windows_apps_dir(resolved):
             continue
         if directory.exists() and os.access(directory, os.W_OK):
-            target = directory / ("reql.cmd" if host_platform.system() == "Windows" else "reql")
+            target = directory / _command_file_names()[0]
             if target.exists() and not _is_owned_command_file(target):
                 continue
             return directory
@@ -572,11 +425,11 @@ def _is_windows_apps_dir(path: Path) -> bool:
     return host_platform.system() == "Windows" and "windowsapps" in parts
 
 
-def _launcher_fallback_command() -> str:
-    args = _launcher_args()
-    if host_platform.system() == "Windows":
-        return subprocess.list2cmdline(args)
-    return " ".join(shlex.quote(arg) for arg in args)
+def _format_command(args: list[str], *, windows: bool | None = None) -> str:
+    """Render one argument vector for the selected shell."""
+    if windows is None:
+        windows = host_platform.system() == "Windows"
+    return subprocess.list2cmdline(args) if windows else shlex.join(args)
 
 
 def _launcher_args() -> list[str]:
@@ -587,10 +440,11 @@ def _launcher_args() -> list[str]:
     return [python, "-m", "memory.cli"]
 
 
-def _command_script(path: Path) -> str:
-    args = _launcher_args()
-    if path.suffix.casefold() in {".cmd", ".bat"}:
-        command = subprocess.list2cmdline(args)
+def _command_script(path: Path, args: list[str]) -> str:
+    """Build the native shim from the same invocation shown in guidance."""
+    windows = path.suffix.casefold() in {".cmd", ".bat"}
+    command = _format_command(args, windows=windows)
+    if windows:
         return (
             "@echo off\n"
             f"REM {COMMAND_MARKER}\n"
@@ -598,7 +452,6 @@ def _command_script(path: Path) -> str:
             f"{command} %*\n"
             "exit /b %ERRORLEVEL%\n"
         )
-    command = " ".join(shlex.quote(arg) for arg in args)
     return (
         "#!/bin/sh\n"
         f"# {COMMAND_MARKER}\n"
@@ -637,12 +490,6 @@ def _make_executable(path: Path) -> None:
         path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     except OSError:
         pass
-
-
-def _gemini_user_dir(home: Path) -> Path:
-    if host_platform.system() == "Windows":
-        return home / ".agents"
-    return home / ".gemini"
 
 
 def _write_file(path: Path, content: str, *, sectioned: bool, dry_run: bool) -> str:
@@ -726,11 +573,8 @@ def _remove_section(existing: str) -> str:
     return ("\n\n".join(parts) + "\n") if parts else ""
 
 
-def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool, home_dir: Path | None = None) -> tuple[Path, str] | None:
+def _install_hook(path: Path, *, report_event: bool, dry_run: bool) -> str:
     """Install a managed reminder for session startup."""
-    path = _hook_settings_path(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
-    if path is None:
-        return None
     settings = _read_json_object(path)
     _remove_managed_hooks(settings)
     hooks = settings.get("hooks")
@@ -741,36 +585,33 @@ def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_r
         startup = hooks["SessionStart"] = []
     startup.append({
         "matcher": "startup",
-        "hooks": [{"type": "command", "command": _python_hook_command(platform_name)}],
+        "hooks": [{"type": "command", "command": _python_hook_command(report_event=report_event)}],
     })
     existed = path.exists()
     if existed and _read_json_object(path) == settings:
-        return path, "unchanged"
+        return "unchanged"
     if dry_run:
-        return path, "would-update" if existed else "would-create"
+        return "would-update" if existed else "would-create"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return path, "updated" if existed else "created"
+    return "updated" if existed else "created"
 
 
-def _uninstall_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool, home_dir: Path | None = None) -> tuple[Path, str] | None:
+def _uninstall_hook(path: Path, *, root: Path, dry_run: bool) -> str:
     """Remove REQL's startup reminder while keeping user configuration."""
-    path = _hook_settings_path(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
-    if path is None:
-        return None
     if not path.exists():
-        return path, "missing"
+        return "missing"
     settings = _read_json_object(path)
     if not _remove_managed_hooks(settings):
-        return path, "unchanged"
+        return "unchanged"
     if dry_run:
-        return path, "would-update" if settings else "would-remove"
+        return "would-update" if settings else "would-remove"
     if settings:
         path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return path, "updated"
+        return "updated"
     path.unlink()
-    _cleanup_empty_dirs(path.parent, stop=project_dir if project else (home_dir or Path.home()).expanduser())
-    return path, "removed"
+    _cleanup_empty_dirs(path.parent, stop=root)
+    return "removed"
 
 
 def _remove_managed_hooks(settings: dict[str, object]) -> bool:
@@ -802,22 +643,10 @@ def _remove_managed_hooks(settings: dict[str, object]) -> bool:
     return True
 
 
-def _hook_settings_path(platform_name: str, *, project: bool, project_dir: Path, home_dir: Path | None = None) -> Path | None:
-    """Resolve the settings file for clients that support REQL startup hooks."""
-    home = (home_dir or Path.home()).expanduser()
-    if platform_name == "claude":
-        base = project_dir / ".claude" if project else _env_path("CLAUDE_CONFIG_DIR", home / ".claude")
-        return base / "settings.json"
-    if platform_name == "gemini":
-        base = project_dir / ".gemini" if project else _gemini_user_dir(home)
-        return base / "settings.json"
-    return None
-
-
-def _python_hook_command(platform_name: str) -> str:
+def _python_hook_command(*, report_event: bool) -> str:
     """Emit one short reminder when a supported client starts in a REQL project."""
     context = {"additionalContext": "Use REQL for repository discovery. Reuse verified excerpts and supplied checks."}
-    if platform_name == "claude":
+    if report_event:
         context["hookEventName"] = "SessionStart"
     encoded = json.dumps({"hookSpecificOutput": context}, separators=(",", ":"))
     script = (
@@ -825,10 +654,7 @@ def _python_hook_command(platform_name: str) -> str:
         "e=pathlib.Path('.reql/memory.reql').exists() or pathlib.Path('reql.conf').exists();"
         f"sys.stdout.write({encoded!r} if e else ''); # {HOOK_ID}"
     )
-    args = [sys.executable or "python", "-c", script]
-    if host_platform.system() == "Windows":
-        return subprocess.list2cmdline(args)
-    return " ".join(shlex.quote(arg) for arg in args)
+    return _format_command([sys.executable or "python", "-c", script])
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
@@ -874,7 +700,7 @@ def _skill_files(
     fallback_command: str,
 ) -> list[tuple[str, Path, str]]:
     files = [
-        ("skill", base / "skills" / skill_dir / "SKILL.md", content)
+        ("skill", base / skill_dir / "SKILL.md", content)
         for skill_dir, content in _skill_generator().skill_markdowns(
             platform_name=platform_name,
             project=project,
@@ -884,7 +710,7 @@ def _skill_files(
         )
     ]
     files.extend(
-        ("skill-resource", base / "skills" / skill_dir / relative_path, content)
+        ("skill-resource", base / skill_dir / relative_path, content)
         for skill_dir, relative_path, content in _skill_generator().skill_resources(
             platform_name=platform_name,
             project=project,
@@ -921,7 +747,7 @@ def _instruction_section(
     command_path: Path,
     fallback_command: str,
 ) -> str:
-    supported = ", ".join(cfg["label"] for name, cfg in PLATFORMS_CONFIG.items() if cfg["is_all"])
+    supported = ", ".join(profile.label for profile in CLIENT_PROFILES.values() if profile.install_all)
     return _skill_generator().instruction_section(
         platform_name=platform_name,
         project=project,
@@ -966,4 +792,4 @@ def _markdown_rule(client_name: str, *, command_name: str, command_path: Path, f
 
 
 def available_platforms_text() -> str:
-    return ", ".join(PLATFORMS_CONFIG) + ", all"
+    return ", ".join(CLIENT_PROFILES) + ", all"

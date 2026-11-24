@@ -4,14 +4,16 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import is_dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from pkgutil import get_data
+from typing import Any, Mapping, get_type_hints
 
-from .models import REQLConfig, config_from_mapping, merge_config
+import config as builtin_config
 
-CONFIG_FILENAME = "conf.yaml"
+from .models import SECTION_TYPES, REQLConfig, _merge_config, config_from_mapping, merge_config
+
 PROJECT_CONFIG_FILENAME = "reql.conf"
-LOCAL_CONFIG_FILENAME = PROJECT_CONFIG_FILENAME
 CONFIG_PATH_ENV = "REQL_CONFIG"
 CONFIG_OVERRIDES_ENV = "REQL_CONFIG_OVERRIDES"
 
@@ -48,19 +50,17 @@ def resolve_config_path(
     return find_config_path(start_dir)
 
 
-def canonical_config_path() -> Path:
-    """Return the repository canonical ``conf.yaml`` path."""
-
-    candidate = Path(__file__).resolve().with_name(CONFIG_FILENAME)
-    if candidate.is_file():
-        return candidate
-    raise ConfigError(f"Canonical {CONFIG_FILENAME} was not found")
-
-
 def load_config(path: str | Path | None = None, *, start_dir: str | Path | None = None) -> REQLConfig:
-    """Load protected internal defaults joined with one project config."""
+    """Load bundled defaults with overrides from one project configuration."""
+    config, _ = _load_config_with_project_defaults(path, start_dir=start_dir)
+    return config
 
-    config = _load_config_file(canonical_config_path())
+
+def _load_config_with_project_defaults(
+    path: str | Path | None, *, start_dir: str | Path | None,
+) -> tuple[REQLConfig, dict[str, Any]]:
+    """Keep the user defaults used to validate file and later overrides together."""
+    config, project_defaults = _load_defaults()
     if path:
         config_path = Path(path).expanduser().resolve(strict=False)
         if not config_path.exists():
@@ -68,34 +68,64 @@ def load_config(path: str | Path | None = None, *, start_dir: str | Path | None 
     else:
         config_path = find_config_path(start_dir)
     if config_path is not None:
-        config = _merge_config_file(config, config_path)
-    return config
+        config = _merge_config_file(config, config_path, project_defaults)
+    return config, project_defaults
 
 
 def default_config() -> REQLConfig:
-    """Return deterministic defaults from the protected internal config."""
+    """Read and validate the core policy and project defaults packaged with REQL."""
+    config, _ = _load_defaults()
+    return config
 
-    return _load_config_file(canonical_config_path())
 
-
-def _load_config_file(config_path: Path) -> REQLConfig:
+def _load_defaults() -> tuple[REQLConfig, dict[str, Any]]:
+    """Build the full config and retain the user defaults for override validation."""
+    module_directory = Path(builtin_config.__file__).parent
+    core_path = module_directory / "config" / "core.yaml"
+    user_path = core_path.with_name("user.yaml")
+    loaded: list[dict[str, Any]] = []
+    for path in (core_path, user_path):
+        try:
+            data = get_data(builtin_config.__name__, path.relative_to(module_directory).as_posix())
+            if data is None:
+                raise ConfigError(f"Cannot read built-in configuration {path}")
+            text = data.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ConfigError(f"Cannot read built-in configuration {path}: {exc}") from exc
+        loaded.append(_parse_basic_yaml(text, path))
+    defaults, project_defaults = loaded
+    _merge_default_sections(defaults, project_defaults, SECTION_TYPES)
     try:
-        if config_path.suffix.lower() not in {".yaml", ".yml"}:
-            raise ConfigError(f"Unsupported configuration file type: {config_path}")
-        data = _load_yaml(config_path)
-        return config_from_mapping(data)
-    except ConfigError:
-        raise
-    except Exception as exc:
-        raise ConfigError(f"Invalid configuration in {config_path}: {exc}") from exc
+        config = config_from_mapping(defaults, require_complete=True)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Invalid built-in configuration in {core_path} and {user_path}: {exc}") from exc
+    return config, project_defaults
 
 
-def _merge_config_file(config: REQLConfig, override_path: Path) -> REQLConfig:
+def _merge_default_sections(
+    target: dict[str, Any], source: Mapping[str, Any], option_types: Mapping[str, Any], prefix: str = "",
+) -> None:
+    """Join shared schema groups and keep each option in a single YAML file."""
+    for key, value in source.items():
+        if key not in target:
+            target[key] = value
+            continue
+        option = f"{prefix}.{key}" if prefix else key
+        option_type = option_types.get(key)
+        current = target[key]
+        if not is_dataclass(option_type) or not isinstance(current, dict) or not isinstance(value, Mapping):
+            raise ConfigError(f"Duplicate built-in option {option} in core.yaml and user.yaml")
+        _merge_default_sections(current, value, get_type_hints(option_type), option)
+
+
+def _merge_config_file(
+    config: REQLConfig, override_path: Path, project_defaults: Mapping[str, Any],
+) -> REQLConfig:
     """Merge a partial YAML config file over an already validated config."""
 
     try:
         overrides = _load_yaml(override_path)
-        return merge_config(config, overrides)
+        return _merge_config(config, overrides, project_defaults)
     except ConfigError:
         raise
     except Exception as exc:
@@ -110,7 +140,8 @@ def load_project_config_data(path: str | Path) -> dict[str, Any]:
         raise ConfigError(f"Configuration file not found: {config_path}")
     try:
         data = _load_yaml(config_path)
-        merge_config(default_config(), data)
+        config, project_defaults = _load_defaults()
+        _merge_config(config, data, project_defaults)
         return data
     except ConfigError:
         raise
@@ -133,27 +164,27 @@ def load_effective_config(
 
     env_values = os.environ if env is None else env
     selected_path = resolve_config_path(path, start_dir=start_dir, env=env_values)
-    config = load_config(selected_path, start_dir=start_dir)
+    config, project_defaults = _load_config_with_project_defaults(selected_path, start_dir=start_dir)
 
     env_overrides = env_values.get(CONFIG_OVERRIDES_ENV)
     try:
         if env_overrides:
-            config = merge_config(config, parse_config_overrides(env_overrides))
+            config = _merge_config(config, parse_config_overrides(env_overrides), project_defaults)
         if overrides:
-            config = merge_config(config, overrides)
+            config = _merge_config(config, overrides, project_defaults)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     return config
 
 
 def write_sample_config(path: str | Path = PROJECT_CONFIG_FILENAME, *, overwrite: bool = False) -> Path:
-    """Create a project ``reql.conf`` initialized from the internal defaults."""
+    """Create a minimal project override file."""
 
     target = Path(path).expanduser().resolve(strict=False)
     if target.exists() and not overwrite:
         raise FileExistsError(f"Config file already exists: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(canonical_config_path().read_text(encoding="utf-8"), encoding="utf-8")
+    target.write_text(builtin_config.PROJECT_CONFIG_TEMPLATE, encoding="utf-8")
     return target
 
 
@@ -177,7 +208,8 @@ def set_local_config_option(option: str, raw_value: str, *, start_dir: str | Pat
         option_data = child
     option_data[option_parts[-1]] = value
     try:
-        merge_config(default_config(), data)
+        config, project_defaults = _load_defaults()
+        _merge_config(config, data, project_defaults)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -269,7 +301,7 @@ def _dump_yaml_value(value: Any) -> str:
 YAML_ASSIGN_RE = re.compile(r"^([A-Za-z0-9_.-]+):(?:\s+(.*))?$")
 
 
-def _parse_basic_yaml(text: str, path: Path) -> dict[str, Any]:
+def _parse_basic_yaml(text: str, path: Path | str) -> dict[str, Any]:
     lines: list[tuple[int, str, int, str]] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         if "\t" in raw_line[: len(raw_line) - len(raw_line.lstrip())]:
@@ -336,7 +368,7 @@ def _parse_basic_yaml(text: str, path: Path) -> dict[str, Any]:
     return data
 
 
-def _parse_yaml_value(raw: str, path: Path, line_number: int) -> Any:
+def _parse_yaml_value(raw: str, path: Path | str, line_number: int) -> Any:
     if raw in {"true", "false"}:
         return raw == "true"
     if raw in {"[]", "{}"}:

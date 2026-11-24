@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...artifacts.context_scope import artifact_context_scope
 from ..base import (
     TreeSitterExtractorBase,
     _children,
@@ -24,12 +25,33 @@ from ..base import (
 )
 from ..models import CodeSymbol, SymbolKind
 
+_TEST_MODULES = {"@jest/globals", "node:test", "vitest"}
+_TEST_FUNCTIONS = {"it", "test"}
+_TEST_MODIFIERS = {"concurrent", "only", "skip", "todo", "fails", "failing", "serial", "each", "skipIf", "runIf"}
+
 
 class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
     language_key = "javascript"
     tree_sitter_module = "tree_sitter_javascript"
 
     def _walk_root(self, root: Any) -> None:
+        """Resolve supported test registration bindings before visiting calls."""
+        self._test_functions: set[tuple[str, ...]] = set()
+        if artifact_context_scope(self.artifact) == "test":
+            self._test_functions.update((name,) for name in _TEST_FUNCTIONS)
+            for node in _named_children(root):
+                if node.type != "import_statement":
+                    continue
+                module = _string_literal(_node_text(self.source, _field(node, "source")))
+                for name, alias in self._javascript_import_bindings(node):
+                    binding = alias or name
+                    self._test_functions.discard((binding,))
+                    if module not in _TEST_MODULES:
+                        continue
+                    if name == "*":
+                        self._test_functions.update((binding, function) for function in _TEST_FUNCTIONS)
+                    elif name in _TEST_FUNCTIONS or (module == "node:test" and name == "default"):
+                        self._test_functions.add((binding,))
         self._walk_javascript(root, [])
 
     def _walk_javascript(self, node: Any, scope: list[CodeSymbol]) -> None:
@@ -69,7 +91,8 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
             if test is not None:
                 symbol, callback = test
                 self.symbols.append(symbol)
-                self._walk_javascript_children(callback, [*scope, symbol])
+                if callback is not None:
+                    self._walk_javascript_children(callback, [*scope, symbol])
                 return
         self._walk_javascript_children(node, scope)
 
@@ -82,22 +105,41 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
 
         See docs/PIPELINE.md#changing-an-extractor for versions and tests.
         """
-        from ...artifacts.context_scope import artifact_context_scope
-
-        function = _node_text(self.source, _field(node, "function"))
-        if function not in {"test", "it", "test.only", "it.only"} or artifact_context_scope(self.artifact) != "test":
+        if not self._test_functions:
+            return None
+        callee = _field(node, "function")
+        wrapped = callee is not None and callee.type == "call_expression"
+        if wrapped:
+            callee = _field(callee, "function")
+        names = []
+        while callee is not None and callee.type == "member_expression":
+            names.append(_node_text(self.source, _field(callee, "property")))
+            callee = _field(callee, "object")
+        if callee is None or callee.type != "identifier":
+            return None
+        names.append(_node_text(self.source, callee))
+        names.reverse()
+        binding_length = 2 if tuple(names[:2]) in self._test_functions else 1
+        modifiers = names[binding_length:]
+        if (tuple(names[:binding_length]) not in self._test_functions
+                or not _TEST_MODIFIERS.issuperset(modifiers) or (wrapped and not modifiers)):
             return None
         arguments = _field(node, "arguments")
         items = _named_children(arguments) if arguments is not None else []
-        if len(items) < 2 or items[0].type != "string" or items[1].type not in {"arrow_function", "function_expression"}:
+        if not items or items[0].type != "string":
             return None
         name = _string_literal(_node_text(self.source, items[0]))
         if not name or len(name) > 160:
             return None
-        callback = items[1]
+        callback = items[-1] if items[-1].type in {"arrow_function", "function_expression"} else None
+        if callback is None and (len(items) != 1 or not modifiers or modifiers[-1] != "todo"):
+            return None
+        params = _params(self.source, _field(callback, "parameters")) if callback is not None else []
         symbol = _symbol(self.artifact, "function", _parent(self.module, scope), name,
-                         _line(node), _end_line(node), args=_params(self.source, _field(callback, "parameters")))
+                         _line(node), _end_line(node), args=params)
         symbol.metadata["test_case"] = True
+        if modifiers:
+            symbol.metadata["test_modifiers"] = modifiers
         return symbol, callback
 
     def _javascript_import(self, node: Any) -> None:
@@ -116,7 +158,18 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
             return
         raw = _node_text(self.source, node).strip()
         exported = node.type == "export_statement"
-        bindings: list[tuple[str | None, str | None]] = []
+        bindings = self._javascript_import_bindings(node)
+        for name, alias in bindings or [(None, None)]:
+            item = _import(self.artifact, module, name, alias, _line(node), raw)
+            if exported:
+                item.metadata["is_re_export"] = True
+            elif not bindings:
+                item.metadata["import_form"] = "side_effect"
+            self.imports.append(item)
+
+    def _javascript_import_bindings(self, node: Any) -> list[tuple[str, str | None]]:
+        """Read binding names from imports and re-exports in source order."""
+        bindings: list[tuple[str, str | None]] = []
         for child in _named_children(node):
             if child.type not in {"import_clause", "export_clause", "namespace_export"}:
                 continue
@@ -130,13 +183,9 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
                             bindings.append((name, alias))
                 elif entry.type == "namespace_import":
                     bindings.append(("*", _node_text(self.source, _named_children(entry)[0])))
-                elif entry.type == "identifier" and not exported:
+                elif entry.type == "identifier" and node.type != "export_statement":
                     bindings.append(("default", _node_text(self.source, entry)))
-        for name, alias in bindings or [(None, None)]:
-            item = _import(self.artifact, module, name, alias, _line(node), raw)
-            if exported:
-                item.metadata["is_re_export"] = True
-            self.imports.append(item)
+        return bindings
 
     def _javascript_class_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
         name_node = _field(node, "name")

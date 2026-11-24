@@ -1,6 +1,7 @@
 """Paragraph-oriented chunking helpers."""
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 
 
@@ -14,53 +15,40 @@ class ParagraphChunk:
 
 
 def paragraph_chunks(text: str, *, max_chars: int = 3000) -> list[ParagraphChunk]:
+    """Chunk nonblank paragraphs while retaining coordinates in the original text."""
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
     chunks: list[ParagraphChunk] = []
-    lines = text.splitlines()
-    offset = 0
-    paragraph: list[str] = []
-    paragraph_start_line = 1
-    paragraph_start_offset = 0
-
-    for index, line in enumerate(lines, start=1):
-        line_start = offset
-        offset += len(line) + 1
+    offsets: list[int] = []
+    offset = paragraph_start = 0
+    for line in text.splitlines(keepends=True):
+        offsets.append(offset)
         if not line.strip():
-            _flush_paragraph(chunks, paragraph, paragraph_start_line, index - 1, paragraph_start_offset, line_start, max_chars)
-            paragraph = []
-            paragraph_start_line = index + 1
-            paragraph_start_offset = offset
-            continue
-        if not paragraph:
-            paragraph_start_line = index
-            paragraph_start_offset = line_start
-        paragraph.append(line)
-
-    end_offset = len(text)
-    _flush_paragraph(chunks, paragraph, paragraph_start_line, len(lines) or 1, paragraph_start_offset, end_offset, max_chars)
+            _flush_paragraph(chunks, text, offsets, paragraph_start, offset, max_chars)
+            paragraph_start = offset + len(line)
+        offset += len(line)
+    _flush_paragraph(chunks, text, offsets, paragraph_start, len(text), max_chars)
     return chunks
 
 
 def _flush_paragraph(
     chunks: list[ParagraphChunk],
-    paragraph: list[str],
-    start_line: int,
-    end_line: int,
-    start_offset: int,
-    end_offset: int,
+    text: str,
+    offsets: list[int],
+    start: int,
+    end: int,
     max_chars: int,
 ) -> None:
-    text = "\n".join(paragraph).strip()
-    if not text:
-        return
-    if len(text) <= max_chars:
-        chunks.append(ParagraphChunk(text, start_line, end_line, start_offset, end_offset))
-        return
-    cursor = 0
-    current_start = start_offset
-    while cursor < len(text):
-        piece = text[cursor : cursor + max_chars].strip()
+    """Skip surrounding whitespace and map each retained slice to its own lines."""
+    while start < end:
+        while start < end and text[start].isspace():
+            start += 1
+        stop = min(start + max_chars, end)
+        piece = text[start:stop].rstrip()
         if piece:
-            piece_end = current_start + len(piece)
-            chunks.append(ParagraphChunk(piece, start_line, end_line, current_start, piece_end))
-            current_start = piece_end
-        cursor += max_chars
+            piece_end = start + len(piece)
+            chunks.append(ParagraphChunk(
+                "\n".join(piece.splitlines()), bisect_right(offsets, start), bisect_right(offsets, piece_end - 1),
+                start, piece_end,
+            ))
+        start = stop

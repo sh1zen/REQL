@@ -1,4 +1,4 @@
-"""Validate useful, bounded handoffs from persisted shared work."""
+"""Validate complete, scoped handoffs from persisted shared work."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from mcp.tools import reql_work_context
-from memory.services.coordination import CoordinationStore, render_work_context
+from memory.services.coordination import CoordinationStore, render_work_context, render_work_overview
 
 
 class WorkContextRecoveryTests(unittest.TestCase):
@@ -59,22 +59,48 @@ class WorkContextRecoveryTests(unittest.TestCase):
         self.assertIn(current["id"], ids)
         self.assertFalse(any("Unrelated" in row["content"] for row in payload["records"]))
 
-    def test_focused_text_keeps_late_contract_and_test_evidence(self) -> None:
-        rationale = "Contract explanation. " * 24 + "VERIFIED: python -m unittest tests.test_transport; 23 passed."
-        contract_rationale = "Compatibility details. " * 25 + "CONTRACT_TAIL: exclusion wins before limit"
-        contract = self.put("decision", "Keep filter semantics", rationale=contract_rationale)
-        task = self.put("task", "Implement signed request transport", rationale=rationale, depends_on=[contract["id"]],
-                        next_action="Continue from accepted transport fixtures", files=[f"src/part_{n}.py" for n in range(7)])
+    def test_recovers_wide_and_deep_prerequisites_across_providers(self) -> None:
+        """Follow every matched branch and keep long evidence in the rendered handoff."""
+        rationale = "Acceptance detail. " * 400 + "End of the contract."
+        paths = [f"src/module_{index}.py" for index in range(20)]
+        leaf = self.put("decision", "Definition of accepted behavior", rationale=rationale, files=paths)
+        chain = [leaf]
+        for index in range(8):
+            chain.append(self.put("decision", f"Layer {index} of the contract", rationale="Delegates to the prior layer",
+                                  depends_on=[chain[-1]["id"]]))
+        anchors = [self.put("task", f"Integration prerequisite {index}", depends_on=[chain[-1]["id"]])
+                   for index in range(50)]
+        verification = "Contract explanation. " * 24 + "VERIFIED: python -m unittest tests.test_transport; 23 passed."
+        task_paths = [f"src/part_{index}.py" for index in range(7)]
+        task = self.put("task", "Complete every prerequisite", rationale=verification, files=task_paths,
+                        depends_on=[row["id"] for row in anchors])
         payload = self.work.context(record_id=task["id"])
+        expected = {row["id"] for row in [task, *anchors, *chain]}
+        self.assertEqual({row["id"] for row in payload["records"]}, expected)
+        self.assertEqual((payload["total_matches"], payload["omitted"]), (len(expected), 0))
+        self.assertEqual(reql_work_context(storage_path=str(self.root / ".reql" / "memory.reql"), record_id=task["id"]), payload)
         before = deepcopy(payload)
         text = render_work_context(payload, record_id=task["id"])
-        self.assertIn(rationale, text)
-        self.assertIn("src/part_6.py", text)
-        self.assertIn(contract_rationale, text)
-        mcp = reql_work_context(storage_path=str(self.root / ".reql" / "memory.reql"), record_id=task["id"])
-        self.assertEqual(mcp, payload)
         self.assertEqual(payload, before)
-        self.assertLessEqual(len(text), 6000)
+        self.assertIn(verification, text)
+        self.assertIn(task_paths[-1], text)
+        self.assertIn(rationale, text)
+        self.assertIn(paths[-1], text)
+        overview = self.work.overview()
+        self.assertEqual(len(overview["sections"]["active"]), 51)
+        self.assertIn(rationale, render_work_overview(overview))
+        limited = self.work.context(record_id=task["id"], limit=45)
+        self.assertEqual((len(limited["records"]), limited["omitted"]), (45, len(expected) - 45))
+
+    def test_each_direct_match_expands_its_own_branch(self) -> None:
+        leaves = []
+        for index in range(12):
+            leaf = self.put("constraint", f"Required invariant {index}")
+            self.put("task", f"Integration outcome {index}", depends_on=[leaf["id"]])
+            leaves.append(leaf["id"])
+        payload = self.work.context("integration outcome")
+        self.assertEqual(len(payload["records"]), 24)
+        self.assertTrue(set(leaves) <= {row["id"] for row in payload["records"]})
 
     def test_direct_constraint_survives_a_small_task_budget(self) -> None:
         """Keep an explicit acceptance contract ahead of history on a bounded handoff."""

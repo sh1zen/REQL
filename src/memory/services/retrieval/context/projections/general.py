@@ -6,7 +6,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from .....artifacts.context_scope import is_test_context_path
+from .....artifacts.context_scope import application_surface_kind, is_test_context_path
+from .....code_analysis.catalog import display_language_for_path
 from .....domain.constants import INACTIVE_STATUSES
 from .....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from .....extraction.normalization import clamp, tokenize
@@ -18,7 +19,6 @@ from ...common import (
     SOURCE_NODE_TYPES,
     TECHNICAL_EDGE_TYPES,
     TECHNICAL_NODE_TYPES,
-    _expanded_tokens,
 )
 
 
@@ -32,10 +32,11 @@ class GeneralContextProjectionMixin:
         candidates: dict[str, MemoryNode] = {node.id: node for node in subgraph.nodes}
         for node, _score in self.store.lexical_search(
             subgraph.query.text,
-            top_k=max(max_items * 8, 40),
+            top_k=max(max_items * 8, 40) if subgraph.query.project_ids is None else None,
             include_archived=subgraph.query.include_archived,
         ):
-            candidates[node.id] = node
+            if subgraph.query.allows_project(node):
+                candidates[node.id] = node
 
         grouped: dict[tuple[str, str, str], list[tuple[MemoryNode, set[str]]]] = {}
         for node in candidates.values():
@@ -185,7 +186,7 @@ class GeneralContextProjectionMixin:
         limit = min(max_items, 20)
         selected: list[RankedNode] = []
         seen: set[str] = set()
-        query_tokens = set(_expanded_tokens(subgraph.query.text))
+        query_tokens = set(self._search_tokens(subgraph.query.text))
         deferred_sources: list[RankedNode] = []
         deferred_indirect: list[RankedNode] = []
         for item in subgraph.ranked_nodes:
@@ -197,7 +198,7 @@ class GeneralContextProjectionMixin:
                 deferred_indirect.append(item)
                 continue
             searchable = " ".join(part for part in (node.label, node.text, node.canonical_key) if part)
-            has_query_token = bool(query_tokens & set(_expanded_tokens(searchable)))
+            has_query_token = bool(query_tokens & set(self._search_tokens(searchable)))
             if query_tokens and not has_query_token and float(item.reasons.get("match_score", 0.0) or 0.0) <= 0.0:
                 deferred_indirect.append(item)
                 continue
@@ -369,7 +370,7 @@ class GeneralContextProjectionMixin:
         limit: int,
     ) -> OrderedDict[str, MemoryNode]:
         sources: OrderedDict[str, MemoryNode] = OrderedDict()
-        query_tokens = set(_expanded_tokens(query.text))
+        query_tokens = set(self._search_tokens(query.text))
         for node in nodes.values():
             if node.type in SOURCE_NODE_TYPES:
                 if not self._source_is_query_relevant(node, query=query, edges=edges, seed_nodes=seed_nodes, query_tokens=query_tokens):
@@ -408,7 +409,7 @@ class GeneralContextProjectionMixin:
         seed_nodes: set[str],
         sources: set[str],
     ) -> tuple[OrderedDict[str, MemoryNode], OrderedDict[str, MemoryEdge], list[str]]:
-        query_tokens = set(_expanded_tokens(query_text))
+        query_tokens = set(self._search_tokens(query_text))
         degree: dict[str, int] = dict.fromkeys(nodes, 0)
         for edge in edges.values():
             if edge.from_id in degree:
@@ -458,44 +459,26 @@ class GeneralContextProjectionMixin:
             return False
         if node.type not in CODE_CONTEXT_NODE_TYPES:
             return False
-        if node.type in {"File", "SourceArtifact"} and str(node.properties.get("context_scope") or "").casefold() == "docs":
+        scope = str(node.properties.get("context_scope") or "").casefold()
+        if node.type in {"File", "SourceArtifact", "SourceFragment"} and scope == "docs":
             return False
         path = cls._node_relative_path(node)
         if path and cls._is_generated_context_path(path):
             return False
         if node.type == "SourceFragment":
-            return bool(path and cls._is_code_source_path(path))
+            return bool(path and (
+                scope in {"code", "test"} or (
+                    not scope and (node.properties.get("artifact_type") == "code"
+                                   or display_language_for_path(path) is not None
+                                   or application_surface_kind(path) is not None)
+                )
+            ))
         return True
 
     @staticmethod
     def _is_generated_context_path(path: str) -> bool:
         value = path.replace("\\", "/")
         return any(part in value for part in (".egg-info/", "__pycache__/", ".reql/", ".git/"))
-
-    @staticmethod
-    def _is_code_source_path(path: str) -> bool:
-        value = path.replace("\\", "/").lstrip("/").casefold()
-        return value.startswith(("src/", "tests/")) or GeneralContextProjectionMixin._is_application_surface_path(value)
-
-    @staticmethod
-    def _is_application_surface_path(path: str) -> bool:
-        value = path.replace("\\", "/").lstrip("/").casefold()
-        return value.startswith(
-            (
-                "app/views/",
-                "app/templates/",
-                "public/assets/",
-                "public/css/",
-                "public/js/",
-                "resources/views/",
-                "resources/css/",
-                "resources/js/",
-                "templates/",
-                "views/",
-                "assets/",
-                "static/",
-            )
-        ) or any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))
 
     def _is_generic_context_node(self, node: MemoryNode, local_degree: int) -> bool:
         text = (node.canonical_key or node.label or node.text or "").strip().casefold()
@@ -510,7 +493,7 @@ class GeneralContextProjectionMixin:
     def _is_relevant_memory_node(self, node: MemoryNode, query_text: str, *, query_tokens: set[str] | None = None) -> bool:
         if node.type in TECHNICAL_NODE_TYPES:
             return False
-        query_tokens = query_tokens if query_tokens is not None else set(_expanded_tokens(query_text))
+        query_tokens = query_tokens if query_tokens is not None else set(self._search_tokens(query_text))
         direct = self._direct_relevance_score(node, query_text, query_tokens=query_tokens)
         if node.type in {"Topic", "Entity", "Fact"}:
             return direct >= 0.65
@@ -527,7 +510,7 @@ class GeneralContextProjectionMixin:
     ) -> bool:
         if source.type in TECHNICAL_NODE_TYPES:
             return False
-        query_tokens = query_tokens if query_tokens is not None else set(_expanded_tokens(query.text))
+        query_tokens = query_tokens if query_tokens is not None else set(self._search_tokens(query.text))
         if self._direct_relevance_score(source, query.text, query_tokens=query_tokens) >= 0.85:
             return True
         for edge in edges.values():
@@ -556,7 +539,7 @@ class GeneralContextProjectionMixin:
 
     def _agent_source_payloads(self, subgraph: MemorySubgraph, *, max_items: int, query_text: str | None = None) -> list[dict[str, Any]]:
         candidates: OrderedDict[str, MemoryNode] = OrderedDict()
-        query_tokens = set(_expanded_tokens(query_text or ""))
+        query_tokens = set(self._search_tokens(query_text or ""))
         for item in subgraph.ranked_nodes:
             if item.node.type in SOURCE_NODE_TYPES:
                 candidates.setdefault(item.node.id, item.node)
@@ -571,12 +554,12 @@ class GeneralContextProjectionMixin:
             for node in candidates.values():
                 text = self._compact_text(node.text or node.label or node.canonical_key or node.id, max_chars=260)
                 path = self._node_relative_path(node) or ""
-                if query_tokens & set(_expanded_tokens(text)) and not is_test_context_path(path):
+                if query_tokens & set(self._search_tokens(text)) and not is_test_context_path(path):
                     has_non_test_source = True
                     break
         for node in candidates.values():
             text = self._compact_text(node.text or node.label or node.canonical_key or node.id, max_chars=260)
-            if query_tokens and not (query_tokens & set(_expanded_tokens(text))):
+            if query_tokens and not (query_tokens & set(self._search_tokens(text))):
                 continue
             path = self._node_relative_path(node) or ""
             if has_non_test_source and is_test_context_path(path):
@@ -737,6 +720,8 @@ class GeneralContextProjectionMixin:
         followup_items = list(ranked_items) if ranked_items is not None else subgraph.ranked_nodes
         ids = [item.node.id for item in followup_items[: min(3, max_items)]]
         query = self._reql_string(subgraph.query.text)
+        depth = subgraph.query.max_depth
+        depth_option = f" --max-depth {depth}" if depth is not None else ""
         retrieve_statement = f"RETRIEVE {query} LIMIT {min(max_items, 8)} RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start"
         followups = [
             {
@@ -746,7 +731,7 @@ class GeneralContextProjectionMixin:
             },
             {
                 "label": "Expand graph context",
-                "command": f"reql query_graph --query {query} --max-depth {subgraph.query.max_depth} --json",
+                "command": f"reql query_graph --query {query}{depth_option} --json",
                 "purpose": "expanded graph context",
             },
         ]
@@ -774,15 +759,7 @@ class GeneralContextProjectionMixin:
         if path is None:
             return None
         value = str(path).replace("\\", "/")
-        if not value or "://" in value:
-            return None
-        marker = "/src/"
-        if marker in value:
-            return "src/" + value.rsplit(marker, 1)[1]
-        marker = "/tests/"
-        if marker in value:
-            return "tests/" + value.rsplit(marker, 1)[1]
-        return value
+        return value if value and "://" not in value else None
 
     @staticmethod
     def _line_span(item: MemoryNode | MemoryEdge) -> tuple[int | None, int | None]:
@@ -898,8 +875,8 @@ class GeneralContextProjectionMixin:
         return node.label or node.text or node.canonical_key or node.id
 
     @staticmethod
-    def _compact_text(text: str, *, max_chars: int = 320) -> str:
+    def _compact_text(text: str, *, max_chars: int | None = 320) -> str:
         compact = " ".join(str(text).split())
-        if len(compact) <= max_chars:
+        if max_chars is None or len(compact) <= max_chars:
             return compact
         return compact[: max_chars - 3].rstrip() + "..."

@@ -127,10 +127,28 @@ class AgentWorkWorkflowTests(unittest.TestCase):
         self.assertEqual({item['agent_id'] for item in self.work.records()},{'agent:coordinator'})
         self.assertEqual(self.storage.read_bytes(),b'Canonical graph must not be opened by work operations')
 
-    def test_parallel_cli_claims_and_restart_recover_shared_work(self) -> None:
-        """Exercise overlapping queue claims and handoff across independent CLI invocations."""
+    def test_parallel_cli_claims_cover_disjoint_work_and_overlapping_handoffs(self) -> None:
+        """Claim a shared queue through independent processes and recover interrupted work."""
+        def worker_command(name: str, *args: str) -> dict:
+            return json.loads(self.cli("agent", "--agent", f"agent:{name}", "--activity", name, *args, "--json").stdout)
+
+        def claim_pair(names: tuple[str, str], *options: str) -> list[dict]:
+            ready = Barrier(2, timeout=10)
+
+            def claim(name: str) -> dict:
+                ready.wait()
+                return worker_command(name, "init", "--next", *options)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(claim, names))
+
         self.storage.unlink()
         (self.root / "codec.py").write_text("def encode(value):\n    return value\n", encoding="utf-8")
+        disjoint_sources = {}
+        for symbol in ("calculate_total", "parse_invoice"):
+            path = f"{symbol}.py"
+            (self.root / path).write_text(f"def {symbol}():\n    return 1\n", encoding="utf-8")
+            disjoint_sources[symbol] = path
         self.cli("project", "compile")
         planner = self.agent("planner")
         planner.init("Plan work")
@@ -140,16 +158,7 @@ class AgentWorkWorkflowTests(unittest.TestCase):
         )["node"] for name in ("Test codec inputs", "Test codec outputs")]
         integration = planner.add_task("Integrate codec", depends_on=[task["id"] for task in tasks])["node"]
 
-        gate = Barrier(2)
-
-        def claim(name: str) -> dict:
-            gate.wait(timeout=10)
-            result = self.cli("agent", "--agent", f"agent:{name}", "--activity", name, "init", "--next", "--workstream", "wire",
-                              "--query", "encode", "--json")
-            return json.loads(result.stdout)
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            first, second = pool.map(claim, ("first", "second"))
+        first, second = claim_pair(("first", "second"), "--workstream", "wire", "--query", "encode")
         self.assertCountEqual([first["claimed_task"]["id"], second["claimed_task"]["id"]],
                               [task["id"] for task in tasks])
         self.assertEqual(sum(bool(result["file_overlaps"]["files"]) for result in (first, second)), 1)
@@ -163,7 +172,7 @@ class AgentWorkWorkflowTests(unittest.TestCase):
         self.assertEqual(progress["claim"], original["claim"])
         with self.assertRaisesRegex(ValueError, "already claimed"):
             planner.record(record_id=task_id, expected_revision=progress["revision"], status="done")
-        restarted = json.loads(self.cli("agent", "--agent", "agent:first", "--activity", "first", "init", "--task", task_id, "--json").stdout)
+        restarted = worker_command("first", "init", "--task", task_id)
         self.assertEqual(restarted["assignment_status"], "resumed")
         self.assertEqual(restarted["claimed_task"], progress)
         blocked = json.loads(self.cli(
@@ -188,6 +197,26 @@ class AgentWorkWorkflowTests(unittest.TestCase):
         self.cli("agent", "--agent", "agent:successor", "--activity", "successor", "finish", "Downstream review passed", "--task", task_id)
         self.cli("agent", "--agent", "agent:second", "--activity", "second", "finish", "Codec check passed", "--task", second["claimed_task"]["id"])
         self.assertEqual(self.work.context(record_id=integration["id"])["records"][0]["execution_state"], "ready")
+        planner.complete_task(integration["id"], "Both codec checks passed")
+
+        disjoint_tasks = {
+            planner.add_task(symbol, files=[path])["node"]["id"]: path
+            for symbol, path in disjoint_sources.items()
+        }
+        names = ("reader", "parser")
+        claimed_pair = claim_pair(names)
+        self.assertCountEqual([row["claimed_task"]["id"] for row in claimed_pair], disjoint_tasks.keys())
+        for name, claimed in zip(names, claimed_pair):
+            with self.subTest(worker=name):
+                task = claimed["claimed_task"]
+                source = claimed["source_context"]["payload"]
+                self.assertIn(disjoint_tasks[task["id"]], {row["path"] for row in source["working_set"]})
+                self.assertEqual(source["snippets"], [])
+                self.assertEqual(claimed["assignment_status"], "claimed")
+                self.assertEqual(claimed["file_overlaps"]["files"], [])
+                resumed = worker_command(name, "init", "--next")
+                self.assertEqual(resumed["assignment_status"], "resumed")
+                self.assertEqual(resumed["claimed_task"], task)
 
     def test_finish_rolls_back_shared_changes_and_can_retry_private_close(self) -> None:
         """Preserve claims on failed commits and never repeat a committed release."""
@@ -226,7 +255,7 @@ class AgentWorkWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "finish already committed"):
             worker.init(task_id=unfinished)
         new_claim = self.agent("successor").init(task_id=unfinished)["claimed_task"]
-        retried = self.agent("worker").finish("Checked result", task_id=selected, before_finish=self.fail)
+        retried = self.agent("worker").finish("Checked result", task_id=selected)
         self.assertEqual(retried["completed_task"]["revision"], claimed[0]["revision"] + 1)
         self.assertEqual(retried["released_claims"], 1)
         self.assertEqual(self.work.show(unfinished), new_claim)
@@ -333,12 +362,12 @@ class AgentWorkWorkflowTests(unittest.TestCase):
         opened = self.work.show(task_id)
         self.assertEqual((opened["status"], opened["revision"]), ("open", claimed["revision"] + 1))
         with self.assertRaisesRegex(ValueError, "needs a claim"):
-            self.agent("cli").finish("Premature finish", task_id=task_id, before_finish=self.fail)
+            self.agent("cli").finish("Premature finish", task_id=task_id)
         transferred = json.loads(self.cli(*peer, *claim_args).stdout)["claimed_task"]
         self.assertEqual((transferred["agent_id"], transferred["revision"]), ("agent:peer", opened["revision"] + 1))
 
         with self.assertRaisesRegex(ValueError, "already claimed by agent:peer"):
-            self.agent("cli").finish("Stale finish", task_id=task_id, before_finish=self.fail)
+            self.agent("cli").finish("Stale finish", task_id=task_id)
         error = json.loads(self.cli(*owner, "finish", "Stale finish", "--task", task_id, "--json", expected=2).stdout)
         self.assertIn("already claimed by agent:peer", error["error"]["message"])
         self.assertEqual(self.work.show(task_id), transferred)

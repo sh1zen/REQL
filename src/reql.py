@@ -1,6 +1,8 @@
 """Canonical public Python API for REQL."""
 from __future__ import annotations
 
+from sys import modules as _modules
+
 from api import (
     BlockGraphStore,
     ConfigError,
@@ -27,6 +29,11 @@ from api import (
     TestAssociation,
     load_config,
 )
+from memory import config, query
+
+# Keep the public configuration and query import paths for existing callers.
+_modules[f"{__name__}.config"] = config
+_modules[f"{__name__}.query"] = query
 
 __all__ = [
     "MemoryGraph",

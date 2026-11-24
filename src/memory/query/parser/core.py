@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..ast import Statement
+from ...config.policies import QueryDefaultsPolicy
+from ..ast import DEFAULT_QUERY_DEFAULTS, Statement
 from ..errors import REQLSyntaxError
 from ..lexer import Token, tokenize_reql
 from .clauses import SYMBOL_NODE_TYPES
@@ -13,7 +14,8 @@ from .commands import CommandParserMixin
 class REQLParser(CommandParserMixin):
     """Recursive-descent parser for the compact REQL grammar."""
 
-    def __init__(self, source: str) -> None:
+    def __init__(self, source: str, *, defaults: QueryDefaultsPolicy = DEFAULT_QUERY_DEFAULTS) -> None:
+        self.defaults = defaults
         self.source = source.strip()
         if self.source.endswith(";"):
             self.source = self.source[:-1].strip()
@@ -52,7 +54,7 @@ class REQLParser(CommandParserMixin):
         elif self.match_keyword("HUBS"):
             stmt = self._parse_hubs()
         elif self.match_keyword("DELTAS"):
-            stmt = self._parse_typed_node_list("DELTAS", ("GraphDelta",), allow_type=False, limit=10)
+            stmt = self._parse_typed_node_list("DELTAS", ("GraphDelta",), allow_type=False)
         elif self.match_keyword("CACHE"):
             stmt = self._parse_cache()
         elif self.match_keyword("VERIFY"):
@@ -133,5 +135,5 @@ class REQLParser(CommandParserMixin):
             raise REQLSyntaxError(f"Unexpected token {self.current.value!r} at position {self.current.position}")
 
 
-def parse_reql(source: str) -> Statement:
-    return REQLParser(source).parse()
+def parse_reql(source: str, *, defaults: QueryDefaultsPolicy = DEFAULT_QUERY_DEFAULTS) -> Statement:
+    return REQLParser(source, defaults=defaults).parse()

@@ -1,157 +1,66 @@
-"""Bounded lexical term selection for the block graph store."""
+"""Compute lexical weights from complete node text and searchable metadata."""
 from __future__ import annotations
 
 from collections import Counter
+from itertools import chain
 from typing import Sequence
 
+from ...config.policies import LexicalConfig, LexicalIndexPolicy
 from ...domain.models import MemoryNode
 from ...extraction.normalization import (
+    _iter_keyword_scores,
+    _tokenize_with_signal_scores,
     identifier_expanded_text,
-    keyword_scores,
     token_signal_score,
-    tokenize,
     token_variants,
 )
 
 LEXICAL_INDEX_SCHEMA_VERSION = 2
-LEXICAL_TEXT_WINDOW_COUNT = 8
-LEXICAL_TEXT_TOKEN_BUDGET = 384
-LEXICAL_TEXT_KEYWORD_BUDGET = 96
-LEXICAL_TEXT_TERM_BUDGET = 448
-LEXICAL_METADATA_TOKEN_BUDGET = 96
-LEXICAL_METADATA_KEYWORD_BUDGET = 48
-LEXICAL_METADATA_TERM_BUDGET = 128
-LEXICAL_MAX_TERMS_PER_NODE = 576
-LEXICAL_PROPERTY_VALUE_LIMIT = 64
-LEXICAL_WINDOW_OVERLAP = 48
 
 
-def _text_term_weights(value: str) -> dict[str, float]:
-    """Select weighted terms with coverage across long source text."""
-    windows = _text_windows(value)
-    if not windows:
-        return {}
-
-    token_quota = max(1, LEXICAL_TEXT_TOKEN_BUDGET // len(windows))
-    keyword_quota = max(1, LEXICAL_TEXT_KEYWORD_BUDGET // len(windows))
-    weights: dict[str, float] = {}
-    for window in windows:
-        for token, weight in _selected_token_weights(window, token_quota).items():
-            weights[token] = max(weights.get(token, 0.0), weight)
-        for term, score in keyword_scores(window, max_terms=keyword_quota):
-            weights[term] = max(weights.get(term, 0.0), float(score))
-    return _cap_terms(weights, LEXICAL_TEXT_TERM_BUDGET)
+def _text_term_weights(value: str, config: LexicalConfig) -> dict[str, float]:
+    """Build postings from every eligible term and phrase in node text."""
+    return _term_weights(value, config)
 
 
-def _metadata_term_weights(node: MemoryNode, property_values: Sequence[str]) -> dict[str, float]:
-    """Weight bounded identifiers and searchable properties above prose."""
-    values = [node.type, node.label or "", node.canonical_key or "", *property_values]
-    text = " ".join(value for value in values if value)
-    if not text:
-        return {}
-    weights = {
-        term: min(1.20, weight * 1.20)
-        for term, weight in _selected_token_weights(text, LEXICAL_METADATA_TOKEN_BUDGET).items()
-    }
-    for term, score in keyword_scores(text, max_terms=LEXICAL_METADATA_KEYWORD_BUDGET):
-        weights[term] = max(weights.get(term, 0.0), min(1.20, float(score) * 1.20))
-    expanded_text = identifier_expanded_text(text)
-    if expanded_text != text:
-        for term, score in keyword_scores(expanded_text, max_terms=LEXICAL_METADATA_KEYWORD_BUDGET):
-            weights[term] = max(weights.get(term, 0.0), min(1.20, float(score) * 1.20))
-    return _cap_terms(weights, LEXICAL_METADATA_TERM_BUDGET)
-
-
-def _selected_token_weights(value: str, limit: int) -> dict[str, float]:
-    """Expand identifiers and choose a bounded set of weighted tokens."""
-    tokens = tokenize(value)
-    expanded = tokenize(identifier_expanded_text(value))
-    existing = set(tokens)
-    tokens.extend(token for token in expanded if token not in existing)
-    tokens = [variant for token in tokens for variant in token_variants(token)]
-    if not tokens or limit <= 0:
-        return {}
-
-    counts = Counter(tokens)
-    ordered = list(dict.fromkeys(tokens))
-    selected = _select_tokens(ordered, counts, limit)
+def _metadata_term_weights(node: MemoryNode, property_values: Sequence[str], config: LexicalConfig) -> dict[str, float]:
+    """Weight metadata terms, including phrases from expanded identifiers."""
+    text = " ".join(value for value in (node.type, node.label, node.canonical_key, *property_values) if value)
+    weight = config.index.metadata_weight
     return {
-        token: _token_index_weight(token, counts[token])
-        for token in selected
+        term: min(weight, score * weight)
+        for term, score in _term_weights(text, config, expanded_phrases=True).items()
     }
 
 
-def _select_tokens(ordered: list[str], counts: Counter[str], limit: int) -> list[str]:
-    """Select from unique tokens under the caller's positive token budget."""
-    if len(ordered) <= limit:
-        return ordered
+def _term_weights(text: str, config: LexicalConfig, *, expanded_phrases: bool = False) -> dict[str, float]:
+    """Analyze each representation once and reuse its terms for scoring."""
+    normalization = config.normalization
+    tokens, signals = _tokenize_with_signal_scores(text, policy=normalization)
+    raw_counts = Counter(tokens)
+    expanded_text = identifier_expanded_text(text, split_identifiers=normalization.split_identifiers)
+    expanded, expanded_signals = (
+        _tokenize_with_signal_scores(expanded_text, policy=normalization)
+        if expanded_text != text else ((), {})
+    )
+    expanded_counts = Counter(expanded)
+    expanded_only = ((term, count) for term, count in expanded_counts.items() if term not in raw_counts)
+    counts: Counter[str] = Counter()
+    for token, count in chain(raw_counts.items(), expanded_only):
+        for variant in token_variants(token, expand_plurals=normalization.expand_plurals):
+            counts[variant] += count
 
-    priority_slots = max(1, int(limit * 0.75))
-    selected = sorted(
-        ordered,
-        key=lambda token: (
-            token_signal_score(token),
-            1.0 / max(1, counts[token]),
-            len(token),
-        ),
-        reverse=True,
-    )[:priority_slots]
-    selected_set = set(selected)
-
-    remaining = [token for token in ordered if token not in selected_set]
-    slots = limit - len(selected)
-
-    # Preserve positional coverage as well as high-signal/rare terms.  This is
-    # what prevents terms near the middle or tail of a long PDF page from being
-    # systematically invisible to lexical retrieval.
-    # There are more remaining unique tokens than slots, so these positions
-    # are distinct and cannot overlap the priority selection.
-    selected.extend(remaining[(index * len(remaining)) // slots] for index in range(slots))
-    return selected
+    weights = {token: _token_index_weight(token, count, config.index) for token, count in counts.items()}
+    for term, score in _iter_keyword_scores(tokens, signals, normalization, token_counts=raw_counts):
+        weights[term] = max(weights.get(term, 0.0), score)
+    if expanded_phrases:
+        for term, score in _iter_keyword_scores(expanded, expanded_signals, normalization, token_counts=expanded_counts):
+            weights[term] = max(weights.get(term, 0.0), score)
+    return weights
 
 
-def _token_index_weight(token: str, count: int) -> float:
-    """Combine signal and rarity into a bounded lexical weight."""
+def _token_index_weight(token: str, count: int, policy: LexicalIndexPolicy) -> float:
+    """Combine signal and rarity into a lexical weight between zero and one."""
     signal = token_signal_score(token)
     rarity = 1.0 / max(1.0, float(count) ** 0.5)
-    return min(1.0, 0.30 + (0.55 * signal) + (0.15 * rarity))
-
-
-def _text_windows(value: str) -> list[str]:
-    """Split text into bounded overlapping windows without truncating its tail."""
-    text = str(value or "")
-    if not text:
-        return []
-    if len(text) <= 2048:
-        return [text]
-
-    count = min(LEXICAL_TEXT_WINDOW_COUNT, max(2, (len(text) + 2047) // 2048))
-    windows: list[str] = []
-    for index in range(count):
-        start = (index * len(text)) // count
-        end = ((index + 1) * len(text)) // count
-        if index:
-            start = max(0, start - LEXICAL_WINDOW_OVERLAP)
-        if index + 1 < count:
-            end = min(len(text), end + LEXICAL_WINDOW_OVERLAP)
-        window = text[start:end]
-        if window:
-            windows.append(window)
-    return windows
-
-
-def _cap_terms(weights: dict[str, float], limit: int) -> dict[str, float]:
-    """Keep the strongest terms with deterministic tie breaking."""
-    if len(weights) <= limit:
-        return weights
-    ranked = sorted(
-        weights.items(),
-        key=lambda item: (
-            item[1],
-            token_signal_score(item[0].replace(" ", "_")),
-            len(item[0]),
-            item[0],
-        ),
-        reverse=True,
-    )[:limit]
-    return dict(ranked)
+    return min(1.0, policy.token_base_weight + policy.token_signal_weight * signal + policy.token_rarity_weight * rarity)

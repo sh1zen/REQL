@@ -384,7 +384,6 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
         arguments = _call_argument_nodes(node)
         for argument in arguments:
             self._generic_expression_references(argument, scope, access="read")
-        argument_values = _quoted_texts_in_nodes(self.source, arguments)
         self.calls.append(
             CodeCall(
                 id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
@@ -393,9 +392,16 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
                 target=target,
                 line=_line(node),
                 column=_column(node),
-                metadata={"language": self.language_key, "profile": self.profile.name, "arguments": argument_values},
+                metadata=self._call_metadata(node, target, arguments),
             )
         )
+
+    def _call_metadata(self, node: Any, target: str, arguments: list[Any]) -> dict[str, Any]:
+        """Provide literal call evidence and allow a language to attach its own metadata."""
+        return {
+            "language": self.language_key, "profile": self.profile.name,
+            "arguments": _quoted_texts_in_nodes(self.source, arguments),
+        }
 
 
 def _declaration_name_node(node: Any | None, profile: AstProfile) -> Any | None:

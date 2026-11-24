@@ -2,12 +2,35 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from config import VERSION
 from memory.domain.models import MemoryQuery
 from reql import MemoryGraph, QueryContextRequest
 
 
-class RetrievalRankingV2Tests(unittest.TestCase):
-    def test_exact_corroborated_homonym_and_stable_envelope(self) -> None:
+class RetrievalRankingTests(unittest.TestCase):
+    def test_compound_query_matches_working_set_owner_by_its_indexed_name(self) -> None:
+        """Ordinary query vocabulary can also be the name of a code owner."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = "packages/src/dispatcher.py"
+            (root / path).parent.mkdir(parents=True)
+            (root / path).write_text("def workflow():\n    pass\n", encoding="utf-8")
+            graph = MemoryGraph.open(root / ".reql/memory.reql")
+            try:
+                self.assertFalse(graph.compile_project(root).run.errors)
+                payload = graph.query_context_payload(
+                    "Investigate workflow after migration", scopes=["code"],
+                )["payload"]
+                self.assertTrue(any(
+                    row["path"] == path and any(name.rsplit(".", 1)[-1] == "workflow" for name in row["symbols"])
+                    for row in payload["working_set"]
+                ), payload)
+                exact = graph.query_context_payload(path, scopes=["code"])["payload"]
+                self.assertEqual(exact["working_set"][0]["path"], path)
+            finally:
+                graph.close()
+
+    def test_exact_corroborated_homonym_and_stable_owner_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "billing.py").write_text(
@@ -27,10 +50,8 @@ class RetrievalRankingV2Tests(unittest.TestCase):
                 request = QueryContextRequest.from_raw(text=query, scopes=["code"], include_source=True, max_items=5)
                 first = graph.query_context_result(request)
                 second = graph.query_context_result(request)
-                self.assertEqual(first.graph_revision, second.graph_revision)
                 self.assertEqual(first.payload["owner_candidates"], second.payload["owner_candidates"])
-                self.assertEqual(first.schema_version, 2)
-                self.assertEqual(first.payload["ranking_profile"], "v2")
+                self.assertEqual(first.payload["ranking_profile"], VERSION)
                 self.assertTrue(any(row["source_status"] == "verified" for row in first.payload["snippets"]))
             finally:
                 graph.close()

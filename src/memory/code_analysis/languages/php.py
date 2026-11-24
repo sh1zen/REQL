@@ -5,7 +5,8 @@ import re
 from typing import Any
 
 from .generic import COMMON_CONTROL_CALLS, COMMON_IMPORTS, AstProfile, GenericProfileTreeSitterExtractor
-from ..base import _import, _reference
+from ..base import _field, _import, _named_children, _node_text, _reference
+from ..surface import is_template_render_call
 
 
 class PhpTreeSitterExtractor(GenericProfileTreeSitterExtractor):
@@ -41,10 +42,9 @@ class PhpTreeSitterExtractor(GenericProfileTreeSitterExtractor):
         super()._walk_root(root)
         source = self.source.decode("utf-8", errors="replace")
         self._supplement_include_directives(source)
-        self._supplement_compact_references(source)
-        self._enrich_view_calls(source)
+        self._supplement_compact_references()
 
-    def _supplement_compact_references(self, source: str) -> None:
+    def _supplement_compact_references(self) -> None:
         existing = {
             (reference.owner, reference.name, reference.line, reference.access)
             for reference in self.references
@@ -53,10 +53,7 @@ class PhpTreeSitterExtractor(GenericProfileTreeSitterExtractor):
             tail = re.split(r"[.>:]+", str(call.target or "").casefold())[-1]
             if tail != "compact" or not call.line:
                 continue
-            expression = _php_call_expression_at_line(source, tail, call.line)
-            if expression is None:
-                continue
-            for name in re.findall(r"['\"]([A-Za-z_]\w*)['\"]", expression):
+            for name in call.metadata.get("php_compact_names", []):
                 key = (call.caller, name, call.line, "read")
                 if key in existing:
                     continue
@@ -113,25 +110,38 @@ class PhpTreeSitterExtractor(GenericProfileTreeSitterExtractor):
             )
             existing.add((line, target))
 
-    def _enrich_view_calls(self, source: str) -> None:
-        render_names = {"display", "include_view", "partial", "render", "render_template", "template", "view"}
-        for call in self.calls:
-            tail = re.split(r"[.>:]+", str(call.target or "").casefold())[-1]
-            if tail not in render_names or not call.line:
-                continue
-            expression = _php_call_expression_at_line(source, tail, call.line)
-            if not expression:
-                continue
-            quoted = re.findall(r"['\"]([^'\"]+)['\"]", expression)
-            if quoted:
-                call.metadata["template_names"] = [quoted[0]]
-            view_variables = set(re.findall(r"['\"]([A-Za-z_]\w*)['\"]\s*=>", expression))
+    def _call_metadata(self, node: Any, target: str, arguments: list[Any]) -> dict[str, Any]:
+        """Read template and compact arguments at the AST call site."""
+        metadata = super()._call_metadata(node, target, arguments)
+        argument_list = _field(node, "arguments")
+        args = [child for child in _named_children(argument_list) if child.type == "argument"]
+        if re.split(r"[.>:]+", target.casefold())[-1] == "compact":
+            metadata["php_compact_names"] = [
+                value for arg in args
+                if (value := _php_literal_argument(self.source, arg)) and re.fullmatch(r"[A-Za-z_]\w*", value)
+            ]
+        if is_template_render_call(target):
+            template = _php_literal_argument(self.source, args[0]) if args else None
+            metadata["template_names"] = [template] if template else []
+            expression = _node_text(self.source, argument_list)
+            view_variables = set(re.findall(r"""['"]([A-Za-z_]\w*)['"]\s*=>""", expression))
             for compact in re.finditer(r"\bcompact\s*\((.*?)\)", expression, flags=re.IGNORECASE | re.DOTALL):
-                view_variables.update(re.findall(r"['\"]([A-Za-z_]\w*)['\"]", compact.group(1)))
-            call.metadata["view_variables"] = sorted(view_variables)
+                view_variables.update(re.findall(r"""['"]([A-Za-z_]\w*)['"]""", compact.group(1)))
+            metadata["view_variables"] = sorted(view_variables)
             variable_sources = sorted(set(re.findall(r"\$([A-Za-z_]\w*)", expression)))
             if variable_sources:
-                call.metadata["view_variable_sources"] = variable_sources
+                metadata["view_variable_sources"] = variable_sources
+        return metadata
+
+
+def _php_literal_argument(source: bytes, argument: Any) -> str | None:
+    """Return the value of a positional PHP string without interpolation."""
+    parts = [part for part in _named_children(argument) if part.type != "comment"]
+    if len(parts) != 1 or parts[0].type not in {"string", "encapsed_string"}:
+        return None
+    if any(part.type != "string_content" for part in _named_children(parts[0])):
+        return None
+    return _node_text(source, parts[0])[1:-1]
 
 
 def _php_include_target(expression: str) -> tuple[str | None, dict[str, object]]:
@@ -139,7 +149,8 @@ def _php_include_target(expression: str) -> tuple[str | None, dict[str, object]]
     if not quoted:
         return None, {"dynamic": True}
     unquoted = re.sub(r"['\"][^'\"]*['\"]", "", expression)
-    dynamic = bool(re.search(r"\$[A-Za-z_]\w*", unquoted))
+    unrecognized = re.sub(r"\b(?:dirname\s*\(\s*__DIR__\s*\)|__DIR__\b)", "", unquoted, flags=re.IGNORECASE)
+    dynamic = bool(re.search(r"[^\s().]", unrecognized) or re.search(r'"[^"]*\$', expression))
     target = "".join(quoted).replace("\\", "/")
     metadata: dict[str, object] = {"dynamic": dynamic}
     lowered = unquoted.casefold()
@@ -206,34 +217,3 @@ def _php_offset_is_code(source: str, offset: int) -> bool:
         else:
             index += 1
     return in_php and not (quote or line_comment or block_comment)
-
-
-def _php_call_expression_at_line(source: str, call_name: str, line: int) -> str | None:
-    start_offset = sum(len(item) for item in source.splitlines(keepends=True)[: max(0, line - 1)])
-    pattern = re.compile(rf"\b{re.escape(call_name)}\s*\(", flags=re.IGNORECASE)
-    match = pattern.search(source, max(0, start_offset - 80))
-    if match is None or source.count("\n", 0, match.start()) + 1 > line + 1:
-        return None
-    opening = source.find("(", match.start())
-    depth = 0
-    quote = ""
-    escaped = False
-    for index in range(opening, len(source)):
-        char = source[index]
-        if quote:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = ""
-            continue
-        if char in {"'", '"'}:
-            quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return source[opening + 1 : index]
-    return None

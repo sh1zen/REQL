@@ -98,7 +98,7 @@ jobs:
           wheel-env/bin/reql --help
           wheel-env/bin/reql config show
           wheel-env/bin/reql tests --help
-          wheel-env/bin/reql project status --help
+          wheel-env/bin/reql stats --help
           wheel-env/bin/reql install codex --dry-run
 
       - name: Verify isolated uv tool install

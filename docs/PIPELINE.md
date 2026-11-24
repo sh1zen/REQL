@@ -2,15 +2,18 @@
 
 `project compile` and `MemoryGraph.update_project` use the same
 `IncrementalCompilationService`. The scanner reads files without changing them,
-hashes their full contents, and verifies size and nanosecond modification time
-before and after each read. Unstable files are retried, then reported as scan
-errors. Hashing uses a direct path for zero/one file, two workers for small scans
-and at most eight workers for larger scans, bounded by available CPUs.
+hashes their full contents with SHA-256, and verifies size and nanosecond
+modification time before and after each read. Unstable files are retried, then
+reported as scan errors. The scan has unlimited file size by default and
+accepts an explicit positive ceiling through `scan.max_file_size_mb`.
+Hashing uses a direct path for zero/one file, two
+workers for small scans and at most eight for larger scans, bounded by available CPUs.
 
 The compiler registers changed structure and reconciles deletions rather than
 rewriting unchanged project/file metadata. Revision lookups order scalar metadata
-before loading manifests. Effective policy is one immutable
-`CompilationOptions` model; see [Configuration](CONFIGURATION.md#loader).
+before loading manifests. The loader only applies project overrides to options
+declared in `user.yaml` before the compiler builds its immutable `CompilationOptions`.
+See [Configuration](CONFIGURATION.md#loader).
 The scanner and parser contracts govern refresh of cached classifications and
 fragments. See [code analysis](#code-analysis) and [document ingestion](#document-ingestion)
 for their outputs and parser requirements.
@@ -24,13 +27,13 @@ for their outputs and parser requirements.
 
 ```text
 project compile
-  -> open and validate graph storage
+  -> acquire exclusive graph access and validate storage
   -> scan and hash project files
   -> plan changed, deleted and recoverable artifacts
   -> graph transaction:
-       register changed structure and compile artifacts
-       relink document fragments
-       archive deleted artifacts and invalidate their cache entries
+       register changed structure and archive deleted graph records
+       compile changed artifacts and invalidate deleted cache entries
+       relink document fragments against active symbols
        reconcile project-wide structural and test links against active artifacts
        persist CompilationRun and GraphDelta
        record ProjectRevision when the run succeeds and its manifest changes
@@ -43,20 +46,34 @@ Each artifact compiles inside a nested graph transaction. An artifact exception
 rolls back its writes while other artifacts can still succeed. Project-wide
 structural/unused/orphan analysis runs only at the stages whose error guards
 allow it; a failed run does not publish a committed project revision.
+CLI compilation and edit refresh can wait for the graph lease with
+`--lock-timeout SECONDS`. The compiler starts after the lease is acquired.
+The `query_context` CLI command can use the same option for its shared read lease.
+Project reports scan under the same policy and reject incomplete scans before
+writing reports. Community detection and hub ranking cover the full project
+scope in memory. Hub scoring uses all detected memberships.
+Report collection reads all scoped code and state records. Call edge counts
+cover the selected project and shared edges. Markdown applies configured
+list limits after sorting and reports omitted items. It includes every parser
+error for each listed artifact and uses the warnings from hub analysis.
 
-Document-only changes relink their dirty fragments. A code change relinks
-document fragments against the updated project symbol set. CSS surface findings
-refresh once after changed/deleted artifacts have been processed.
+Document-only changes relink their dirty fragments and reconcile only those
+artifacts' links. Code changes and deletions relink document fragments against
+the updated project symbol set. CSS surface findings reconcile within their
+project after changed and deleted artifacts have been processed. Archival,
+artifact/cache enumeration, and structural and static test reconciliation read
+their complete indexed scopes.
 
 New successful cache entries are written as one disk batch **after** the graph
 transaction commits. Deletion handling invalidates existing entries during
 archival. The graph and JSON cache are separate persistence boundaries; completed
 artifact provenance permits recovery when a cache entry is missing. Mismatched
-existing entries require recompilation. A checkpoint writes to a staged file and
-clears the WAL after the new generation replaces the old one.
-Compilation, including the refresh during task completion, evaluates checkpointing
-after applying changes. Opening the graph for compilation can replay the
-existing WAL without rewriting the checkpoint first.
+existing entries require recompilation. Under the exclusive graph lock, a
+checkpoint writes to a staged file and closes the active memory map before
+publishing the new generation. The adapter clears the WAL after publication.
+If replacement fails, the previous checkpoint and its WAL remain available.
+Compilation evaluates checkpointing after applying changes. Opening the graph
+for compilation can replay the existing WAL without rewriting the checkpoint first.
 See [Storage transactions](STORAGE.md#transactions).
 
 Every run that reaches transaction persistence records a `CompilationRun` and
@@ -66,44 +83,67 @@ upserts, while the changed-symbol summary excludes equivalent symbols and
 line-only movement; see [Project compilation](CLI.md#project-compilation).
 
 `reql edit` checks target files against the latest compiled project revision
-before writing. It refreshes the graph after edits and reports compilation
-errors alongside the applied paths. Assigned `reql agent finish` refreshes
-after saved checks pass with stable inputs. For tasks with a saved source check,
-edit files directly so finish can check them before refreshing.
-Both commands use the same incremental compiler, configured scan policy, and
-graph writer lock as `project compile`.
+before writing. Plans and source files have no built-in size or edit-count
+ceiling. The source editor waits for the native edit lock, then validates file
+hashes and applies the plan. The command refreshes the graph after edits and
+reports compilation errors alongside the applied paths. It uses the same incremental
+compiler, configured scan policy, and graph writer lock as `project compile`.
 
-Agent Workspace checks claim ownership before verification. After checks
-and refresh, it checks the active session and the coordination transaction
-checks the task revision and prerequisites. Completion, return of unfinished
-claims to the queue, and checkpoint publication commit together before closing
-the private session. A verification or refresh failure leaves the session and
-claim active. A claim is also committed before optional source retrieval.
-If retrieval fails after that commit, the CLI reports the claim, available
+Agents pass focused checks before running broader checks. They refresh the
+graph after direct edits and supply results at handoff.
+Agent Workspace checks the active session, and the
+coordination transaction checks the claim, task revision, and prerequisites.
+Workspace store opens wait for native shared or exclusive locks.
+Completion, return of unfinished claims to the queue, and checkpoint publication
+commit together before closing the private session. The checkpoint links all
+session work and stores pending next actions. A claim is also committed
+before optional source retrieval.
+The CLI waits for the shared graph lease after that commit.
+If retrieval fails, the CLI reports the claim, available
 shared context, and a source retry. Claim identity and revision are checked
 separately from prerequisite readiness. A claim waiting for prerequisites can
-still retrieve source evidence.
+still retrieve source evidence. Work recovery follows the full matched causal
+scope before applying any result limit supplied by the caller.
+JSON claim results include source locations. Add `--source` to embed verified
+bodies. Text follow-ups can use the displayed ranges and hashes from an
+earlier brief to avoid repeating source.
+
+For a task query, resolve the project from the indexed paths in the assignment
+before ranking. Use the same project for follow-up queries. Omit project source
+if several projects are indexed and the assignment does not identify one. A
+test-only request uses indexed test source for both ranked results and
+assigned-file recovery.
+
+Verification plans run focused checks before broad checks. A failed check ends
+the plan. For a check with declared inputs, REQL verifies the revision and
+input hashes before reusing a receipt or saving a new pass.
+
+### Workflow projections
+
+Explanation uses the configured hop limit for graph relationships and
+corroborating imports. Pipeline and HTML graph exports use the same directed
+root selector, including cycles, when a project has no qualifying explicit
+trigger. Pipeline also resolves imports supported by available source evidence.
+See [Analysis and report policies](CONFIGURATION.md#analysis-and-report-policies).
 
 ### Cache and fingerprints
 
-The cache and compiler share an artifact fingerprint policy. An explicit parser
-or chunking version applies project-wide, including when compilers use different
-options on the same service. Cache entries compare:
+The cache and compiler share an artifact fingerprint policy based on the REQL
+release version from `src/config.py`. Cache entries compare the following values.
 
 - artifact SHA-256, size and modification time;
-- parser and chunking versions;
 - effective compilation-options hash and active status.
 
 Both cache hits and recovery also require a matching successfully compiled
 digest and compiler-contract fingerprint on the active `SourceArtifact`.
-Scan-time metadata alone cannot validate compiled spans or failed work.
-For code, the fingerprint includes the grammar selected by the parser catalog,
-the Tree-sitter runtime and grammar package versions, and the extractor's
-inherited revisions.
-Built-in document parsers use a separate contract without grammar dependencies.
-Custom compilers and parsers use a conservative contract that tracks the full
-grammar environment. Entries with an earlier fingerprint are rebuilt once at
-the next successful compilation. The graph and disk-cache formats stay the same.
+The fingerprint includes the REQL release version and the compiler contract version. A changed fingerprint triggers
+recompilation and replaces the cache snapshot on disk and in the graph.
+Code fingerprints also include the selected grammar, extractor and relevant
+Tree-sitter dependency versions. Built-in document fingerprints depend on the
+release and compile options, including the core document term, relation and
+event policy. Custom compilers and parsers track the full
+grammar environment. Graph storage and cache serialization use their own
+format identifiers for compatibility.
 
 The primary cache is `<project>/.reql/artifact-cache.json`. Planning builds one
 active project map from disk and graph cache records. Missing entries can be
@@ -116,9 +156,18 @@ reconciles deletions and invalidates their existing cache entries. Changing
 options without cache writes cannot make an earlier cache entry valid for a
 different graph snapshot.
 
+The block adapter builds lexical postings from the complete node text and
+searchable metadata. On a policy mismatch, it rebuilds from canonical nodes
+and the current WAL overlay. Compilation checkpoints rebuilt postings with
+the effective policy key.
+
 Context-scope metadata is written by artifact/code/document producers. Clean
 artifacts are not revisited to repair missing fields; recompile an incomplete
-artifact so its producer writes the canonical representation.
+artifact so its producer writes the canonical representation. Changes to
+`testing.discovery.directories` invalidate cached compilation. Recompilation
+updates test scope and test cases, archives removed classifications and
+reconciles static `TESTS` edges. The summary gathers direct relationships and matches test
+filenames across the project, then adds up to eight lexical matches.
 
 ## Graph Records
 
@@ -131,10 +180,19 @@ artifact so its producer writes the canonical representation.
 | `ProjectRevision` | Content-addressed manifest, parent revision and changed file paths |
 
 Successful code compiles reconcile AST-backed `TESTS` edges after cross-file
-resolution and deletion handling. Test execution observations remain in a
+resolution and deletion handling. Test scope uses configured directory expressions
+and built-in filename conventions. The compiler, summary, retrieval, explanation,
+pipeline and graph export share the classification. Compilation summaries
+limit associated tests to the project that produced the revision. For ECMAScript, literal test
+callbacks include `test` and `it`, named imports from supported test runners,
+and the `only`, `skip` and `concurrent` modifiers. Test execution observations remain in a
 separate store. Reads compare captured hashes against the test and target files
 and their compiled provenance. An unrelated revision leaves matching hashes
 valid.
+For brief queries that name exact test files, retrieval scopes lexical
+test candidates to those files before it adds association evidence.
+An association supplies the projected test name and source range.
+Assigned briefs share one section budget across verified Markdown outlines.
 
 Change collections use sets internally and ordered lists at persistence/public
 boundaries. Edges use the persisted ids returned by upserts, including when a
@@ -209,8 +267,9 @@ Python, decorators/modifiers, type hints where available, and call targets from 
 including the nearest function or method owner for each call. Solidity extraction
 emits contract, interface, library, struct, enum, event, constructor, modifier,
 receive/fallback, and function symbols; resolves relative imports and Foundry
-remappings from `remappings.txt` and `foundry.toml`; links resolvable imports to
-real `File` nodes; records `EMITS` for events, `USES` for `using` directives,
+remappings from `remappings.txt` and `foundry.toml`; changes to these files
+refresh Solidity artifacts. Compilation links resolvable imports to
+real `File` nodes and records `EMITS` for events, `USES` for `using` directives,
 `INSTANTIATES` for `new` expressions, and filters Solidity builtins such as
 `require`, `assert`, `revert`, `msg`, `abi`, `block`, and `tx`.
 Other recognized languages use the reusable Tree-sitter profile extractor with
@@ -245,7 +304,9 @@ Tree-sitter wheels declare the corresponding grammar module.
 
 `JavaScriptTreeSitterExtractor` owns the shared ECMAScript walker. TypeScript
 inherits those extraction rules, and TSX inherits TypeScript; each class selects
-its corresponding grammar through the existing factory registration.
+its corresponding grammar through the existing factory registration. Relative
+extensionless imports resolve local files or directory indexes across the
+supported ECMAScript extensions, including .mts and .cts.
 
 Tree-sitter is a mandatory runtime dependency. REQL does not fall back to the
 standard-library Python `ast` parser, regex parsing, or any other code parser.
@@ -269,11 +330,10 @@ Code artifacts also produce `SourceFragment` nodes for major supported-language
 symbols. Code block fragment IDs are based on the artifact and symbol qualified
 name rather than line offsets, so moving a function or class does not create a
 new fragment for the same symbol. Repeated compiles do not duplicate symbols or
-fragments. Unresolved calls do not create standalone call-site nodes;
-non-builtin unresolved call targets are stored as `unresolved_calls`
-summaries on the owning function or method. Language builtins and calls through
-names imported by the artifact, such as `os.getcwd` after `import os`, are
-filtered out as low-signal graph noise.
+fragments. The owning function or method stores unresolved calls in
+`unresolved_calls`. The compiler checks the artifact's imported bindings and,
+for Python, the runtime's built-in names before recording an unresolved call.
+The Python runtime version is part of the compilation fingerprint.
 Computed receivers such as `super().execute()`, `factory().execute()` and
 `items[0].execute()` do not establish a local target by method name alone. Their
 full targets remain in unresolved-call summaries, including builtin receiver
@@ -292,7 +352,12 @@ signals that are useful during repository queries. These findings are stored as
 `possibly_unused_function`, `possibly_unused_method`, and
 `possibly_unused_class`. Function, method, and class findings are intentionally
 scoped to references detected in the compiled artifact, so they should be read
-as local cleanup candidates rather than whole-program proof. Public functions,
+as local cleanup candidates rather than whole-program proof. Resolved project
+references and named imports suppress these candidates. Unresolved call names
+alone do not. A candidate returns when the last resolved use disappears,
+including after an incremental update or deletion. Retention keeps the
+suppressed candidate and its evidence while its declaration remains active.
+Public functions,
 classes, and methods are marked as API-risk candidates with lower confidence and
 `cleanup_priority=low`, and test artifacts do not emit `possibly_unused_*`
 findings for test classes or test methods. Test-local unused imports and
@@ -312,11 +377,24 @@ See [cleanup retrieval](CLI.md#retrieval-commands) for the safe-remove
 projection and [finding queries](REQL.md#code-graph-examples) for inspecting
 candidates that require validation.
 
-Application-surface compilation connects CSS selectors with matching template
-attributes and JavaScript selector/class APIs. It also emits
-`unused_css_class` and high-confidence `always_overridden_css_declaration`
-findings. PHP `include`/`require` partials resolve static paths to view files.
-Template-render edges expose detected `view_variables`.
+Application-surface compilation connects case-sensitive CSS class and ID
+selectors with literal HTML attributes and JavaScript selector/class APIs.
+Selectors in compound DOM queries and multiple literal class-list arguments
+contribute usage evidence. It emits `unused_css_class` and
+`always_overridden_css_declaration` for identical values repeated in one rule.
+Different values or separate rules produce `possibly_overridden_css_declaration`
+findings that require validation. PHP `include`/`require` partials resolve static
+paths to view files. Controller templates also resolve in sibling
+`Views` or `views` directories. Template-render edges expose detected `view_variables`.
+Adding or removing a template refreshes sources with recorded literal render
+or include references.
+
+Python endpoint extraction uses source-local HTTP framework receiver bindings
+and literal decorator arguments. Explicit methods and constructor prefixes
+become route facts. The standalone `@route` convention remains supported.
+Each handler owns its endpoint identity, including when handlers share a route.
+The first compile after the change refreshes cached facts and archives stale
+endpoint and CSS findings.
 
 Package `__init__.py` imports are marked on `Import` nodes with
 `is_re_export=true`. A project-wide post-parse pass resolves them to real public
@@ -333,12 +411,10 @@ after changed artifacts and stale links are deactivated.
 Unrecognized code-like artifacts register project structure (`Project`,
 `Directory`, `File`, `SourceArtifact`, and `CONTAINS`) without parser errors.
 
-External or synthetic `CodeSymbol` nodes are only created for meaningful names
-such as unresolved decorators, base classes, or type hints. Null-like names,
-builtins, names already represented by imports, and builtin generic forms such
-as `list[str]` are ignored, and external symbols are excluded from default hub
-rankings and top-symbol report sections so they do not drown out real project
-functions, classes, and methods.
+Synthetic `CodeSymbol` nodes represent external names from parsed code, such as
+decorators, bases and type hints. Imported bindings and Python built-ins are
+already known to the compiler. Explicit raises record the exception name,
+including built-in and imported exceptions.
 
 ### C syntax recovery
 
@@ -372,9 +448,13 @@ uv venv
 uv pip install -e .
 ```
 
-Parser construction uses the declared Tree-sitter 0.25 API: `Parser(language)`.
-Grammar providers return a capsule or a constructed `Language` object. Invalid
-provider values and constructor errors propagate.
+Parser construction uses `Parser(language)` with Tree-sitter 0.25 through 0.27.
+Python 3.10 resolves to a compatible release, such as Tree-sitter 0.26.1 and
+language pack 1.23.1. Python 3.11 and later can use Tree-sitter 0.27.0 and
+language pack 1.25.2. Grammar providers return a capsule or a constructed
+`Language` object. The loader wraps the pointer from older standalone Solidity
+wheels in a Tree-sitter capsule. Invalid provider values and constructor errors
+propagate.
 
 Compilation never downloads fallback grammars. Language-pack versions can fetch
 missing parsers from GitHub on `get_language`; REQL checks their local inventory
@@ -400,24 +480,16 @@ source or clearing the graph.
 
 - Edit the shared walker when a change applies to JavaScript, TypeScript, and
   TSX. They all use [javascript.py](../src/memory/code_analysis/languages/javascript.py).
-- Advance `facts_revision` on the extractor whose persisted facts change
-  (start at 1). Revisions accumulate through inheritance, so changing the
-  shared JavaScript walker invalidates JavaScript, TypeScript, and TSX.
-- Advance `PARSER_FACTS_VERSION` in
-  [fingerprint.py](../src/memory/artifacts/fingerprint.py) for project-wide
-  changes to persisted compiler facts.
+- Use the release version in [config.py](../src/config.py) to invalidate persisted
+  facts across code and documents when releasing parser changes.
 - Test extracted behavior separately through `MemoryGraph.compile_project` as in
   [test_symbol_resolution.py](../tests/test_symbol_resolution.py). Close the
   graph with `contextlib.closing(MemoryGraph.open(...))` or in `finally`.
-- To test scoped invalidation in process, hold source, store and compilation
-  options fixed. Change the relevant extractor revision and use a new
-  `IncrementalCompilationService`. Check which files were rebuilt and confirm
-  the next unchanged compile reports zero changes. Explicit `parser_version`
-  values override the project-wide contract. See
-  [test_incremental_integrity.py](../tests/test_incremental_integrity.py).
-  To test migration from the previous extracted facts, seed the index with the
-  previous extractor in a separate checkout. The version override changes cache
-  identity.
+- Test release invalidation with fixed source, store and compilation options.
+  Compile with the new release version and confirm that the next unchanged
+  compile reports zero changes. Grammar-package changes affect the artifacts
+  that use the corresponding grammar.
+  [test_incremental_integrity.py](../tests/test_incremental_integrity.py)
 
 ## Document Ingestion
 
@@ -429,8 +501,8 @@ Artifact ingestion turns registered `SourceArtifact` files into parsed
 - Markdown: headings, paragraphs, lists, fenced code blocks, inline links, and
   simple pipe tables.
 - Plain text and text-like artifacts: paragraph chunks with preserved line
-  ranges and character offsets, including unknown UTF-8 text files. Recognized
-  code formats use the code parser instead.
+  ranges and character offsets, including unknown UTF-8 or recognized UTF-16
+  text files. Recognized code formats use the code parser.
 - PDF: text and page-based fragments when the [optional parser](#pdf-fallback)
   is available.
 - Code: registered Tree-sitter parsers create technical graph facts and source
@@ -438,10 +510,20 @@ Artifact ingestion turns registered `SourceArtifact` files into parsed
 - Image and video files are skipped during project compilation and are not parsed,
   registered, or compiled.
 
+The scanner recognizes UTF-16 with a byte-order mark or a strong alternating
+null-byte pattern. Code compilation, document parsing and source previews use
+the same encoding detection. Stylesheets, scripts and supported template
+formats share the application scope and surface linker classification regardless
+of directory. Markdown in a view directory keeps its documentation scope.
+
 Files with a Markdown extension use the Markdown parser. Extensionless files
 and `.txt` files with Markdown markup can use it based on a sample of their
-contents. Plain text is indexed in paragraph chunks when document ingestion
-is enabled. Document fragments participate in `query_context --docs`.
+contents. A recognized interpreter shebang takes priority over Markdown
+comments in extensionless scripts. Reclassification from code to a document
+archives the previous code graph. Markdown extracts ATX and single-line Setext
+headings. Fenced blocks close on the same marker character with at least the
+opening marker count and each block has its own fragment. Plain-text chunks
+retain their own line and character spans, including in CRLF files. Document fragments participate in `query_context --docs`.
 Configured formats and document policy are described in
 [Configuration](CONFIGURATION.md#behavior).
 
@@ -482,7 +564,7 @@ are deduplicated by artifact and structural hash, so changed text updates an
 existing same-position fragment instead of duplicating it.
 
 Text documents in compile mode (`markdown`, `text`, `config`, `data`, and
-unknown UTF-8 text) are compiled structurally into fragments and document
+unknown text in supported encodings) are compiled structurally into fragments and document
 relations. Document text remains a lower-level source layer used for
 provenance, code linking, and query context around the code graph.
 
@@ -492,10 +574,11 @@ concepts that are archived when their headings disappear. The
 [document relations](REQL.md#document-relations) connect fragments to their
 artifact, sections, links, code blocks, and compiled symbols.
 
-Document-code links require an explicit high-signal mention, such as a qualified
-module, function, class, method, route, endpoint, schema, filename, or path.
-The linker caps results at eight targets per fragment and skips generic headings
-and short terms such as `usage`, `config`, `api`, `project`, and `architecture`.
+Document-code links use unique indexed names, qualified names, paths and routes.
+Use inline code or call syntax to reference a plain identifier such as `api`.
+An identifier with internal capitals, digits or underscores can also match
+its indexed spelling in prose. The same rules apply to headings. The linker
+keeps up to eight targets per fragment.
 
 Parser metadata and parser errors are stored on both the artifact and fragment
 properties where relevant. See [failure behavior](#failure-behavior) for
@@ -504,14 +587,15 @@ compilation outcomes.
 ### PDF fallback
 
 With `compile.documents.pdf` enabled, the optional `pypdf` dependency extracts
-text. Missing dependencies produce metadata-only fragments and artifact
-properties such as `needs_parser` or `partially_readable` where appropriate.
+text from the compiler's verified byte snapshot. A missing `pypdf` package
+produces metadata-only fragments with `needs_parser`. Failures importing an
+installed package are surfaced as compilation errors.
 
 ### Adding a document parser
 
 Add document format parsers under `memory/document_ingestion/formats/` and
 inherit `BaseDocumentParser` from `memory.document_ingestion.base`. The common
-base handles format support checks, UTF-8 decoding with replacement, file
+base handles format support checks, text decoding with replacement, file
 metadata, and path-derived titles. Register new parsers in
 `default_parser_registry()` when they should participate in project
 compilation. Keep optional format dependencies graceful, following the PDF

@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from api import MemoryGraph
+from config import VERSION
 from memory.artifacts.cache import artifact_cache_path
 from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.options import CompilationOptions
-from memory.artifacts.fingerprint import DEFAULT_PARSER_VERSION, tree_sitter_versions
-from memory.code_analysis.languages.javascript import JavaScriptTreeSitterExtractor
+from memory.artifacts.fingerprint import tree_sitter_versions
 from memory.code_analysis.parser_base import default_code_parser_registry
+from memory.document_ingestion.base import default_parser_registry
 from memory.domain.exceptions import StorageError
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
 
@@ -91,30 +93,26 @@ class IncrementalIntegrityTests(unittest.TestCase):
         doc_artifact = next(item for item in enabled.scan.artifacts if item.relative_path == "guide.md")
         self.assertTrue(self.graph.store.find_nodes_by_property("artifact_id", doc_artifact.id, type_="SourceFragment"))
 
-    def test_matching_missing_cache_recovers_but_new_parser_version_recompiles(self) -> None:
-        """Recovery requires the same compiler version as the completed source snapshot."""
+    def test_matching_missing_cache_recovers_but_new_release_recompiles(self) -> None:
+        """Recovery requires the release that produced the completed source snapshot."""
         options = CompilationOptions.from_config(self.graph.config)
         self.assertEqual(self.graph.compile_project(self.root, parsing_options=options).run.files_changed, 1)
-        matching = IncrementalCompilationService(
-            self.graph.store, parser_version=DEFAULT_PARSER_VERSION, compile_options=options,
-        )
-        self.assertEqual(matching.compile_path(self.root).run.files_changed, 0)
+        self.assertEqual(self._incremental_service().compile_path(self.root).run.files_changed, 0)
         self.graph.clear_cache(self.root)
         self.assertEqual(self.graph.compile_project(self.root, parsing_options=options).run.files_changed, 0)
         self.graph.clear_cache(self.root)
-        upgraded = IncrementalCompilationService(
-            self.graph.store, parser_version=DEFAULT_PARSER_VERSION + "-next", compile_options=options,
-        )
-        self.assertEqual(upgraded.compile_path(self.root).run.files_changed, 1)
-        self.assertEqual(upgraded.compile_path(self.root).run.files_changed, 0)
-        upgraded.clear_cache(self.root)
-        self.assertEqual(upgraded.compile_path(self.root).run.files_changed, 0)
-        self.assertEqual(upgraded.cache_status(self.root)["dirty_artifacts"], 0)
+        with patch("memory.artifacts.compile_identity.VERSION", VERSION + "-next"):
+            upgraded = self._incremental_service()
+            self.assertEqual(upgraded.compile_path(self.root).run.files_changed, 1)
+            self.assertEqual(upgraded.compile_path(self.root).run.files_changed, 0)
+            upgraded.clear_cache(self.root)
+            self.assertEqual(upgraded.compile_path(self.root).run.files_changed, 0)
+            self.assertEqual(upgraded.cache_status(self.root)["dirty_artifacts"], 0)
 
-    def test_changing_chunk_contract_and_options_uses_one_compilation_fingerprint(self) -> None:
-        """The compiler, cache and option-specific compiler agree after each upgrade."""
+    def test_changing_options_uses_one_compilation_fingerprint(self) -> None:
+        """The compiler and cache agree when one service compiles with different options."""
         self.graph.compile_project(self.root)
-        service = IncrementalCompilationService(self.graph.store, chunking_version="test-chunks-v2")
+        service = self._incremental_service()
         options = CompilationOptions(ingest_documents=False)
         run = service.compile_path(self.root, parsing_options=options)
         self.assertFalse(run.run.errors)
@@ -125,16 +123,28 @@ class IncrementalIntegrityTests(unittest.TestCase):
         self.assertEqual(service.compile_path(self.root, parsing_options=options).run.files_changed, 0)
         self.assertEqual(service.cache_status(self.root, parsing_options=options)["dirty_artifacts"], 0)
 
-    def test_extractor_upgrade_reuses_unaffected_artifacts(self) -> None:
-        """A shared walker revision invalidates JavaScript, TypeScript and TSX only."""
-        expected = self._write_mixed_project()
+    def test_builtin_parsers_use_the_reql_version(self) -> None:
+        """Persist REQL's version on the artifacts parsed by built-in parsers."""
+        (self.root / "guide.md").write_text("# Guide\n\nUsing the invoice rules.\n", encoding="utf-8")
+        (self.root / "guide.txt").write_text("Using the invoice rules.\n", encoding="utf-8")
+        result = self.graph.compile_project(self.root, parsing_options=CompilationOptions())
+        self.assertFalse(result.run.errors)
+        self.assertEqual(result.run.files_changed, 3)
+        self.assertEqual({parser.parser_version for parser in default_parser_registry().parsers}, {VERSION})
+        self.assertEqual(
+            {self.graph.store.get_node(artifact.id).properties["parser_version"] for artifact in result.scan.artifacts},
+            {VERSION},
+        )
+
+    def test_reql_upgrade_recompiles_code_and_documents(self) -> None:
+        """A release change invalidates cached facts for every built-in parser."""
+        self._write_mixed_project()
         initial = self._incremental_service().compile_path(self.root)
         self.assertFalse(initial.run.errors)
         self.assertEqual(initial.run.files_changed, 5)
-        revision = JavaScriptTreeSitterExtractor.facts_revision + 1
-        with patch.object(JavaScriptTreeSitterExtractor, "facts_revision", revision):
+        with patch("memory.artifacts.compile_identity.VERSION", VERSION + "-next"):
             service = self._incremental_service()
-            self._assert_recompiled(service, initial, expected)
+            self._assert_recompiled(service, initial, {artifact.relative_path for artifact in initial.scan.artifacts})
             service.clear_cache(self.root)
             self.assertEqual(service.compile_path(self.root).run.files_changed, 0)
 
@@ -147,16 +157,41 @@ class IncrementalIntegrityTests(unittest.TestCase):
         with patch("memory.artifacts.compile_identity.tree_sitter_versions", return_value=versions):
             self._assert_recompiled(self._incremental_service(), initial, {"widget.ts", "widget.tsx"})
 
-    def test_explicit_project_version_still_invalidates_all_artifacts(self) -> None:
-        """Callers can explicitly advance the overall compilation contract."""
-        self._write_mixed_project()
-        initial = self._incremental_service().compile_path(self.root)
-        updated = self._incremental_service(parser_version=DEFAULT_PARSER_VERSION + "-project-upgrade")
-        self._assert_recompiled(updated, initial, {artifact.relative_path for artifact in initial.scan.artifacts})
+    def test_recompile_replaces_obsolete_cache_fields(self) -> None:
+        """Rewrite old disk and graph cache snapshots without separate versions."""
+        initial = self.graph.compile_project(self.root)
+        self.assertFalse(initial.run.errors)
+        artifact = initial.scan.artifacts[0]
+        path = artifact_cache_path(self.root)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        entry = payload["projects"][artifact.project_id]["entries"][artifact.id]
+        old_fields = {"parser_version": "project-scan-v10", "chunking_version": "uncompiled-v1"}
+        entry.update(old_fields)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        self.graph.store.update_node_fields(entry["id"], properties=entry)
+        node = self.graph.store.get_node(artifact.id)
+        self.graph.store.update_node_fields(
+            artifact.id, properties={**node.properties, "compilation_fingerprint": "old-compiler-contract"},
+        )
 
-    def test_injected_registry_honors_the_registered_builtin_extractor(self) -> None:
-        """Document options and explicit registry injection preserve code version checks."""
-        expected = self._write_mixed_project()
+        reports = self.graph.project_report(self.root, output_dir=Path(self.temp.name) / "reports")
+        for report in (reports.graph_report, reports.cache_report):
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("Dirty artifacts: 1", text)
+
+        refreshed = self.graph.compile_project(self.root)
+        self.assertFalse(refreshed.run.errors)
+        self.assertEqual(refreshed.run.files_changed, 1)
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        disk_entry = disk["projects"][artifact.project_id]["entries"][artifact.id]
+        graph_entry = self.graph.store.get_node(entry["id"])
+        self.assertEqual(graph_entry.properties, disk_entry)
+        self.assertFalse(old_fields.keys() & disk_entry.keys())
+        self.assertEqual(self.graph.compile_project(self.root).run.files_changed, 0)
+
+    def test_injected_registry_preserves_grammar_scoped_code_fingerprints(self) -> None:
+        """A TypeScript update refreshes its consumers and the custom document contract."""
+        self._write_mixed_project()
         options = CompilationOptions.from_config(self.graph.config)
 
         def service() -> IncrementalCompilationService:
@@ -166,21 +201,21 @@ class IncrementalIntegrityTests(unittest.TestCase):
             return IncrementalCompilationService(self.graph.store, compiler=compiler)
 
         initial = service().compile_path(self.root)
-        revision = JavaScriptTreeSitterExtractor.facts_revision + 1
-        with patch.object(JavaScriptTreeSitterExtractor, "facts_revision", revision):
-            self._assert_recompiled(service(), initial, expected)
+        self.assertFalse(initial.run.errors)
+        versions = {**tree_sitter_versions(), "tree-sitter-typescript": "new-version"}
+        with patch("memory.artifacts.compile_identity.tree_sitter_versions", return_value=versions):
+            self._assert_recompiled(service(), initial, {"widget.ts", "widget.tsx", "guide.md"})
 
-    def _write_mixed_project(self) -> set[str]:
+    def _write_mixed_project(self) -> None:
         code = {"widget.js": "function widget() { return 1; }\n",
                 "widget.ts": "function widget(): number { return 1; }\n",
                 "widget.tsx": "function Widget() { return <div />; }\n"}
         for path, content in {**code, "guide.md": "# Widget\n\nUsage guide.\n"}.items():
             (self.root / path).write_text(content, encoding="utf-8")
-        return set(code)
 
-    def _incremental_service(self, *, parser_version: str | None = None) -> IncrementalCompilationService:
+    def _incremental_service(self) -> IncrementalCompilationService:
         return IncrementalCompilationService(
-            self.graph.store, parser_version=parser_version, compile_options=CompilationOptions.from_config(self.graph.config),
+            self.graph.store, compile_options=CompilationOptions.from_config(self.graph.config),
         )
 
     def _assert_recompiled(

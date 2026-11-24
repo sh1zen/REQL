@@ -8,15 +8,21 @@ from ..base import BaseDocumentParser
 from ..metadata import line_offsets, make_fragment
 from ..models import DocumentFragment, DocumentLink, DocumentParseResult, DocumentTable
 
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
-FENCE_RE = re.compile(r"^(```+|~~~+)\s*([A-Za-z0-9_+.-]+)?\s*$")
+HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?)\s*|$)")
+SETEXT_RE = re.compile(r"^ {0,3}(=+|-+)\s*$")
+FENCE_RE = re.compile(r"^ {0,3}(```+|~~~+)\s*([A-Za-z0-9_+.-]+)?\s*$")
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
 
 
+def closes_fence(line: str, opening: str) -> bool:
+    """Match a closing Markdown fence of the same character and sufficient length."""
+    marker = FENCE_RE.fullmatch(line)
+    return bool(marker and marker[2] is None and marker[1].startswith(opening))
+
+
 class MarkdownParser(BaseDocumentParser):
     parser_name = "markdown"
-    parser_version = "markdown-v2"
     artifact_types = frozenset({"markdown"})
     languages = frozenset({"markdown"})
 
@@ -41,10 +47,9 @@ class MarkdownParser(BaseDocumentParser):
                 i += 1
                 continue
 
-            heading = HEADING_RE.match(line)
+            heading = _heading_at(lines, i)
             if heading:
-                level = len(heading.group(1))
-                heading_text = heading.group(2).strip().strip("#").strip()
+                level, heading_text, end = heading
                 if level == 1 and title == self.title_from_path(artifact):
                     title = heading_text
                 heading_stack = [item for item in heading_stack if item[0] < level]
@@ -55,9 +60,9 @@ class MarkdownParser(BaseDocumentParser):
                     text=heading_text,
                     index=index,
                     start_line=line_number,
-                    end_line=line_number,
+                    end_line=end + 1,
                     start_offset=_offset(offsets, i),
-                    end_offset=_offset(offsets, i) + len(line),
+                    end_offset=_line_end(offsets, lines, end),
                     section_path=section_path,
                     metadata={"level": level, "parser": self.parser_name},
                 )
@@ -65,7 +70,7 @@ class MarkdownParser(BaseDocumentParser):
                 current_heading_id = fragment.id
                 heading_stack.append((level, heading_text, fragment.id))
                 index += 1
-                i += 1
+                i = end + 1
                 continue
 
             fence = FENCE_RE.match(line)
@@ -75,7 +80,7 @@ class MarkdownParser(BaseDocumentParser):
                 start = i
                 i += 1
                 body: list[str] = []
-                while i < len(lines) and not lines[i].startswith(fence_token[:3]):
+                while i < len(lines) and not closes_fence(lines[i], fence_token):
                     body.append(lines[i])
                     i += 1
                 end = i if i < len(lines) else max(start, i - 1)
@@ -191,7 +196,20 @@ def _collect_references(fragment: DocumentFragment, links: list[DocumentLink]) -
 
 def _is_block_start(lines: list[str], index: int) -> bool:
     line = lines[index]
-    return bool(HEADING_RE.match(line) or FENCE_RE.match(line) or LIST_RE.match(line) or _is_table_start(lines, index))
+    return bool(_heading_at(lines, index) or FENCE_RE.match(line) or LIST_RE.match(line) or _is_table_start(lines, index))
+
+
+def _heading_at(lines: list[str], index: int) -> tuple[int, str, int] | None:
+    """Extract ATX headings and single-line Setext headings."""
+    line = lines[index]
+    if match := HEADING_RE.fullmatch(line):
+        text = re.sub(r"(?:^|[ \t]+)#+$", "", match[2] or "").strip()
+        return len(match[1]), text, index
+    if (index + 1 < len(lines) and line.strip() and not line.startswith(("    ", "\t"))
+            and not (FENCE_RE.match(line) or LIST_RE.match(line) or SETEXT_RE.match(line))
+            and (underline := SETEXT_RE.fullmatch(lines[index + 1]))):
+        return (1 if underline[1][0] == "=" else 2), line.strip(), index + 1
+    return None
 
 
 def _is_table_start(lines: list[str], index: int) -> bool:

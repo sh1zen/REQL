@@ -30,7 +30,7 @@ def structural_hash(
     section_path: str | None = None,
 ) -> str:
     if fragment_type == "code_block" and section_path:
-        return content_hash(fragment_type, section_path)
+        return content_hash(fragment_type, index, section_path)
     return content_hash(fragment_type, index, start_line, end_line, page_number, section_path)
 
 

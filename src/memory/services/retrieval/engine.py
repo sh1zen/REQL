@@ -5,6 +5,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
 
+from ...config import REQLConfig, default_config
 from ...diagnostics import PerformanceLogger
 from ...domain.constants import INACTIVE_STATUSES
 from ...domain.ids import stable_id
@@ -14,6 +15,7 @@ from ...extraction.deterministic import DeterministicExtractor
 from ...extraction.normalization import canonicalize
 from ...storage.extractor import SemanticExtractor
 from ...storage.graph_store import GraphStore
+from ...testing import TestIntelligenceService
 from .common import (
     CODE_CONTEXT_EDGE_TYPES,
     CODE_CONTEXT_NODE_TYPES,
@@ -29,10 +31,7 @@ from .context.renderers.markdown import MarkdownContextRendererMixin
 from .context.service import ContextServiceMixin
 from .context.models import NodeMatchMetrics
 from .expansion import GraphExpansionMixin
-from .search import RetrievalSearchMixin, RANKED_SYMBOL_TYPES
-
-
-RANKING_PROFILE = "v2"
+from .search import RANKED_SYMBOL_TYPES, RetrievalSearchMixin, symbol_lookup_key
 
 
 class RetrievalEngine(
@@ -51,27 +50,42 @@ class RetrievalEngine(
     the retrieval pipeline while preserving the established method contracts.
     """
     def __init__(self, store: GraphStore, extractor: SemanticExtractor | None = None, *,
-                 profile_logger: PerformanceLogger | None = None) -> None:
+                 profile_logger: PerformanceLogger | None = None,
+                 config: REQLConfig | None = None) -> None:
         self.store = store
-        self.extractor = extractor or DeterministicExtractor()
+        config = config or default_config()
+        self.policy = config.retrieval
+        self.test_discovery = config.testing.discovery
+        self.test_intelligence = TestIntelligenceService(store, policy=config.storage,
+                                                         suggestions=config.testing.suggestions)
+        self.normalization = config.lexical.normalization
+        self.extractor = extractor or DeterministicExtractor(
+            policy=config.lexical.seeds, normalization=self.normalization,
+        )
         self.profile_logger = profile_logger
 
-    def retrieve(self, query: MemoryQuery) -> MemorySubgraph:
+    def retrieve(self, query: MemoryQuery, *, complete: bool = False) -> MemorySubgraph:
+        """Rank the full candidate scope and apply the requested result count."""
         profile = self.profile_logger
         with (profile.span("retrieval.total", top_k=query.top_k, max_depth=query.max_depth) if profile else nullcontext()):
-            return self._retrieve(query, profile=profile)
+            return self._retrieve(query, profile=profile, complete=complete or query.top_k is None)
 
     @staticmethod
     def _is_graph_layer_node(node: MemoryNode) -> bool:
         return node.type not in TECHNICAL_NODE_TYPES
 
-    def _retrieve(self, query: MemoryQuery, *, profile: PerformanceLogger | None) -> MemorySubgraph:
+    def _retrieve(
+        self, query: MemoryQuery, *, profile: PerformanceLogger | None, complete: bool,
+    ) -> MemorySubgraph:
+        search, ranking = self.policy.search, self.policy.ranking
+        top_k = query.top_k
         seed_scores: OrderedDict[str, float] = OrderedDict()
         match_metrics: dict[str, NodeMatchMetrics] = {}
         with (profile.span("retrieval.tokenize") if profile else nullcontext()):
             query_profile = self._query_profile(query.text)
         query_scopes = self._normalize_query_context_scopes(query.context_scopes)
         terms = self._identifier_terms(query.text)
+        whole_symbol = {symbol_lookup_key(query.text.strip())}
         code_context = self._is_explicit_code_context(query.node_types) or bool(query_scopes and query_scopes <= {"code", "test"})
         traversal_edge_types = query.edge_types if query.edge_types is not None else (CODE_CONTEXT_EDGE_TYPES if code_context else DEFAULT_CONTEXT_EDGE_TYPES)
         lexical_node_types = query.node_types
@@ -85,19 +99,31 @@ class RetrievalEngine(
                 "relative_path_key",
                 normalized_query_path,
                 type_="SourceArtifact",
-                limit=20,
+                limit=None,
                 clone=False,
             )
+            if exact_artifacts and "/" not in normalized_query_path:
+                # A bare filename can also identify an indexed file below the root.
+                exact_artifacts.extend(
+                    node for node, _ in self.store.lexical_search(
+                        query.text, top_k=None, node_types={"SourceArtifact"},
+                        include_archived=query.include_archived, clone=False,
+                    )
+                    if self._node_matches_exact_query_path(node, query.text)
+                )
             for artifact in exact_artifacts:
+                if artifact.id in exact_path_nodes or not query.allows_project(artifact):
+                    continue
                 exact_path_nodes[artifact.id] = artifact
                 for file_node in self.store.find_nodes_by_property(
                     "artifact_id",
                     artifact.id,
                     type_="File",
-                    limit=20,
+                    limit=None,
                     clone=False,
                 ):
-                    exact_path_nodes[file_node.id] = file_node
+                    if query.allows_project(file_node):
+                        exact_path_nodes[file_node.id] = file_node
 
         # Exact source paths supersede canonical terms. Avoid extracting
         # and looking up seeds that would be discarded after the path lookup.
@@ -107,30 +133,29 @@ class RetrievalEngine(
             with (profile.span("retrieval.canonical_seed", topics=len(extraction.topics), entities=len(extraction.entities)) if profile else nullcontext()):
                 for topic, score in extraction.topics:
                     node = self.store.get_node_by_key("Topic", canonicalize(topic))
-                    if node:
+                    if node and query.allows_project(node):
                         if query_scopes and not self._node_matches_query_context_scope(node, query_scopes):
                             continue
                         seed_scores[node.id] = max(
                             seed_scores.get(node.id, 0.0),
-                            0.55 + 0.40 * score,
+                            search.topic_seed_base + search.topic_seed_weight * score,
                             self._direct_relevance_score(node, query.text, query_tokens=query_profile.tokens),
                         )
                 for entity, _, score in extraction.entities:
                     node = self.store.get_node_by_key("Entity", canonicalize(entity))
-                    if node:
+                    if node and query.allows_project(node):
                         if query_scopes and not self._node_matches_query_context_scope(node, query_scopes):
                             continue
                         seed_scores[node.id] = max(
                             seed_scores.get(node.id, 0.0),
-                            0.60 + 0.35 * score,
+                            search.entity_seed_base + search.entity_seed_weight * score,
                             self._direct_relevance_score(node, query.text, query_tokens=query_profile.tokens),
                         )
 
         # 2) lexical search across the graph.
-        lexical_limit = max(query.top_k * 3, 30)
-        with (profile.span("retrieval.lexical_search", top_k=lexical_limit) if profile else nullcontext()):
+        with (profile.span("retrieval.lexical_search") if profile else nullcontext()):
             if exact_path_nodes:
-                lexical_matches = [(node, 1.0) for node in exact_path_nodes.values()]
+                lexical_matches = [(node, search.exact_path_score) for node in exact_path_nodes.values()]
             else:
                 lexical_matches = (
                     self._scoped_lexical_search(
@@ -138,18 +163,19 @@ class RetrievalEngine(
                         query_profile,
                         lexical_node_types=lexical_node_types,
                         scopes=query_scopes,
-                        top_k=lexical_limit,
                         metrics_cache=match_metrics,
                     )
                     if query_scopes
-                    else self.store.lexical_search(
+                    else self._include_exact_symbols(self.store.lexical_search(
                         query.text,
-                        top_k=lexical_limit,
+                        top_k=None,
                         node_types=lexical_node_types,
                         include_archived=query.include_archived,
-                    )
+                    ), query.text, terms)
                 )
             for node, score in lexical_matches:
+                if not query.allows_project(node):
+                    continue
                 if lexical_node_types is not None and node.type not in lexical_node_types:
                     continue
                 if node.type in TECHNICAL_NODE_TYPES:
@@ -165,8 +191,11 @@ class RetrievalEngine(
                     metrics = self._node_match_metrics(node, query_profile)
                     match_metrics[node.id] = metrics
                 exact = bool(terms and self._exact_symbol_match(node, terms))
-                if exact and metrics.match_score < 0.4:
-                    metrics = replace(metrics, match_score=0.4)
+                if exact:
+                    metrics = replace(
+                        metrics, match_score=max(metrics.match_score, search.exact_symbol_match_floor),
+                        coverage=1.0 if self._exact_symbol_match(node, whole_symbol) else metrics.coverage,
+                    )
                     match_metrics[node.id] = metrics
                 if not exact and self._is_weak_multiterm_match(
                     node,
@@ -176,30 +205,30 @@ class RetrievalEngine(
                     has_strong_identifier_overlap=metrics.strong_identifier_overlap,
                 ):
                     continue
-                adjusted_score = 1.0 if exact else max(score, metrics.match_score)
+                adjusted_score = search.exact_symbol_score if exact else max(score, metrics.match_score)
                 seed_scores[node.id] = max(seed_scores.get(node.id, 0.0), adjusted_score)
 
-        exact_path_seed_scores = OrderedDict(
-            (node.id, seed_scores[node.id])
+        exact_path_seeds = {
+            node.id: node
             for node, _score in lexical_matches
             if node.id in seed_scores
             and node.type in {"File", "SourceArtifact"}
             and self._node_matches_exact_query_path(node, query.text)
-        )
-        if exact_path_nodes:
+        }
+        if exact_path_nodes or exact_path_seeds:
             # A complete path or filename is stronger intent than incidental
             # prose or extension overlap elsewhere in the graph. A scope that
             # excludes that path returns no seeds instead of unrelated matches.
-            seed_scores = exact_path_seed_scores
+            seed_scores = OrderedDict((node_id, seed_scores[node_id]) for node_id in exact_path_seeds)
         elif code_context:
-            for node_id, score in self._field_owner_seeds(query, lexical_node_types, query_scopes).items():
+            owners = self._field_owner_seeds(query, lexical_node_types, query_scopes)
+            for node_id, score in owners.items():
                 seed_scores[node_id] = max(seed_scores.get(node_id, 0.0), score)
                 metrics = match_metrics.get(node_id, NodeMatchMetrics(0.0, 0.0))
-                match_metrics[node_id] = replace(metrics, match_score=max(0.36, metrics.match_score))
+                match_metrics[node_id] = replace(metrics, match_score=max(search.field_owner_match_floor, metrics.match_score))
 
         sorted_seed_scores = sorted(seed_scores.items(), key=lambda item: (-item[1], item[0]))
-        seed_node_ids = self._pick_seed_node_ids(sorted_seed_scores, max_k=max(query.top_k * 2, 20),
-                                                gap_ratio=0.20)
+        seed_node_ids = [node_id for node_id, _ in sorted_seed_scores]
         with (profile.span("retrieval.expand", seed_nodes=len(seed_node_ids), max_depth=query.max_depth) if profile else nullcontext()):
             candidates, candidate_edges = self._expand_and_rank_candidates(
                 seed_node_ids,
@@ -214,7 +243,7 @@ class RetrievalEngine(
 
         ranked: list[RankedNode] = []
         corroborated = set()
-        if terms:
+        if terms and not complete:
             for edge in candidate_edges.values():
                 if not edge.properties.get("resolver") or edge.type not in {"CALLS", "INSTANTIATES", "REFERENCES"}:
                     continue
@@ -229,18 +258,18 @@ class RetrievalEngine(
                 if candidate.score <= 0.0 and candidate.match_score <= 0.0:
                     continue
                 exact = self._exact_symbol_match(candidate.node, terms)
-                if (exact and candidate.node.properties.get("name") in corroborated_names
+                if (not complete and exact and candidate.node.properties.get("name") in corroborated_names
                         and candidate.node.id not in corroborated
                         and str(candidate.node.properties.get("qualified_name") or "").casefold() not in terms):
                     continue
                 exact_owner = (candidate.node.type in RANKED_SYMBOL_TYPES
                                and self._node_matches_exact_query_path(candidate.node, query.text))
                 evidence = 0.0
-                if candidate.edge_ids:
-                    edge = candidate_edges[candidate.edge_ids[-1]]
+                if candidate.last_edge_id is not None:
+                    edge = candidate_edges[candidate.last_edge_id]
                     if edge.properties.get("resolver") and edge.type in {"CALLS", "INSTANTIATES", "REFERENCES", "OVERRIDES"}:
-                        evidence = 0.18
-                score = min(1.0, candidate.score + max(0.18 * exact, 0.24 * exact_owner) + evidence)
+                        evidence = ranking.resolved_edge_bonus
+                score = min(1.0, candidate.score + max(ranking.exact_symbol_bonus * exact, ranking.exact_owner_bonus * exact_owner) + evidence)
                 ranked.append(
                     RankedNode(
                         node=candidate.node,
@@ -270,7 +299,7 @@ class RetrievalEngine(
                 item.node.id,
             )
         )
-        ranked = self._diversify(ranked, query.top_k)
+        ranked = ranked[:top_k]
         if query.store_trace:
             self.store.record_usage_event(
                 query.text,
@@ -321,12 +350,14 @@ class RetrievalEngine(
 
                 direction="both",
                 edge_types=traversal_edge_types,
-                min_weight=0.25,
-                limit=80,
+                min_weight=ranking.context_min_edge_weight,
+                limit=None,
                 clone=False,
             )
             for edge, neighbor in neighbors:
                 if edge.type in TECHNICAL_EDGE_TYPES or neighbor.type in TECHNICAL_NODE_TYPES:
+                    continue
+                if not query.allows_project(neighbor):
                     continue
                 if code_context and not self._is_code_context_node(neighbor):
                     continue
@@ -363,28 +394,8 @@ class RetrievalEngine(
             nodes=public_nodes,
             edges=public_edges,
             seed_node_ids=seed_node_ids,
+            exact_paths=tuple(sorted({
+                path for node in exact_path_seeds.values() if (path := self._node_relative_path(node))
+            })),
             trace_id=trace_id,
         )
-
-    def _diversify(self, ranked: list[RankedNode], limit: int) -> list[RankedNode]:
-        """Preserve exact symbols and reserve room for independent source files."""
-        selected: list[RankedNode] = []
-        deferred: list[RankedNode] = []
-        by_path: dict[str, int] = {}
-        source_wrappers = set()
-        for item in ranked:
-            path = self._node_relative_path(item.node)
-            if path and item.node.type in {"File", "SourceArtifact", "Module"}:
-                if path in source_wrappers:
-                    continue
-                source_wrappers.add(path)
-            if path and not item.reasons.get("exact_match") and by_path.get(path, 0) >= 2:
-                deferred.append(item)
-                continue
-            if path:
-                by_path[path] = by_path.get(path, 0) + 1
-            selected.append(item)
-            if len(selected) >= limit:
-                break
-        return (selected + deferred)[:limit]
-

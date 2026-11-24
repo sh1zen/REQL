@@ -19,15 +19,14 @@ class FailureContextService:
         self.graph = graph
 
     def context(self, query: str = "", *, files: list[str] | None = None, symbol_ids: list[str] | None = None,
-                record_id: str | None = None, workstream: str | None = None, limit: int = 5,
+                record_id: str | None = None, workstream: str | None = None, limit: int | None = None,
                 records: list[dict[str, Any]] | None = None, _source_lookup: bool = False) -> dict[str, Any]:
-        if type(limit) is not int or not 1 <= limit <= 40:
-            raise ValueError("Context limit must be between 1 and 40")
+        limit = self.work.context_limit(limit)
         if not isinstance(query, str):
             raise ValueError("Failure context query must be a string")
-        if symbol_ids is not None and (not isinstance(symbol_ids, list) or len(symbol_ids) > 64
+        if symbol_ids is not None and (not isinstance(symbol_ids, list)
                                        or any(not isinstance(value, str) or not value for value in symbol_ids)):
-            raise ValueError("symbol_ids must contain at most 64 nonempty ids")
+            raise ValueError("symbol_ids must be a list of nonempty ids")
         paths = set(_paths(files if files is not None else []))
         requested = set(symbol_ids or ())
         tokens = _tokens(query)
@@ -60,23 +59,21 @@ class FailureContextService:
                 continue
             reasons = (["task or causal link"] if connected else [])
             if matched_paths:
-                reasons.append("file match " + ", ".join(sorted(matched_paths)[:3]))
+                reasons.append("file match " + ", ".join(sorted(matched_paths)))
             if matched_symbols:
                 reasons.append("verified symbol match")
             if overlap:
-                reasons.append("text match " + ", ".join(sorted(overlap)[:5]))
+                reasons.append("text match " + ", ".join(sorted(overlap)))
             item = {
                 "id": row["id"], "revision": row["revision"], "kind": "failure", "status": row["status"],
-                "content": row["content"][:320], "rationale": row["rationale"][:320],
-                "files": row["files"][:8], "reasons": reasons, "freshness": freshness,
+                "content": row["content"], "rationale": row["rationale"],
+                "files": row["files"], "reasons": reasons, "freshness": freshness,
             }
             if verified:
                 item["failure_evidence"] = verified
             ranked.append(((connected, len(matched_paths), len(matched_symbols), len(overlap),
                             freshness != "potentially_obsolete", row["updated_at"], row["id"]), item))
         selected = [item for _, item in sorted(ranked, key=lambda pair: pair[0], reverse=True)[:limit]]
-        while selected and len(json.dumps(selected, ensure_ascii=True)) > 6000:
-            selected.pop()
         revision = hashlib.sha256(json.dumps(selected, sort_keys=True).encode()).hexdigest()
         return {"format": "reql-failure-context-v1", "revision": revision, "query": query,
                 "records": selected, "total_matches": len(ranked), "omitted": len(ranked) - len(selected)}
@@ -139,16 +136,18 @@ def _related_ids(row: dict[str, Any]) -> set[str]:
 
 
 def render_failure_context(payload: dict[str, Any]) -> str:
-    """Display record revisions and match evidence in a bounded section."""
+    """Display the selected records and their match evidence."""
     lines = ["## Relevant failures"]
-    for item in payload["records"][:5]:
-        reasons = ", ".join(item["reasons"])[:180]
+    for item in payload["records"]:
+        reasons = ", ".join(item["reasons"])
         lines.append(f"- {item['id']} r{item['revision']} ({item['freshness']}, {reasons})")
         if item.get("engineering_context_ref"):
             continue
-        lines.append(f"  {item['content'][:200]}")
+        lines.append(f"  {item['content']}")
         if item.get("rationale"):
-            lines.append(f"  {item['rationale'][:160]}")
+            lines.append(f"  {item['rationale']}")
     if not payload["records"]:
         lines.append("- No related active failures.")
+    if payload.get("omitted"):
+        lines.append(f"- {payload['omitted']} matching failure(s) omitted. Increase --limit to see more.")
     return "\n".join(lines)

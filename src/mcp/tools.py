@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,9 @@ from api.memory_graph import MemoryGraph
 from memory.artifacts.options import CompilationOptions
 from memory.config import (
     ConfigError,
+    MCPConfig,
     REQLConfig,
+    default_config,
     load_effective_config,
     resolve_config_path,
 )
@@ -32,15 +35,6 @@ from memory.domain.query_context import (
     DEFAULT_TOP_K as DEFAULT_CONTEXT_TOP_K,
 )
 from memory.domain.query_context import (
-    MAX_DEPTH as MAX_CONTEXT_DEPTH,
-)
-from memory.domain.query_context import (
-    MAX_ITEMS as MAX_QUERY_CONTEXT_ITEMS,
-)
-from memory.domain.query_context import (
-    MAX_TOP_K as MAX_QUERY_CONTEXT_TOP_K,
-)
-from memory.domain.query_context import (
     MIN_DEPTH as MIN_CONTEXT_DEPTH,
 )
 from memory.domain.query_context import (
@@ -52,17 +46,11 @@ from memory.domain.query_context import (
 from memory.domain.query_context import (
     QueryContextRequest,
 )
+from memory.query.errors import REQLError as REQLQueryError
 from memory.security import SecurityError, sanitize_agent_text, validate_mcp_path
 from memory.services.coordination import CoordinationStore, KINDS
 
-MAX_TOP_K = 50
-MAX_DEPTH = 5
-MAX_ITEMS = 50
-MAX_QUERY_ROWS = 200
-MAX_MEMORY_TEXT_CHARS = 2000
-MAX_CONTEXT_NODES = 200
-MAX_CONTEXT_EDGES = 400
-MUTATING_REQL_COMMANDS = {"COMMUNITIES", "HUBS"}
+MUTATING_REQL_COMMANDS = {"ACTIVATE", "COMMUNITIES", "HUBS"}
 
 
 class MCPToolError(REQLError):
@@ -96,13 +84,14 @@ WRITE_TOOLS = {
 def _work_store(storage_path: str) -> CoordinationStore:
     """Validate both the project boundary and its derived engineering store."""
     selected = _tool_storage(storage_path)
-    dashboard = validate_mcp_path(selected.with_name("agent-dashboard.reql"), name="dashboard_storage")
-    return CoordinationStore(dashboard)
+    config = _load_tool_config(None, None, start_dir=_project_root_for_storage(selected))
+    dashboard = validate_mcp_path(config.workspace.dashboard_path(selected), name="dashboard_storage")
+    return CoordinationStore(dashboard, config=config)
 
 
 def reql_work_context(*, storage_path: str, query: str = "", files: list[str] | None = None,
                       workstream: str | None = None, record_id: str | None = None,
-                      limit: int = 8, include_history: bool = False, kinds: list[str] | None = None) -> dict[str, Any]:
+                      limit: int | None = None, include_history: bool = False, kinds: list[str] | None = None) -> dict[str, Any]:
     """Read focused causal work without opening the canonical graph or a session."""
     try:
         work = _work_store(storage_path)
@@ -112,7 +101,7 @@ def reql_work_context(*, storage_path: str, query: str = "", files: list[str] | 
             path = work.path.with_name(Path(storage_path).name)
             arguments = {"files": files, "workstream": workstream, "record_id": record_id, "limit": limit}
             if path.is_file() or path.with_name(f"{path.name}.wal").is_file():
-                with _open_graph(str(path), _load_tool_config(None, None), read_only=True) as graph:
+                with _open_graph(str(path), work.config, read_only=True) as graph:
                     return graph.failure_context(query, **arguments)
             return FailureContextService(work).context(query, **arguments)
         return work.context(query, files=files, workstream=workstream, record_id=record_id, limit=limit,
@@ -121,8 +110,8 @@ def reql_work_context(*, storage_path: str, query: str = "", files: list[str] | 
         raise MCPToolError(str(exc)) from exc
 
 
-def reql_work_overview(*, storage_path: str, limit: int = 5) -> dict[str, Any]:
-    """Read compact goals, trajectory, blockers and ready work across sessions."""
+def reql_work_overview(*, storage_path: str, limit: int | None = None) -> dict[str, Any]:
+    """Read project goals, trajectory, blockers and ready work across sessions."""
     try:
         return _work_store(storage_path).overview(limit=limit)
     except ValueError as exc:
@@ -175,7 +164,7 @@ def reql_work_claim_next(*, storage_path: str, agent_id: str, session_id: str,
         result = work.claim_next(agent_id=_required_text(agent_id, "agent_id"),
                                  session_id=_required_text(session_id, "session_id"), workstream=workstream)
         if task := result.get("claimed_task"):
-            result["work_context"] = work.context(record_id=task["id"], limit=6)
+            result["work_context"] = work.context(record_id=task["id"])
         return result
     except ValueError as exc:
         raise MCPToolError(str(exc)) from exc
@@ -195,16 +184,18 @@ def query_graph(
     include_archived: bool = False,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    _limits: MCPConfig | None = None,
 ) -> dict[str, Any]:
     """Return a structured query-centered subgraph with sources and agent context."""
     config = _load_tool_config(config_path, config_overrides)
+    limits = _limits or config.mcp
     query = _required_text(query, "query")
-    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=MAX_TOP_K)
-    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=MAX_DEPTH)
-    max_nodes = _bounded_int(max_nodes, "max_nodes", minimum=1, maximum=MAX_CONTEXT_NODES)
-    max_edges = _bounded_int(max_edges, "max_edges", minimum=0, maximum=MAX_CONTEXT_EDGES)
-    max_sources = _bounded_int(max_sources, "max_sources", minimum=0, maximum=MAX_ITEMS)
-    max_items = _bounded_int(max_items, "max_items", minimum=1, maximum=MAX_ITEMS)
+    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=limits.max_top_k)
+    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=limits.max_depth)
+    max_nodes = _bounded_int(max_nodes, "max_nodes", minimum=1, maximum=limits.max_nodes)
+    max_edges = _bounded_int(max_edges, "max_edges", minimum=0, maximum=limits.max_edges)
+    max_sources = _bounded_int(max_sources, "max_sources", minimum=0, maximum=limits.max_items)
+    max_items = _bounded_int(max_items, "max_items", minimum=1, maximum=limits.max_items)
     with _open_graph(storage_path, config, read_only=True) as graph:
         return graph.query_graph(
             query,
@@ -236,10 +227,12 @@ def query_context(
     task_id: str | None = None,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    _limits: MCPConfig | None = None,
 ) -> dict[str, Any]:
     """Return a bounded deterministic context block for a task/query."""
     storage_path = str(validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path"))
     config = _load_tool_config(config_path, config_overrides, start_dir=_project_root_for_storage(Path(storage_path)))
+    limits = _limits or config.mcp
     query = _required_text(query, "query")
     selected_scopes = _optional_string_list(scopes, "scopes") or []
     for enabled, scope in ((code, "code"), (docs, "docs"), (test, "test")):
@@ -259,6 +252,15 @@ def query_context(
         )
     except (TypeError, ValueError) as exc:
         raise MCPToolError(str(exc)) from exc
+    budget = request.budget
+    capped = replace(
+        budget,
+        top_k=min(budget.top_k, limits.max_top_k),
+        max_depth=min(budget.max_depth, limits.max_depth),
+        max_items=min(budget.max_items, limits.max_items),
+    )
+    if capped != budget:
+        request = replace(request, budget=capped)
     with _open_graph(storage_path, config, read_only=True) as graph:
         result = graph.query_context_result(request)
         return result.to_dict()
@@ -276,15 +278,17 @@ def query_explore(
     include_archived: bool = False,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    _limits: MCPConfig | None = None,
 ) -> dict[str, Any]:
     """Return dependency and structural-refactor query slices for coding agents."""
     config = _load_tool_config(config_path, config_overrides)
+    limits = _limits or config.mcp
     query = _required_text(query, "query")
     views = _optional_string_list(views, "views")
-    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=MAX_TOP_K)
-    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=MAX_DEPTH)
-    limit = _bounded_int(limit, "limit", minimum=1, maximum=MAX_ITEMS)
-    max_items = _bounded_int(max_items, "max_items", minimum=1, maximum=MAX_ITEMS)
+    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=limits.max_top_k)
+    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=limits.max_depth)
+    limit = _bounded_int(limit, "limit", minimum=1, maximum=limits.max_items)
+    max_items = _bounded_int(max_items, "max_items", minimum=1, maximum=limits.max_items)
     with _open_graph(storage_path, config, read_only=True) as graph:
         return graph.query_explore(
             query,
@@ -310,14 +314,16 @@ def query_memories(
     include_archived: bool = False,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    _limits: MCPConfig | None = None,
 ) -> dict[str, Any]:
     """Return a compact list of relevant memory/source texts for an agent query."""
     config = _load_tool_config(config_path, config_overrides)
+    limits = _limits or config.mcp
     query = _required_text(query, "query")
-    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=MAX_TOP_K)
-    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=MAX_DEPTH)
-    limit = _bounded_int(limit, "limit", minimum=1, maximum=MAX_ITEMS)
-    max_text_chars = _bounded_int(max_text_chars, "max_text_chars", minimum=80, maximum=MAX_MEMORY_TEXT_CHARS)
+    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=limits.max_top_k)
+    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=limits.max_depth)
+    limit = _bounded_int(limit, "limit", minimum=1, maximum=limits.max_items)
+    max_text_chars = _bounded_int(max_text_chars, "max_text_chars", minimum=80, maximum=limits.max_text_chars)
     with _open_graph(storage_path, config, read_only=True) as graph:
         return graph.query_memories_payload(
             query,
@@ -338,17 +344,22 @@ def reql_query(
     limit: int | None = None,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    _limits: MCPConfig | None = None,
 ) -> dict[str, Any]:
     """Execute a REQL statement and return bounded tabular results."""
     config = _load_tool_config(config_path, config_overrides)
+    limits = _limits or config.mcp
     statement = _required_text(statement, "statement")
     if _reql_statement_requires_write(statement):
         raise MCPToolError("This REQL statement persists analysis results; use an approved write/update tool instead")
-    output_limit = _bounded_optional_int(limit, "limit", minimum=0, maximum=MAX_QUERY_ROWS)
+    output_limit = _bounded_optional_int(limit, "limit", minimum=0, maximum=limits.max_query_rows)
     if output_limit is None:
-        output_limit = MAX_QUERY_ROWS
+        output_limit = limits.max_query_rows
     with _open_graph(storage_path, config, read_only=True) as graph:
-        result = graph.query(statement)
+        try:
+            result = graph.query(statement)
+        except REQLQueryError as exc:
+            raise MCPToolError(str(exc)) from exc
         rows = [_jsonable(row) for row in result.rows[:output_limit]]
         original_count = len(result.rows)
         return {
@@ -393,12 +404,14 @@ def reql_hubs(
     limit: int = 10,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    _limits: MCPConfig | None = None,
 ) -> dict[str, Any]:
     """Return a bounded list of high-value hub nodes."""
     config = _load_tool_config(config_path, config_overrides)
+    limits = _limits or config.mcp
     if not config.analysis.enable_hubs:
         raise MCPToolError("Hub analysis is disabled by configuration")
-    limit = _bounded_int(limit, "limit", minimum=1, maximum=MAX_TOP_K)
+    limit = _bounded_int(limit, "limit", minimum=1, maximum=limits.max_top_k)
     with _open_graph(storage_path, config) as graph:
         report = graph.analyze_hubs(project_id=project_id, limit=limit)
         hubs = [
@@ -483,269 +496,279 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 }
 
 
-TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "name": "reql_tests_for",
-        "description": "Read-only: observed, static and optional candidate test associations.",
-        "inputSchema": {
-            "type": "object", "required": ["storage_path"],
-            "oneOf": [{"required": ["symbol_id"]}, {"required": ["file"]}],
-            "properties": {
-                "storage_path": {"type": "string"}, "symbol_id": {"type": "string"},
-                "file": {"type": "string"}, "include_candidates": {"type": "boolean", "default": False},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-            },
-        },
-    },
-    {
-        "name": "reql_tests_import",
-        "description": "Write: import project-local coverage JSON into the test evidence store after explicit approval.",
-        "inputSchema": {
-            "type": "object", "required": ["storage_path", "path", "input", "confirm"],
-            "properties": {
-                "storage_path": {"type": "string"}, "path": {"type": "string"}, "input": {"type": "string"},
-                "format": {"const": "coverage-json"}, "confirm": {"const": True},
-            },
-        },
-    },
-    {
-        "name": "reql_work_context",
-        "description": "Read-only: focused engineering work, decisions, constraints, failures and dependencies across sessions.",
-        "inputSchema": {"type": "object", "required": ["storage_path"], "properties": {
-            "storage_path": {"type": "string"}, "query": {"type": "string", "default": ""},
-            "files": {"type": "array", "items": {"type": "string"}},
-            "workstream": {"type": "string"}, "record_id": {"type": "string"},
-            "kinds": {"type": "array", "items": {"type": "string", "enum": sorted(KINDS)}},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 8},
-            "include_history": {"type": "boolean", "default": False}}},
-    },
-    {
-        "name": "reql_work_overview",
-        "description": "Read-only: compact project goals, workstreams, direction, completion, blockers and next ready outcomes.",
-        "inputSchema": {"type": "object", "required": ["storage_path"], "properties": {
-            "storage_path": {"type": "string"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}}},
-    },
-    {
-        "name": "reql_work_record",
-        "description": "Write: upsert durable work. Reuse ids; updates require fields.record_id and fields.expected_revision. Decisions/failures require fields.rationale. Provide stable agent/session provenance; record checkpoints at session boundaries.",
-        "inputSchema": {"type": "object", "required": ["storage_path", "kind", "content", "agent_id", "session_id"], "properties": {
-            "storage_path": {"type": "string"}, "kind": {"type": "string", "enum": sorted(KINDS)},
-            "content": {"type": "string"}, "agent_id": {"type": "string"}, "session_id": {"type": "string"},
-            "fields": {"type": "object", "additionalProperties": False, "properties": {
-                "key": {"type": "string"}, "record_id": {"type": "string"}, "expected_revision": {"type": "integer"},
-                "status": {"type": "string"}, "rationale": {"type": "string"}, "workstream": {"type": "string"},
-                "parent": {"type": "string"}, "next_action": {"type": "string"}, "importance": {"type": "integer"},
-                "failure_evidence": {"type": "object", "additionalProperties": False, "properties": {
-                    "source_revision": {"type": "string"},
-                    **{name: {"type": "array", "items": {"type": "string"}}
-                       for name in ("symbol_ids", "test_ids", "observed_checks")},
-                }},
-                **{name: {"type": "array", "items": {"type": "string"}} for name in ("files", "depends_on", "contradicts", "supersedes", "summarizes")}}}}},
-    },
-    {
-        "name": "reql_work_claim_next",
-        "description": "Write: atomically claim a ready task or resume this session's current claim. Returns scoped work and overlapping assignments.",
-        "inputSchema": {"type": "object", "required": ["storage_path", "agent_id", "session_id"], "properties": {
-            "storage_path": {"type": "string"}, "agent_id": {"type": "string"},
-            "session_id": {"type": "string"}, "workstream": {"type": "string"}}},
-    },
-    {
-        "name": "query_context",
-        "description": "Read-only: source owners, tests, impact and scoped work, with optional verified source excerpts.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "query"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "query": {"type": "string"},
-                "task_id": {"type": ["string", "null"], "default": None, "description": "Attach this work record and its causal context."},
-                "mode": {"type": "string", "enum": ["informative", "cleanup"], "default": "informative"},
-                "scopes": {
-                    "type": ["array", "null"],
-                    "items": {"type": "string", "enum": ["code", "docs", "test"]},
-                    "uniqueItems": True,
-                    "default": None,
+def _tool_schemas(limits: MCPConfig) -> list[dict[str, Any]]:
+    """Build descriptors whose defaults and maxima match the active limits."""
+    return [
+        {
+            "name": "reql_tests_for",
+            "description": "Read-only: observed, static and optional candidate test associations.",
+            "inputSchema": {
+                "type": "object", "required": ["storage_path"],
+                "oneOf": [{"required": ["symbol_id"]}, {"required": ["file"]}],
+                "properties": {
+                    "storage_path": {"type": "string"}, "symbol_id": {"type": "string"},
+                    "file": {"type": "string"}, "include_candidates": {"type": "boolean", "default": False},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
-                "include_source": {"type": "boolean", "default": False, "description": "Embed bounded current source verified against the committed graph. Requires code or test scopes without docs."},
-                "code": {"type": "boolean", "default": False},
-                "docs": {"type": "boolean", "default": False},
-                "test": {"type": "boolean", "default": False},
-                "top_k": {
-                    "type": "integer",
-                    "default": DEFAULT_CONTEXT_TOP_K,
-                    "minimum": MIN_QUERY_CONTEXT_TOP_K,
-                    "maximum": MAX_QUERY_CONTEXT_TOP_K,
+            },
+        },
+        {
+            "name": "reql_tests_import",
+            "description": "Write: import project-local coverage JSON into the test evidence store after explicit approval.",
+            "inputSchema": {
+                "type": "object", "required": ["storage_path", "path", "input", "confirm"],
+                "properties": {
+                    "storage_path": {"type": "string"}, "path": {"type": "string"}, "input": {"type": "string"},
+                    "format": {"const": "coverage-json"}, "confirm": {"const": True},
                 },
-                "max_depth": {
-                    "type": "integer",
-                    "default": DEFAULT_CONTEXT_MAX_DEPTH,
-                    "minimum": MIN_CONTEXT_DEPTH,
-                    "maximum": MAX_CONTEXT_DEPTH,
+            },
+        },
+        {
+            "name": "reql_work_context",
+            "description": "Read-only: focused engineering work, decisions, constraints, failures and dependencies across sessions.",
+            "inputSchema": {"type": "object", "required": ["storage_path"], "properties": {
+                "storage_path": {"type": "string"}, "query": {"type": "string", "default": ""},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "workstream": {"type": "string"}, "record_id": {"type": "string"},
+                "kinds": {"type": "array", "items": {"type": "string", "enum": sorted(KINDS)}},
+                "limit": {"type": "integer", "minimum": 1, "description": "Return at most this many matching records. Omit to return all matches."},
+                "include_history": {"type": "boolean", "default": False}}},
+        },
+        {
+            "name": "reql_work_overview",
+            "description": "Read-only: project goals, workstreams, direction, completion, blockers and next ready outcomes.",
+            "inputSchema": {"type": "object", "required": ["storage_path"], "properties": {
+                "storage_path": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "description": "Return at most this many records per section. Omit to return all records."}}},
+        },
+        {
+            "name": "reql_work_record",
+            "description": "Write: upsert durable work. Reuse ids; updates require fields.record_id and fields.expected_revision. Decisions/failures require fields.rationale. Provide stable agent/session provenance; record checkpoints at session boundaries.",
+            "inputSchema": {"type": "object", "required": ["storage_path", "kind", "content", "agent_id", "session_id"], "properties": {
+                "storage_path": {"type": "string"}, "kind": {"type": "string", "enum": sorted(KINDS)},
+                "content": {"type": "string"}, "agent_id": {"type": "string"}, "session_id": {"type": "string"},
+                "fields": {"type": "object", "additionalProperties": False, "properties": {
+                    "key": {"type": "string"}, "record_id": {"type": "string"}, "expected_revision": {"type": "integer"},
+                    "status": {"type": "string"}, "rationale": {"type": "string"}, "workstream": {"type": "string"},
+                    "parent": {"type": "string"}, "next_action": {"type": "string"}, "importance": {"type": "integer"},
+                    "failure_evidence": {"type": "object", "additionalProperties": False, "properties": {
+                        "source_revision": {"type": "string"},
+                        **{name: {"type": "array", "items": {"type": "string"}}
+                           for name in ("symbol_ids", "test_ids", "observed_checks")},
+                    }},
+                    **{name: {"type": "array", "items": {"type": "string"}} for name in ("files", "depends_on", "contradicts", "supersedes", "summarizes")}}}}},
+        },
+        {
+            "name": "reql_work_claim_next",
+            "description": "Write: atomically claim a ready task or resume this session's current claim. Returns scoped work and overlapping assignments.",
+            "inputSchema": {"type": "object", "required": ["storage_path", "agent_id", "session_id"], "properties": {
+                "storage_path": {"type": "string"}, "agent_id": {"type": "string"},
+                "session_id": {"type": "string"}, "workstream": {"type": "string"}}},
+        },
+        {
+            "name": "query_context",
+            "description": "Read-only: source owners, tests, impact and scoped work, with optional verified source excerpts.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "query"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "query": {"type": "string"},
+                    "task_id": {"type": ["string", "null"], "default": None, "description": "Attach this work record and its causal context."},
+                    "mode": {"type": "string", "enum": ["informative", "cleanup"], "default": "informative"},
+                    "scopes": {
+                        "type": ["array", "null"],
+                        "items": {"type": "string", "enum": ["code", "docs", "test"]},
+                        "uniqueItems": True,
+                        "default": None,
+                    },
+                    "include_source": {"type": "boolean", "default": False, "description": "Embed bounded current source verified against the committed graph. Requires code or test scopes without docs."},
+                    "code": {"type": "boolean", "default": False},
+                    "docs": {"type": "boolean", "default": False},
+                    "test": {"type": "boolean", "default": False},
+                    "top_k": {
+                        "type": "integer",
+                        "default": min(DEFAULT_CONTEXT_TOP_K, limits.max_top_k),
+                        "minimum": MIN_QUERY_CONTEXT_TOP_K,
+                        "maximum": limits.max_top_k,
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "default": min(DEFAULT_CONTEXT_MAX_DEPTH, limits.max_depth),
+                        "minimum": MIN_CONTEXT_DEPTH,
+                        "maximum": limits.max_depth,
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "default": min(DEFAULT_CONTEXT_MAX_ITEMS, limits.max_items),
+                        "minimum": MIN_QUERY_CONTEXT_ITEMS,
+                        "maximum": limits.max_items,
+                    },
+                    "include_archived": {"type": "boolean", "default": False},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
                 },
-                "max_items": {
-                    "type": "integer",
-                    "default": DEFAULT_CONTEXT_MAX_ITEMS,
-                    "minimum": MIN_QUERY_CONTEXT_ITEMS,
-                    "maximum": MAX_QUERY_CONTEXT_ITEMS,
+            },
+        },
+        {
+            "name": "query_graph",
+            "description": "Read-only: nodes, edges and sources for graph debugging. Prefer query_context for coding tasks.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "query"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer", "default": min(12, limits.max_top_k), "maximum": limits.max_top_k},
+                    "max_depth": {"type": "integer", "default": min(2, limits.max_depth), "maximum": limits.max_depth},
+                    "max_nodes": {"type": "integer", "default": min(80, limits.max_nodes), "maximum": limits.max_nodes},
+                    "max_edges": {"type": "integer", "default": min(160, limits.max_edges), "maximum": limits.max_edges},
+                    "max_sources": {"type": "integer", "default": min(20, limits.max_items), "maximum": limits.max_items},
+                    "max_items": {"type": "integer", "default": min(20, limits.max_items), "maximum": limits.max_items},
+                    "filter_generic": {"type": "boolean", "default": True},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
                 },
-                "include_archived": {"type": "boolean", "default": False},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
             },
         },
-    },
-    {
-        "name": "query_graph",
-        "description": "Read-only: nodes, edges and sources for graph debugging. Prefer query_context for coding tasks.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "query"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "query": {"type": "string"},
-                "top_k": {"type": "integer", "default": 12, "maximum": MAX_TOP_K},
-                "max_depth": {"type": "integer", "default": 2, "maximum": MAX_DEPTH},
-                "max_nodes": {"type": "integer", "default": 80, "maximum": MAX_CONTEXT_NODES},
-                "max_edges": {"type": "integer", "default": 160, "maximum": MAX_CONTEXT_EDGES},
-                "max_sources": {"type": "integer", "default": 20, "maximum": MAX_ITEMS},
-                "max_items": {"type": "integer", "default": 18, "maximum": MAX_ITEMS},
-                "filter_generic": {"type": "boolean", "default": True},
-                "include_archived": {"type": "boolean", "default": False},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
-            },
-        },
-    },
-    {
-        "name": "query_explore",
-        "description": "Read-only: missing dependency/refactor evidence or template duplicates. Select views; reuse existing query_context impact.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "query"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "query": {"type": "string"},
-                "views": {
-                    "type": ["array", "null"],
-                    "default": None,
-                    "items": {"type": "string", "enum": ["all", "owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "structural_duplicates", "code"]},
+        {
+            "name": "query_explore",
+            "description": "Read-only: missing dependency/refactor evidence or template duplicates. Select views; reuse existing query_context impact.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "query"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "query": {"type": "string"},
+                    "views": {
+                        "type": ["array", "null"],
+                        "default": None,
+                        "items": {"type": "string", "enum": ["all", "owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "structural_duplicates", "code"]},
+                    },
+                    "top_k": {"type": "integer", "default": min(12, limits.max_top_k), "maximum": limits.max_top_k},
+                    "max_depth": {"type": "integer", "default": min(3, limits.max_depth), "maximum": limits.max_depth},
+                    "limit": {"type": "integer", "default": min(12, limits.max_items), "maximum": limits.max_items},
+                    "max_items": {"type": "integer", "default": min(18, limits.max_items), "maximum": limits.max_items},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
                 },
-                "top_k": {"type": "integer", "default": 12, "maximum": MAX_TOP_K},
-                "max_depth": {"type": "integer", "default": 3, "maximum": MAX_DEPTH},
-                "limit": {"type": "integer", "default": 12, "maximum": MAX_ITEMS},
-                "max_items": {"type": "integer", "default": 18, "maximum": MAX_ITEMS},
-                "include_archived": {"type": "boolean", "default": False},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
             },
         },
-    },
-    {
-        "name": "query_memories",
-        "description": "Read-only: short ranked memory/source texts without graph-debug fields.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "query"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "query": {"type": "string"},
-                "top_k": {"type": "integer", "default": 12, "maximum": MAX_TOP_K},
-                "max_depth": {"type": "integer", "default": 2, "maximum": MAX_DEPTH},
-                "limit": {"type": "integer", "default": 12, "maximum": MAX_ITEMS},
-                "include_sources": {"type": "boolean", "default": True},
-                "filter_generic": {"type": "boolean", "default": True},
-                "max_text_chars": {"type": "integer", "default": 600, "maximum": MAX_MEMORY_TEXT_CHARS},
-                "include_archived": {"type": "boolean", "default": False},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
+        {
+            "name": "query_memories",
+            "description": "Read-only: short ranked memory/source texts without graph-debug fields.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "query"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer", "default": min(12, limits.max_top_k), "maximum": limits.max_top_k},
+                    "max_depth": {"type": "integer", "default": min(2, limits.max_depth), "maximum": limits.max_depth},
+                    "limit": {"type": "integer", "default": min(12, limits.max_items), "maximum": limits.max_items},
+                    "include_sources": {"type": "boolean", "default": True},
+                    "filter_generic": {"type": "boolean", "default": True},
+                    "max_text_chars": {"type": "integer", "default": min(600, limits.max_text_chars), "maximum": limits.max_text_chars},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
+                },
             },
         },
-    },
-    {
-        "name": "reql_query",
-        "description": "Read-only: execute a REQL statement and return bounded rows.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "statement"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "statement": {"type": "string"},
-                "limit": {"type": ["integer", "null"], "default": None, "maximum": MAX_QUERY_ROWS},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
+        {
+            "name": "reql_query",
+            "description": "Read-only: execute a REQL statement and return bounded rows.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "statement"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "statement": {"type": "string"},
+                    "limit": {"type": ["integer", "null"], "default": None, "maximum": limits.max_query_rows},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
+                },
             },
         },
-    },
-    {
-        "name": "reql_project_status",
-        "description": "Read-only: inspect registered project and cache status for a path.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "path"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "path": {"type": "string"},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
+        {
+            "name": "reql_project_status",
+            "description": "Read-only: inspect registered project and cache status for a path.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "path"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "path": {"type": "string"},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
+                },
             },
         },
-    },
-    {
-        "name": "reql_hubs",
-        "description": "Write/update: analyze graph hubs and persist hub scores. Use with client-side approval.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "project_id": {"type": ["string", "null"], "default": None},
-                "limit": {"type": "integer", "default": 10, "maximum": MAX_TOP_K},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
+        {
+            "name": "reql_hubs",
+            "description": "Write/update: analyze graph hubs and persist hub scores. Use with client-side approval.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "project_id": {"type": ["string", "null"], "default": None},
+                    "limit": {"type": "integer", "default": min(10, limits.max_top_k), "maximum": limits.max_top_k},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
+                },
             },
         },
-    },
-    {
-        "name": "reql_compile_project",
-        "description": "Write/update: scan and incrementally compile a project into the graph. Use with client-side approval.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["storage_path", "path"],
-            "properties": {
-                "storage_path": {"type": "string"},
-                "path": {"type": "string"},
-                "cache_enabled": {"type": ["boolean", "null"], "default": None},
-                "config_path": {"type": ["string", "null"], "default": None},
-                "config_overrides": {"type": ["object", "null"], "default": None},
+        {
+            "name": "reql_compile_project",
+            "description": "Write/update: scan and incrementally compile a project into the graph. Use with client-side approval.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["storage_path", "path"],
+                "properties": {
+                    "storage_path": {"type": "string"},
+                    "path": {"type": "string"},
+                    "cache_enabled": {"type": ["boolean", "null"], "default": None},
+                    "config_path": {"type": ["string", "null"], "default": None},
+                    "config_overrides": {"type": ["object", "null"], "default": None},
+                },
             },
         },
-    },
-]
+    ]
 
 
-def list_tools(*, include_write: bool = True) -> list[dict[str, Any]]:
-    """Return MCP tool descriptors."""
-    if include_write:
-        return list(TOOL_SCHEMAS)
-    return [schema for schema in TOOL_SCHEMAS if schema["name"] in READ_ONLY_TOOLS]
+def list_tools(*, include_write: bool = True, limits: MCPConfig | None = None) -> list[dict[str, Any]]:
+    """Return the tool descriptors advertised by this MCP server."""
+    schemas = _tool_schemas(limits or default_config().mcp)
+    return [schema for schema in schemas if include_write or schema["name"] in READ_ONLY_TOOLS]
 
 
-def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Dispatch a tool call to a pure handler."""
+def call_tool(
+    name: str, arguments: dict[str, Any] | None = None, *, limits: MCPConfig | None = None,
+) -> dict[str, Any]:
+    """Bind client arguments and dispatch the tool with trusted server limits."""
     if name not in TOOL_HANDLERS:
         raise MCPToolError(f"Unknown REQL MCP tool: {name}")
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, dict):
         raise MCPToolError("Tool arguments must be an object")
+    if "_limits" in arguments:
+        raise MCPToolError("Tool limits belong to the server")
+    handler = TOOL_HANDLERS[name]
+    parameters = signature(handler)
     try:
-        return _agent_safe_jsonable(_jsonable(TOOL_HANDLERS[name](**arguments)))
+        bound = parameters.bind(**arguments)
     except TypeError as exc:
         raise MCPToolError(f"Invalid arguments for {name}: {exc}") from exc
+    if limits is not None and "_limits" in parameters.parameters:
+        bound.arguments["_limits"] = limits
+    try:
+        return _agent_safe_jsonable(_jsonable(handler(*bound.args, **bound.kwargs)))
     except SecurityError as exc:
         raise MCPToolError(str(exc)) from exc
-
 
 def _load_tool_config(
     config_path: str | None,
@@ -786,7 +809,6 @@ def _open_graph(storage_path: str, config: REQLConfig, *, read_only: bool = Fals
         config=config,
         read_only=read_only,
         defer_lexical_index=read_only,
-        lock_timeout_seconds=0.05 if read_only else None,
     )
     try:
         yield graph
@@ -825,7 +847,7 @@ def _bounded_int(value: Any, name: str, *, minimum: int, maximum: int) -> int:
         raise MCPToolError(f"{name} must be an integer")
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise MCPToolError(f"{name} must be an integer") from exc
     if parsed < minimum:
         return minimum

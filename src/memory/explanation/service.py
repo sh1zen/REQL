@@ -8,6 +8,10 @@ from pathlib import PurePosixPath
 import re
 from typing import Any, Iterable, Sequence
 
+from ..artifacts.context_scope import is_test_context_path
+from ..code_analysis.entrypoints import entrypoint_reason
+from ..config import AnalysisConfig, default_config
+from ..config.models import ArchitecturePolicy, WorkflowPolicy
 from ..domain.ids import stable_id
 from ..domain.models import MemoryNode
 from ..storage.graph_store import GraphStore
@@ -34,7 +38,6 @@ WORKFLOW_IMPLEMENTATION_EDGE_TYPES = {
     "WRAPS",
 }
 WORKFLOW_OUTPUT_EDGE_TYPES = {"EMITS", "WRITES"}
-WORKFLOW_MAX_HOPS = 4
 DEPENDENCY_EDGE_TYPES = {
     "CALLS",
     "DEPENDS_ON",
@@ -46,39 +49,6 @@ DEPENDENCY_EDGE_TYPES = {
     "USES",
     "WRAPS",
 }
-SOURCE_ROOTS = {"app", "apps", "lib", "main", "packages", "pkg", "source", "sources", "src"}
-TEST_ROOTS = {"spec", "specs", "test", "tests"}
-GENERIC_CAPABILITY_NAMES = {
-    "application",
-    "common",
-    "core",
-    "domain",
-    "infrastructure",
-    "internal",
-    "service",
-    "services",
-    "shared",
-    "support",
-    "util",
-    "utils",
-}
-GENERIC_OWNER_NAMES = {
-    "add",
-    "create",
-    "current",
-    "delete",
-    "execute",
-    "exists",
-    "get",
-    "handle",
-    "list",
-    "read",
-    "run",
-    "set",
-    "status",
-    "update",
-    "write",
-}
 LAYER_ORDER = ("interface", "application", "domain", "core", "infrastructure")
 LAYER_PURPOSES = {
     "interface": "exposes commands, APIs, routes, protocols, or user-facing adapters",
@@ -87,77 +57,6 @@ LAYER_PURPOSES = {
     "core": "implements the repository's central deterministic behavior",
     "infrastructure": "provides storage, configuration, persistence, caching, and external adapters",
 }
-LAYER_TOKENS = {
-    "interface": {"api", "cli", "controller", "endpoint", "http", "mcp", "presentation", "route", "routes", "ui", "view", "web"},
-    "application": {"application", "command", "commands", "handler", "handlers", "job", "jobs", "orchestrator", "service", "services", "usecase", "usecases", "workflow", "workflows"},
-    "domain": {"domain", "entities", "entity", "model", "models", "policies", "policy", "rule", "rules", "schema", "schemas", "value"},
-    "infrastructure": {"adapter", "adapters", "cache", "config", "database", "db", "infrastructure", "migration", "migrations", "persistence", "repository", "storage"},
-}
-ENTRY_ROLE_TOKENS = {"command", "controller", "endpoint", "entrypoint", "handler", "public-api", "route"}
-ENTRY_NAMES = {"_main", "execute", "handle", "main", "run"}
-NON_WORKFLOW_NAMES = {
-    "__init__",
-    "__new__",
-    "setUp",
-    "setUpClass",
-    "tearDown",
-    "tearDownClass",
-}
-INVARIANT_TOKENS = {
-    "always",
-    "atomic",
-    "authorize",
-    "authorized",
-    "ensure",
-    "invariant",
-    "lock",
-    "must",
-    "never",
-    "only",
-    "permission",
-    "require",
-    "required",
-    "transaction",
-    "transactional",
-    "valid",
-    "validate",
-}
-WORKFLOW_GENERIC_TOKENS = {
-    "api",
-    "application",
-    "async",
-    "class",
-    "core",
-    "def",
-    "function",
-    "handler",
-    "main",
-    "method",
-    "module",
-    "run",
-    "service",
-}
-SYMBOL_SUFFIXES = (
-    "Controller",
-    "Coordinator",
-    "Engine",
-    "Handler",
-    "Manager",
-    "Repository",
-    "Service",
-    "Store",
-    "UseCase",
-    "Workflow",
-)
-SEMANTIC_WORKFLOW_SUFFIXES = SYMBOL_SUFFIXES + (
-    "Adapter",
-    "Builder",
-    "Client",
-    "Gateway",
-    "Policy",
-    "Rule",
-    "Validator",
-)
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
 CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
@@ -185,8 +84,9 @@ class _WorkflowCandidate:
 class RepositoryExplanationService:
     """Compute a read-only business projection over a compiled project graph."""
 
-    def __init__(self, store: GraphStore) -> None:
+    def __init__(self, store: GraphStore, *, config: AnalysisConfig | None = None) -> None:
         self.store = store
+        self.config = config if config is not None else default_config().analysis
 
     def explain(
         self,
@@ -211,23 +111,23 @@ class RepositoryExplanationService:
             node
             for node in self._project_nodes(project_id, "SourceFragment")
             if node.properties.get("artifact_id") not in code_artifact_ids
-            and not _is_test_path(_node_path(node))
+            and not is_test_context_path(_node_path(node))
         ]
         test_paths = sorted(
             {
                 path
                 for node in code_artifacts
-                if (path := _node_path(node)) and _is_test_path(path)
+                if (path := _node_path(node)) and is_test_context_path(path)
             }
         )
         modules = [
             node
             for node in self._project_nodes(project_id, "Module")
-            if (path := _node_path(node)) and not _is_test_path(path)
+            if (path := _node_path(node)) and not is_test_context_path(path)
         ]
         capability_nodes = self._capability_nodes(project_id, modules)
         paths = [_node_path(node) for node in modules]
-        dominant_root = _dominant_source_root([path for path in paths if path])
+        dominant_root = _dominant_source_root([path for path in paths if path], self.config.architecture)
         groups, node_groups = self._group_nodes(capability_nodes, dominant_root)
 
         top_nodes = self.store.top_nodes_by_degree(
@@ -241,9 +141,9 @@ class RepositoryExplanationService:
         degree_by_id = {node.id: degree for node, degree, _ in top_nodes}
         for node, degree, weighted_degree in top_nodes:
             path = _node_path(node)
-            if not path or _is_test_path(path):
+            if not path or is_test_context_path(path):
                 continue
-            key = _capability_key(path, dominant_root)
+            key = _capability_key(path, dominant_root, self.config.architecture.source_roots)
             if not key:
                 continue
             group = groups.setdefault(key, _CapabilityGroup(key))
@@ -254,7 +154,7 @@ class RepositoryExplanationService:
 
         focus_matches = self._focus_matches(project_id, focus)
         for node, score in focus_matches:
-            key = _capability_key(_node_path(node), dominant_root)
+            key = _capability_key(_node_path(node), dominant_root, self.config.architecture.source_roots)
             if key and key in groups:
                 groups[key].focus_score += score
                 groups[key].score += score * 8.0
@@ -340,7 +240,7 @@ class RepositoryExplanationService:
         for node_type in CAPABILITY_NODE_TYPES - {"Module"}:
             for node in self._project_nodes(project_id, node_type):
                 path = _node_path(node)
-                if path and not _is_test_path(path):
+                if path and not is_test_context_path(path):
                     nodes[node.id] = node
         return list(nodes.values())
 
@@ -353,7 +253,7 @@ class RepositoryExplanationService:
         node_groups: dict[str, str] = {}
         for node in nodes:
             path = _node_path(node)
-            key = _capability_key(path, dominant_root)
+            key = _capability_key(path, dominant_root, self.config.architecture.source_roots)
             if not key:
                 continue
             group = groups.setdefault(key, _CapabilityGroup(key))
@@ -405,7 +305,7 @@ class RepositoryExplanationService:
                 target = self.store.get_node(edge.to_id, clone=False)
                 if target is not None:
                     resolved_path = str(target.properties.get("resolved_relative_path") or "")
-                    resolved_group = _capability_key(resolved_path, dominant_root)
+                    resolved_group = _capability_key(resolved_path, dominant_root, self.config.architecture.source_roots)
                     if resolved_group in known_groups:
                         target_group = resolved_group
             if source_group and target_group and source_group != target_group:
@@ -426,7 +326,7 @@ class RepositoryExplanationService:
             groups.values(),
             key=lambda item: (-item.focus_score, -item.score, item.key),
         )[:max_capabilities]
-        names = {group.key: _capability_name(group, degree_by_id) for group in ranked_groups}
+        names = {group.key: _capability_name(group, degree_by_id, self.config.architecture) for group in ranked_groups}
         capabilities = []
         for group in ranked_groups:
             ranked_owners = sorted(
@@ -435,19 +335,19 @@ class RepositoryExplanationService:
                     for node in group.nodes.values()
                     if node.type in OWNER_NODE_TYPES and _is_public_owner(node)
                 ),
-                key=lambda node: _owner_rank(node, degree_by_id),
+                key=lambda node: _owner_rank(node, degree_by_id, self.config.architecture),
             )
             if not ranked_owners:
                 ranked_owners = sorted(
                     (node for node in group.nodes.values() if node.type in OWNER_NODE_TYPES),
-                    key=lambda node: _owner_rank(node, degree_by_id),
+                    key=lambda node: _owner_rank(node, degree_by_id, self.config.architecture),
                 )
             owners = _dedupe_evidence(
                 _evidence(node, reason="high-signal owner in this capability")
                 for node in ranked_owners
             )[:4]
             responsibilities = _responsibilities(ranked_owners, fallback=group.key)
-            layer = _infer_layer(group.key, group.paths)
+            layer = _infer_layer(group, self.config)
             dependency_names = [
                 names[target]
                 for (source, target), _count in sorted(
@@ -463,7 +363,7 @@ class RepositoryExplanationService:
                     key=lambda item: (-item[1], item[0]),
                 )
             ][:5]
-            associated_tests = _associated_tests(group.key, responsibilities, test_paths)
+            associated_tests = _associated_tests(group.key, responsibilities, test_paths, self.config.architecture)
             purpose = _capability_purpose(names[group.key], responsibilities, dependency_names)
             capabilities.append(
                 BusinessCapability(
@@ -513,7 +413,7 @@ class RepositoryExplanationService:
         documentation_tokens: dict[str, set[str]] = {}
         candidates: list[_WorkflowCandidate] = []
         for node, degree, weighted_degree in top_nodes:
-            trigger_reason = _workflow_trigger_reason(node)
+            trigger_reason = _workflow_trigger_reason(node, self.config.workflow)
             if trigger_reason is None:
                 continue
             members, relations, predecessors = self._workflow_implementation_nodes(
@@ -522,7 +422,7 @@ class RepositoryExplanationService:
             )
             if len(members) < 2 or not relations:
                 continue
-            concept_tokens = _workflow_concept_tokens(node)
+            concept_tokens = _workflow_concept_tokens(node, self.config.workflow)
             documentation = _workflow_documentation_evidence(
                 documentation_nodes,
                 concept_tokens,
@@ -575,7 +475,7 @@ class RepositoryExplanationService:
         )
         selected: list[_WorkflowCandidate] = []
         for candidate in candidates:
-            if any(_workflow_candidates_overlap(candidate, existing) for existing in selected):
+            if any(_workflow_candidates_overlap(candidate, existing, self.config.workflow) for existing in selected):
                 continue
             selected.append(candidate)
             if len(selected) >= max_workflows:
@@ -584,11 +484,11 @@ class RepositoryExplanationService:
         workflows = []
         for candidate in selected:
             anchor = candidate.anchor
-            trigger_reason = _workflow_trigger_reason(anchor) or "explicit workflow trigger"
+            trigger_reason = _workflow_trigger_reason(anchor, self.config.workflow) or "explicit workflow trigger"
             ordered_members = [anchor] + sorted(
                 (node for node_id, node in candidate.members.items() if node_id != anchor.id),
                 key=lambda node: (
-                    _workflow_role(node, is_trigger=False),
+                    _workflow_role(node, self.config.workflow, is_trigger=False),
                     _node_label(node).casefold(),
                     node.id,
                 ),
@@ -616,7 +516,7 @@ class RepositoryExplanationService:
                 participants.append(
                     WorkflowParticipant(
                         relation="implemented_by",
-                        role=_workflow_role(member, is_trigger=is_trigger),
+                        role=_workflow_role(member, self.config.workflow, is_trigger=is_trigger),
                         target=_evidence(member, reason=reason),
                     )
                 )
@@ -624,13 +524,7 @@ class RepositoryExplanationService:
             name = _humanize_symbol(_node_label(anchor))
             inputs = _workflow_inputs(anchor)
             outputs = self._workflow_outputs(anchor)
-            invariant_nodes = [anchor] + [
-                member
-                for member in candidate.members.values()
-                if member.id != anchor.id
-                and _workflow_role(member, is_trigger=False) == "policy"
-            ]
-            invariants = _workflow_invariants(invariant_nodes)
+            invariants = self._workflow_invariants(ordered_members)
             evidence = _dedupe_evidence(
                 candidate.documentation
                 + [participant.target for participant in participants]
@@ -640,7 +534,7 @@ class RepositoryExplanationService:
                 BusinessWorkflow(
                     id=stable_id("business-workflow", project_id, anchor.id, *member_ids),
                     name=name,
-                    intent=_workflow_intent(anchor, ordered_members),
+                    intent=_workflow_intent(anchor, ordered_members, self.config.architecture),
                     trigger=name,
                     inputs=inputs,
                     outputs=outputs,
@@ -659,12 +553,9 @@ class RepositoryExplanationService:
         members = {anchor.id: anchor}
         relations: dict[str, set[str]] = defaultdict(set)
         predecessors: dict[str, set[str]] = defaultdict(set)
-        visited_depth = {anchor.id: 0}
-        queue: deque[tuple[MemoryNode, int]] = deque([(anchor, 0)])
+        queue = deque([anchor])
         while queue:
-            current, depth = queue.popleft()
-            if depth >= WORKFLOW_MAX_HOPS:
-                continue
+            current = queue.popleft()
             edges = self.store.get_edges(
                 from_id=current.id,
                 type_=sorted(WORKFLOW_IMPLEMENTATION_EDGE_TYPES),
@@ -672,24 +563,17 @@ class RepositoryExplanationService:
                 clone=False,
             )
             for edge in sorted(edges, key=lambda item: (item.type, item.to_id, item.id)):
+                if edge.properties.get("status") == "archived":
+                    continue
                 target = self.store.get_node(edge.to_id, clone=False)
-                if not _is_workflow_participant(target, project_id):
+                if not _is_workflow_participant(target, project_id, self.config.workflow):
                     continue
                 assert target is not None
-                target_depth = depth + 1
-                if not _workflow_target_is_semantic(
-                    anchor,
-                    target,
-                    depth=target_depth,
-                ):
-                    continue
-                members[target.id] = target
+                if target.id not in members:
+                    queue.append(target)
+                    members[target.id] = target
                 relations[target.id].add(edge.type)
                 predecessors[target.id].add(current.id)
-                previous_depth = visited_depth.get(target.id)
-                if previous_depth is None or target_depth < previous_depth:
-                    visited_depth[target.id] = target_depth
-                    queue.append((target, target_depth))
         self._add_import_participants(
             anchor,
             project_id,
@@ -707,31 +591,34 @@ class RepositoryExplanationService:
         relations: dict[str, set[str]],
         predecessors: dict[str, set[str]],
     ) -> None:
-        """Add exact imported symbols as corroborated workflow implementers."""
-
-        processed_sources: set[str] = set()
-        queue: deque[tuple[MemoryNode, int]] = deque(
-            (member, 0) for member in members.values()
-        )
+        """Follow corroborated import chains from the workflow participants."""
+        queue = deque(members.values())
+        artifacts: dict[str, tuple[list[MemoryNode], dict[str, list[str]]]] = {}
+        targets_by_property: dict[tuple[str, str], list[MemoryNode]] = {}
         while queue:
-            source, depth = queue.popleft()
-            if depth >= WORKFLOW_MAX_HOPS:
-                continue
+            source = queue.popleft()
             artifact_id = str(source.properties.get("artifact_id") or "")
-            if not artifact_id or source.id in processed_sources:
+            if not artifact_id:
                 continue
-            processed_sources.add(source.id)
-            source_text = self._workflow_source_text(source)
+            if artifact_id not in artifacts:
+                imports = self.store.find_nodes_by_property(
+                    "artifact_id", artifact_id, type_="Import", status="active", limit=None, clone=False,
+                )
+                fragments: dict[str, list[str]] = defaultdict(list)
+                if imports:
+                    for fragment in self.store.find_nodes_by_property(
+                        "artifact_id", artifact_id, type_="SourceFragment", status="active", limit=None, clone=False,
+                    ):
+                        symbol_id = fragment.properties.get("symbol_id")
+                        if isinstance(symbol_id, str):
+                            fragments[symbol_id].append(str(fragment.text or ""))
+                artifacts[artifact_id] = imports, fragments
+            imports, fragments = artifacts[artifact_id]
+            if not imports:
+                continue
+            source_text = _implementation_body_text(source, "\n".join(fragments.get(source.id, ())))
             if not source_text:
                 continue
-            imports = self.store.find_nodes_by_property(
-                "artifact_id",
-                artifact_id,
-                type_="Import",
-                status="active",
-                limit=None,
-                clone=False,
-            )
             for import_node in imports:
                 resolved_path = str(import_node.properties.get("resolved_relative_path") or "")
                 imported_name = str(import_node.properties.get("name") or "").rsplit(".", 1)[-1]
@@ -741,24 +628,14 @@ class RepositoryExplanationService:
                 reference_name = str(import_node.properties.get("alias") or imported_name)
                 if not _source_references_name(source_text, reference_name):
                     continue
-                if resolved_path:
-                    targets = self.store.find_nodes_by_property(
-                        "relative_path",
-                        resolved_path,
-                        status="active",
-                        limit=None,
-                        clone=False,
+                key = ("relative_path", resolved_path) if resolved_path else ("name", imported_name)
+                if key not in targets_by_property:
+                    targets_by_property[key] = self.store.find_nodes_by_property(
+                        *key, status="active", limit=None, clone=False,
                     )
-                else:
-                    targets = self.store.find_nodes_by_property(
-                        "name",
-                        imported_name,
-                        status="active",
-                        limit=None,
-                        clone=False,
-                    )
+                targets = targets_by_property[key]
                 for target in targets:
-                    if not _is_workflow_participant(target, project_id):
+                    if not _is_workflow_participant(target, project_id, self.config.workflow):
                         continue
                     assert target is not None
                     target_name = _node_label(target).rsplit(".", 1)[-1]
@@ -766,37 +643,16 @@ class RepositoryExplanationService:
                         continue
                     if module_hint and not _module_hint_matches_path(module_hint, _node_path(target)):
                         continue
-                    if not _workflow_target_is_semantic(anchor, target, depth=2):
+                    if not _import_matches_workflow(anchor, target, self.config):
                         continue
-                    is_new = target.id not in members
-                    members[target.id] = target
+                    if target.id not in members:
+                        members[target.id] = target
+                        if _workflow_role(target, self.config.workflow, is_trigger=False) in {
+                            "orchestration", "infrastructure", "policy",
+                        }:
+                            queue.append(target)
                     relations[target.id].add("IMPORTS_FROM")
                     predecessors[target.id].add(source.id)
-                    if (
-                        is_new
-                        and _workflow_role(target, is_trigger=False)
-                        in {"orchestration", "infrastructure", "policy"}
-                    ):
-                        queue.append((target, depth + 1))
-
-    def _workflow_source_text(self, node: MemoryNode) -> str:
-        artifact_id = str(node.properties.get("artifact_id") or "")
-        if not artifact_id:
-            return ""
-        fragments = self.store.find_nodes_by_property(
-            "artifact_id",
-            artifact_id,
-            type_="SourceFragment",
-            status="active",
-            limit=None,
-            clone=False,
-        )
-        source_text = "\n".join(
-            str(fragment.text or "")
-            for fragment in fragments
-            if fragment.properties.get("symbol_id") == node.id
-        )
-        return _implementation_body_text(node, source_text)
 
     def _workflow_outputs(self, anchor: MemoryNode) -> list[str]:
         outputs = []
@@ -811,10 +667,25 @@ class RepositoryExplanationService:
         )
         for edge in edges:
             target = self.store.get_node(edge.to_id, clone=False)
-            if target is None or _is_test_path(_node_path(target)):
+            if target is None or is_test_context_path(_node_path(target)):
                 continue
             outputs.append(f"{_humanize_symbol(edge.type)} {_humanize_symbol(_node_label(target))}")
         return list(dict.fromkeys(output for output in outputs if output))
+
+    def _workflow_invariants(self, members: Sequence[MemoryNode]) -> list[str]:
+        """Summarize indexed failure conditions from the workflow participants."""
+        conditions: dict[str, None] = {}
+        for member in members:
+            edges = self.store.get_edges(from_id=member.id, type_="RAISES", limit=None, clone=False)
+            for edge in edges:
+                if edge.properties.get("status") == "archived":
+                    continue
+                name = edge.properties.get("name") or edge.properties.get("evidence")
+                if isinstance(name, str) and name:
+                    conditions.setdefault(f"{_node_label(member)} raises {name}", None)
+                if len(conditions) >= 5:
+                    return list(conditions)
+        return list(conditions)
 
     def _build_change_guide(
         self,
@@ -825,7 +696,7 @@ class RepositoryExplanationService:
         selected_ids: set[str],
     ) -> ChangeGuide:
         capabilities_by_key = {
-            _capability_key(path, dominant_root): capability
+            _capability_key(path, dominant_root, self.config.architecture.source_roots): capability
             for capability in capabilities
             for path in capability.primary_paths
         }
@@ -833,9 +704,9 @@ class RepositoryExplanationService:
         start_here = []
         if focus:
             for node, score in focus_matches:
-                if _is_test_path(_node_path(node)):
+                if is_test_context_path(_node_path(node)):
                     continue
-                key = _capability_key(_node_path(node), dominant_root)
+                key = _capability_key(_node_path(node), dominant_root, self.config.architecture.source_roots)
                 capability = capabilities_by_key.get(key)
                 if capability and capability.id in selected_ids and capability.id not in capability_ids:
                     capability_ids.append(capability.id)
@@ -886,11 +757,11 @@ def _node_label(node: MemoryNode) -> str:
     return str(value).splitlines()[0]
 
 
-def _path_parts(path: str) -> list[str]:
+def _path_parts(path: str, source_roots: tuple[str, ...]) -> list[str]:
     if not path:
         return []
     parts = [part for part in PurePosixPath(path).parts if part not in {"", "."}]
-    while parts and parts[0].casefold() in SOURCE_ROOTS:
+    while parts and parts[0].casefold() in source_roots:
         parts.pop(0)
     if not parts:
         return []
@@ -908,41 +779,27 @@ def _path_parts(path: str) -> list[str]:
     return [part for part in parts if part]
 
 
-def _dominant_source_root(paths: Sequence[str]) -> str | None:
-    roots = Counter(parts[0].casefold() for path in paths if (parts := _path_parts(path)))
+def _dominant_source_root(paths: Sequence[str], policy: ArchitecturePolicy) -> str | None:
+    roots = Counter(parts[0].casefold() for path in paths if (parts := _path_parts(path, policy.source_roots)))
     if not roots:
         return None
     root, count = roots.most_common(1)[0]
-    required = max(3, int(len(paths) * 0.55))
+    required = max(policy.dominant_root_min_paths, int(len(paths) * policy.dominant_root_ratio))
     return root if count >= required else None
 
 
 @lru_cache(maxsize=4096)
-def _capability_key(path: str, dominant_root: str | None) -> str | None:
+def _capability_key(path: str, dominant_root: str | None, source_roots: tuple[str, ...]) -> str | None:
     """Reuse immutable path classification for symbols sharing a source file."""
-    parts = _path_parts(path)
+    parts = _path_parts(path, source_roots)
     if not parts:
         return None
     folded = [part.casefold() for part in parts]
-    if folded[0] in TEST_ROOTS or _is_test_path(path):
+    if is_test_context_path(path):
         return None
     if dominant_root and folded[0] == dominant_root and len(parts) > 1:
         return folded[1]
     return folded[0]
-
-
-@lru_cache(maxsize=4096)
-def _is_test_path(path: str) -> bool:
-    """Classify path text without caching filesystem or project state."""
-    parts = [part.casefold() for part in PurePosixPath(path.replace("\\", "/")).parts]
-    filename = parts[-1] if parts else ""
-    return bool(
-        any(part in TEST_ROOTS for part in parts[:-1])
-        or filename.startswith("test_")
-        or filename.endswith("_test.py")
-        or ".spec." in filename
-        or ".test." in filename
-    )
 
 
 def _is_public_owner(node: MemoryNode) -> bool:
@@ -952,17 +809,17 @@ def _is_public_owner(node: MemoryNode) -> bool:
     return not name.startswith("_")
 
 
-def _capability_name(group: _CapabilityGroup, degree_by_id: dict[str, int]) -> str:
+def _capability_name(group: _CapabilityGroup, degree_by_id: dict[str, int], policy: ArchitecturePolicy) -> str:
     fallback = _humanize_symbol(group.key)
-    if group.key not in GENERIC_CAPABILITY_NAMES:
+    if group.key not in policy.generic_capability_names:
         return fallback
     owners = sorted(
         (node for node in group.nodes.values() if node.type in OWNER_NODE_TYPES and _is_public_owner(node)),
-        key=lambda node: _owner_rank(node, degree_by_id),
+        key=lambda node: _owner_rank(node, degree_by_id, policy),
     )
     concepts = []
     for node in owners:
-        concept = _owner_concept(_node_label(node))
+        concept = _owner_concept(_node_label(node), policy.symbol_suffixes)
         if concept and concept.casefold() not in {item.casefold() for item in concepts}:
             concepts.append(concept)
         if len(concepts) >= 3:
@@ -970,9 +827,9 @@ def _capability_name(group: _CapabilityGroup, degree_by_id: dict[str, int]) -> s
     return " / ".join(concepts) if concepts else fallback
 
 
-def _owner_concept(value: str) -> str:
+def _owner_concept(value: str, suffixes: tuple[str, ...]) -> str:
     short = value.rsplit(".", 1)[-1]
-    for suffix in SYMBOL_SUFFIXES:
+    for suffix in suffixes:
         if short.endswith(suffix) and len(short) > len(suffix):
             short = short[: -len(suffix)]
             break
@@ -990,17 +847,33 @@ def _responsibilities(nodes: Sequence[MemoryNode], *, fallback: str) -> list[str
     return values or [_humanize_symbol(fallback)]
 
 
-def _infer_layer(key: str, paths: Counter[str]) -> str:
-    parent_paths = " ".join(str(PurePosixPath(path).parent) for path in paths)
-    tokens = _tokens(f"{key} {parent_paths}")
-    for layer in ("interface", "application", "domain", "infrastructure"):
-        if tokens & LAYER_TOKENS[layer]:
+def _infer_layer(group: _CapabilityGroup, config: AnalysisConfig) -> str:
+    """Use indexed roles and explicit project rules to assign a layer."""
+    policy = config.architecture
+    parent_paths = " ".join(str(PurePosixPath(path).parent) for path in group.paths)
+    tokens = _tokens(f"{group.key} {parent_paths}")
+    evidence = set()
+    if any(node.type == "Endpoint" or node.properties.get("is_entrypoint") is True for node in group.nodes.values()):
+        evidence.add("interface")
+    if any(node.type == "Schema" for node in group.nodes.values()):
+        evidence.add("domain")
+    layer_tokens = {
+        "interface": config.workflow.interface_path_tokens,
+        "application": policy.application_tokens,
+        "domain": policy.domain_tokens,
+        "infrastructure": policy.infrastructure_tokens,
+        "core": policy.core_tokens,
+    }
+    for layer in policy.layer_precedence:
+        if layer in evidence or not tokens.isdisjoint(layer_tokens[layer]):
             return layer
-    return "core"
+    return policy.fallback_layer
 
 
-def _associated_tests(key: str, responsibilities: Sequence[str], test_paths: Sequence[str]) -> list[str]:
-    match_tokens = _tokens(f"{key} {' '.join(responsibilities)}") - GENERIC_CAPABILITY_NAMES
+def _associated_tests(
+    key: str, responsibilities: Sequence[str], test_paths: Sequence[str], policy: ArchitecturePolicy,
+) -> list[str]:
+    match_tokens = _tokens(f"{key} {' '.join(responsibilities)}") - set(policy.generic_capability_names)
     if not match_tokens:
         return []
     scored = []
@@ -1020,63 +893,31 @@ def _capability_purpose(name: str, responsibilities: Sequence[str], dependencies
     return purpose
 
 
-def _workflow_trigger_reason(node: MemoryNode) -> str | None:
-    """Return why a node is a workflow trigger, without using focus as admission."""
-
-    if node.type not in {"Endpoint", "Function", "Method"}:
-        return None
-    path = _node_path(node)
-    if _is_test_path(path) or not _is_public_owner(node):
-        return None
-    short_name = _node_label(node).rsplit(".", 1)[-1]
-    if short_name in NON_WORKFLOW_NAMES:
-        return None
-    if node.type == "Endpoint":
-        return "explicit endpoint trigger"
-    path_tokens = _tokens(_node_path(node))
-    role_values = []
-    for property_name in ("roles", "semantic_roles"):
-        value = node.properties.get(property_name) or []
-        if isinstance(value, str):
-            role_values.append(value)
-        else:
-            role_values.extend(str(item) for item in value)
-    role_tokens = _tokens(" ".join(role_values))
-    if role_tokens & ENTRY_ROLE_TOKENS:
-        return "explicit entrypoint role"
-    if path_tokens & LAYER_TOKENS["interface"]:
-        return "interface boundary convention"
-    if short_name in ENTRY_NAMES:
-        return "process entrypoint convention"
-    return None
+def _workflow_trigger_reason(node: MemoryNode, policy: WorkflowPolicy) -> str | None:
+    """Classify a stored symbol as a workflow trigger."""
+    return entrypoint_reason(node.type, node.properties, node.label or node.text or node.id, policy=policy)
 
 
-def _is_workflow_participant(node: MemoryNode | None, project_id: str) -> bool:
+def _is_workflow_participant(node: MemoryNode | None, project_id: str, policy: WorkflowPolicy) -> bool:
     if node is None or node.type not in WORKFLOW_PARTICIPANT_TYPES:
         return False
     if node.status not in ACTIVE_STATUSES or node.properties.get("project_id") != project_id:
         return False
-    if _is_test_path(_node_path(node)) or not _is_public_owner(node):
+    if is_test_context_path(_node_path(node)) or not _is_public_owner(node):
         return False
     short_name = _node_label(node).rsplit(".", 1)[-1]
-    return short_name not in NON_WORKFLOW_NAMES
+    return short_name.casefold() not in policy.excluded_names
 
 
-def _workflow_target_is_semantic(
-    anchor: MemoryNode,
-    target: MemoryNode,
-    *,
-    depth: int,
-) -> bool:
-    if depth <= 1:
-        return True
-    anchor_tokens = _workflow_concept_tokens(anchor)
+def _import_matches_workflow(anchor: MemoryNode, target: MemoryNode, config: AnalysisConfig) -> bool:
+    """Require extra evidence for references to imports outside the call graph."""
+    anchor_tokens = _workflow_concept_tokens(anchor, config.workflow)
     target_tokens = _tokens(_node_label(target).rsplit(".", 1)[-1])
     if anchor_tokens & target_tokens:
         return True
     short_name = _node_label(target).rsplit(".", 1)[-1]
     return target.type in {"Class", "Interface"} and short_name.endswith(
-        SEMANTIC_WORKFLOW_SUFFIXES
+        config.architecture.symbol_suffixes + config.workflow.additional_semantic_suffixes
     )
 
 
@@ -1123,11 +964,11 @@ def _implementation_body_text(node: MemoryNode, source_text: str) -> str:
     return source_text
 
 
-def _workflow_concept_tokens(node: MemoryNode) -> set[str]:
-    tokens = _tokens(_node_label(node).rsplit(".", 1)[-1]) - WORKFLOW_GENERIC_TOKENS
+def _workflow_concept_tokens(node: MemoryNode, policy: WorkflowPolicy) -> set[str]:
+    tokens = _tokens(_node_label(node).rsplit(".", 1)[-1]) - set(policy.generic_tokens)
     if tokens:
         return tokens
-    return _tokens(f"{_node_label(node)} {_node_path(node)}") - WORKFLOW_GENERIC_TOKENS
+    return _tokens(f"{_node_label(node)} {_node_path(node)}") - set(policy.generic_tokens)
 
 
 def _workflow_documentation_evidence(
@@ -1197,6 +1038,7 @@ def _workflow_docstring_evidence(
 def _workflow_candidates_overlap(
     left: _WorkflowCandidate,
     right: _WorkflowCandidate,
+    policy: WorkflowPolicy,
 ) -> bool:
     left_ids = set(left.members)
     right_ids = set(right.members)
@@ -1206,24 +1048,24 @@ def _workflow_candidates_overlap(
     containment = shared / min(len(left_ids), len(right_ids))
     if containment >= 0.75:
         return True
-    left_tokens = _workflow_concept_tokens(left.anchor)
-    right_tokens = _workflow_concept_tokens(right.anchor)
+    left_tokens = _workflow_concept_tokens(left.anchor, policy)
+    right_tokens = _workflow_concept_tokens(right.anchor, policy)
     token_union = left_tokens | right_tokens
     token_overlap = len(left_tokens & right_tokens) / max(1, len(token_union))
     return token_overlap >= 0.5 and shared / max(len(left_ids), len(right_ids)) >= 0.5
 
 
-def _workflow_role(node: MemoryNode, *, is_trigger: bool) -> str:
+def _workflow_role(node: MemoryNode, policy: WorkflowPolicy, *, is_trigger: bool) -> str:
     if is_trigger:
         return "trigger"
     concept = _node_label(node).rsplit(".", 1)[-1].casefold()
     if node.type == "Endpoint":
         return "interface"
-    if concept.endswith(("repository", "store", "gateway", "adapter", "client")):
+    if concept.endswith(policy.infrastructure_suffixes):
         return "infrastructure"
-    if concept.endswith(("service", "usecase", "workflow", "handler", "coordinator", "manager")):
+    if concept.endswith(policy.orchestration_suffixes):
         return "orchestration"
-    if concept.endswith(("policy", "rule", "validator")):
+    if concept.endswith(policy.policy_suffixes):
         return "policy"
     return "participant"
 
@@ -1241,24 +1083,9 @@ def _workflow_inputs(anchor: MemoryNode) -> list[str]:
     return list(dict.fromkeys(inputs))
 
 
-def _workflow_invariants(nodes: Iterable[MemoryNode]) -> list[str]:
-    invariants = []
-    for node in nodes:
-        text = str(node.text or "").strip()
-        for sentence in _sentences(text):
-            if _tokens(sentence) & INVARIANT_TOKENS:
-                invariants.append(sentence)
-        decorators = node.properties.get("decorators") or []
-        if isinstance(decorators, str):
-            decorators = [decorators]
-        for decorator in decorators:
-            value = str(decorator).strip()
-            if value and _tokens(value) & INVARIANT_TOKENS:
-                invariants.append(f"Enforced by {value}")
-    return list(dict.fromkeys(invariants))[:5]
-
-
-def _workflow_intent(anchor: MemoryNode, participants: Sequence[MemoryNode]) -> str:
+def _workflow_intent(
+    anchor: MemoryNode, participants: Sequence[MemoryNode], policy: ArchitecturePolicy,
+) -> str:
     for sentence in _sentences(str(anchor.text or "")):
         if len(_tokens(sentence)) >= 4:
             return sentence
@@ -1267,7 +1094,7 @@ def _workflow_intent(anchor: MemoryNode, participants: Sequence[MemoryNode]) -> 
     for participant in participants:
         if participant.id == anchor.id:
             continue
-        concept = _owner_concept(_node_label(participant))
+        concept = _owner_concept(_node_label(participant), policy.symbol_suffixes)
         if concept and concept.casefold() not in {item.casefold() for item in collaborators}:
             collaborators.append(concept)
         if len(collaborators) >= 4:
@@ -1318,10 +1145,10 @@ def _dedupe_evidence(items: Iterable[CodeEvidence]) -> list[CodeEvidence]:
     return result
 
 
-def _owner_rank(node: MemoryNode, degree_by_id: dict[str, int]) -> tuple[bool, int, str, str]:
+def _owner_rank(node: MemoryNode, degree_by_id: dict[str, int], policy: ArchitecturePolicy) -> tuple[bool, int, str, str]:
     short_name = _node_label(node).rsplit(".", 1)[-1].casefold()
     return (
-        short_name in GENERIC_OWNER_NAMES,
+        short_name in policy.generic_owner_names,
         -degree_by_id.get(node.id, 0),
         _node_label(node).casefold(),
         node.id,

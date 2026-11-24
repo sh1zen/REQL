@@ -40,11 +40,11 @@ PROJECT_SKILL_SOURCE = SkillSource(
         f"{DISCOVERY_POLICY} {_DISCOVERY_COMMANDS} Reuse the assigned brief and read only missing evidence.",
         'Use `agent init --next` for a shared queue or `agent init --task ID --query "literal terms"` for an agreed assignment that needs source. Coordinate overlaps before editing.',
         'Save decisions, blockers, and the next action in shared work. Recover a task or checkpoint with `project context --task ID`. See `references/agent-workspace.md` for progress and handoffs.',
-        'Run the supplied finish command for saved checks. Wait for its refresh. `edit` refreshes the graph. After direct edits with separate checks, run `project compile` once and use `project diff` to inspect the recorded changes.',
+        'Use `agent verify --plan PLAN.json` for a project verification plan. Run focused checks before broader suites and include their results in your handoff. `edit` refreshes the graph. After direct edits, run `project compile --lock-timeout 60` once and use `project diff` to inspect the recorded changes.',
     ),
     rule_points=(
         f"{DISCOVERY_POLICY} {_DISCOVERY_COMMANDS}",
-        'Reuse verified excerpts. Use the supplied finish command for a task with saved checks. `{command_name} edit` refreshes the graph. For direct file edits with separate checks, run `{command_name} project compile` once.',
+        'Reuse verified excerpts. Use `{command_name} agent verify --plan PLAN.json` for a project verification plan. Pass focused checks before broader suites and record the outcome at finish. `{command_name} edit` refreshes the graph. For direct file edits, run `{command_name} project compile --lock-timeout 60` once.',
         'Pass the task ID for assigned retrieval. Reuse the brief, batch edits, and preserve encoding and line endings. Use `reql-agent` (/reql) for writes, coordination, or recovery.',
     ),
 )
@@ -226,13 +226,13 @@ Use `--json` for structured fields: `owner_candidates`, `read_plan`, `contracts`
 
 Use dotted field names for cross-layer data traces. The `data_trace` rows show observed field uses and transformations. Check current source to confirm static links. Source confidence and graph revision do not validate attached engineering claims.
 
-Add `--source` to `--code` or `--test` when you need source bodies. This reads current files and checks their hashes against the committed revision. It returns at most three files, six regions, 120 lines, and 6,000 source characters. Overlapping regions are merged. Files larger than 4 MiB are excluded.
+Add `--source` to `--code` or `--test` to read the selected source spans. REQL checks current file hashes against the committed revision and merges overlapping spans.
 
 Reuse complete verified excerpts. Read only the selected source ranges that need verification. The graph does not refresh during this query.
 
 Keep the selected files with the task. Stop queries when the owner, effects, and tests are clear.
 
-`query_context` includes bounded shared work. Use `project context --file PATH` for missing engineering history. Use `project context --task ID` for assigned work. Read marked omissions with `agent show ID --json`.
+`query_context` attaches matching shared work. Use `project context --file PATH` for focused engineering history and `project context --task ID` for the full causal scope of assigned work. Use `agent show ID --json` to inspect a record and its revisions.
 
 """
     query_advanced = f"""# REQL reference: raw queries, graph relations, and unused code
@@ -336,8 +336,7 @@ Read this reference to update the graph, inspect compilation history, or check t
 
 ## Graph updates
 
-The supplied finish command refreshes the graph after saved checks pass. If you
-ran project checks separately, refresh once:
+After direct source edits, refresh the graph once:
 
 ```bash
 {command_name} project compile
@@ -363,7 +362,7 @@ Use `{command_name} project compile` for initial compilation and later graph upd
 
 ## Storage
 
-Use `storage inspect` for block and index details. Use `storage locks` for current owners. `storage locks --recover-stale` removes only locks proven stale. Use it only for authorized lock recovery.
+Use `storage inspect` for block and index details. Use `storage locks` to check current read or write access. Retry a busy operation after the active command finishes.
 
 `storage compact` rewrites storage without discarding graph history. It is maintenance, not a required refresh step. `storage clear` rebuilds the current project and discards historical graph state. Use it only for an authorized rebuild. Use `--help` for each operation before maintenance.
 """
@@ -490,25 +489,54 @@ Start with `agent init --task TASK_ID --query "Owner.method other_symbol"`.
 Use `agent init --next` for the ready queue. Use a distinct activity for each
 worker and retain it when restarting an active session.
 
-1. Use the brief's verified bodies and indexed line ranges. Retrieve only a
-   missing symbol or read only its indicated lines. Save the complete task
-   brief for the session instead of reloading it.
+1. Reuse the brief's verified excerpts and keep its `--seen-source` options
+   for ranges you already saw. Use an exact symbol or path for missing code or
+   tests. Use `--docs` with a document path or heading. If a reply gives only an
+   indexed range, read those lines. Stop lookup when you have enough evidence.
 2. Keep to your edit scope. For overlapping files, agree on distinct changes
-   before edits. Read a prerequisite's current status with `agent show ID`.
-   Work on independent files while completion waits for dependencies.
-3. Review your scoped diff once after editing. Run the supplied finish command
-   for saved checks and wait for it. Otherwise run focused checks before finish.
-   Give the outcome and any blocker in the summary.
+   before edits. Work on independent files first. Then use `agent wait ID`
+   for a pending prerequisite before attempting dependent completion.
+   Add `--lock-timeout 60` to `query_context` when workers share the graph.
+   If the wait expires, use `storage locks`. Continue independent work and
+   retry after the active command releases the graph.
+3. Review your scoped diff after editing. Follow the verification plan below
+   or use the project's focused checks. Run broader checks after focused
+   checks pass. Reuse a passing check while its inputs stay the same.
+   Refresh the graph after direct edits with `project compile --lock-timeout 60`.
+   Use the supplied finish command and include the outcome and any blocker in
+   the summary.
 
 ```bash
-{command_name} query_context --task TASK_ID --follow-up --query "missing_symbol" --code --brief
+{command_name} query_context --task TASK_ID --follow-up --query "SYMBOL_OR_SOURCE_PATH" --code --test --brief
+{command_name} query_context --task TASK_ID --follow-up --query "DOCUMENT_PATH_OR_HEADING" --docs --brief
 {command_name} agent task update --id TASK_ID --why "Contract ready" --next "Check consumers"
+{command_name} agent wait PREREQUISITE_ID --timeout 60
 {command_name} agent finish "Consumer checks passed" --task TASK_ID
 ```
 
 Publish a shared contract once in the producer's update or a linked decision.
 Refer to the saved decision if the same contract is needed elsewhere.
 For incomplete fields or revision history, use `agent show ID --json`.
+
+## Verification plan
+
+Use at least one `focused` check. Add a `broad` list when the task needs it.
+Put the executable and its arguments in each `command` list. List every
+project file the check reads in `inputs` to reuse a current pass. Omit
+`inputs` for checks with dynamic or external dependencies.
+
+```json
+{{
+  "focused": [
+    {{"command": ["python", "-m", "unittest", "tests.test_serializer"],
+     "inputs": ["serializer.py", "tests/test_serializer.py", "pyproject.toml"]}}
+  ]
+}}
+```
+
+```bash
+{command_name} agent verify --plan PLAN.json
+```
 
 ## Planning and changes in direction
 
@@ -524,7 +552,8 @@ owner names. Reuse keys for retries. Use `--parent` to group work,
 ```
 
 Use `agent task update` for meaningful progress or a blocker. Use `--next=`
-to clear the next step. Update a shared record by ID and observed revision.
+to clear the next step. This command reads the current task revision. To update
+other records, use `agent record --id ID --revision N` with the observed revision.
 Use `--supersedes` with a reason when replacing a decision. Use `agent note`
 for private scratch. Keep source dumps and test logs in their original files.
 

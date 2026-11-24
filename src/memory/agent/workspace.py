@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import os
 import re
-import time
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,28 +13,17 @@ from uuid import uuid4
 from api.memory_graph import MemoryGraph
 from memory.config import REQLConfig, default_config
 from memory.services.coordination import (
-    CoordinationStore, KINDS, MAX_WORK_RECORD_TEXT, TERMINAL, require_task_claim, task_claim,
+    CoordinationStore, KINDS, TERMINAL, require_task_claim, task_claim,
 )
-from memory.domain.exceptions import StorageError
+from memory.domain.exceptions import StorageBusyError, StorageError
 from memory.domain.ids import stable_id
 from memory.domain.models import MemoryNode
 from memory.domain.timeutils import parse_dt, utcnow_iso
-from memory.storage import BlockGraphStore, StoreLease, exclusive_store_lock
+from memory.storage import StoreLease
 
-AGENT_STORAGE_FILE = "agent.reql"
-AGENT_DASHBOARD_STORAGE_FILE = "agent-dashboard.reql"
-AGENT_SCOPE_DIR = "agents"
-DEFAULT_AGENT_ID = "master"
 DEFAULT_ACTIVITY_SCOPE = "__default__"
 PUBLIC_DASHBOARD_NODE_ID = "agent:public-dashboard"
 WORKSPACE_NODE_ID = "agent:workspace"
-AGENT_LOCK_TIMEOUT_SECONDS = 2.0
-AGENT_READ_LOCK_TIMEOUT_SECONDS = 10.0
-AGENT_LOCK_RETRY_ATTEMPTS = 3
-AGENT_LOCK_RETRY_DELAY_SECONDS = 0.25
-DASHBOARD_DEFAULT_LIMIT = 5
-DASHBOARD_MAX_LIMIT = 20
-DASHBOARD_POST_MAX_CHARS = 240
 AGENT_NODE_TYPES = {"private_note", "external_note", "session"}
 
 
@@ -50,17 +38,21 @@ class AgentIdentitySelectionError(ValueError):
         )
 
 
-def _agent_lock_wait_budget(*, read_only: bool) -> float:
-    lock_timeout = AGENT_READ_LOCK_TIMEOUT_SECONDS if read_only else AGENT_LOCK_TIMEOUT_SECONDS
-    retry_delays = max(0, AGENT_LOCK_RETRY_ATTEMPTS - 1) * AGENT_LOCK_RETRY_DELAY_SECONDS
-    return max(0.0, AGENT_LOCK_RETRY_ATTEMPTS * lock_timeout + retry_delays)
-
-
 @dataclass(frozen=True, slots=True)
 class AgentWorkspacePaths:
     standard_storage: Path
     agent_storage: Path
     dashboard_storage: Path
+
+    @property
+    def lifecycle(self) -> Path:
+        """Identify the lease that serializes shared workspace transitions."""
+        return self.dashboard_storage.with_name(f"{self.dashboard_storage.name}.lifecycle")
+
+    @property
+    def initialization(self) -> Path:
+        """Identify the lease for initializing a private store."""
+        return self.agent_storage.with_name(f"{self.agent_storage.name}.init")
 
 
 class AgentWorkspace:
@@ -76,11 +68,12 @@ class AgentWorkspace:
         activity_id: str | None = None,
         config: REQLConfig | None = None,
     ) -> None:
+        self.config = config or default_config()
         standard_path = Path(standard_storage).expanduser().resolve(strict=False)
         resolved_dashboard_storage = (
             Path(dashboard_storage).expanduser().resolve(strict=False)
             if dashboard_storage is not None
-            else self.default_dashboard_storage(standard_path)
+            else self.default_dashboard_storage(standard_path, config=self.config)
         )
         self.activity_id = self._normalize_activity_id(
             activity_id or os.environ.get("REQL_AGENT_ACTIVITY_ID") or os.environ.get("CODEX_THREAD_ID")
@@ -90,39 +83,47 @@ class AgentWorkspace:
             resolved_dashboard_storage,
             agent_id,
             self.activity_id,
+            self.config,
         )
         self.paths = AgentWorkspacePaths(
             standard_storage=standard_path,
             agent_storage=Path(agent_storage).expanduser().resolve(strict=False)
             if agent_storage is not None
-            else self.agent_storage_for(standard_path, self.agent_id),
+            else self.agent_storage_for(standard_path, self.agent_id, config=self.config),
             dashboard_storage=resolved_dashboard_storage,
         )
-        if len({self.paths.standard_storage, self.paths.agent_storage, self.paths.dashboard_storage}) != 3:
+        stores = {path.resolve() for path in (
+            self.paths.standard_storage, self.paths.agent_storage, self.paths.dashboard_storage,
+        )}
+        if len(stores) != 3:
             raise ValueError("Project, private agent, and public dashboard stores must use distinct paths")
-        self.config = config or default_config()
+        if len(stores | {self.paths.lifecycle.resolve(), self.paths.initialization.resolve()}) != 5:
+            raise ValueError("Workspace stores and leases must use distinct paths")
 
     @staticmethod
-    def default_agent_storage(standard_storage: str | Path) -> Path:
+    def default_agent_storage(standard_storage: str | Path, *, config: REQLConfig | None = None) -> Path:
         path = Path(standard_storage).expanduser().resolve(strict=False)
-        return path.with_name(AGENT_STORAGE_FILE)
+        return path.with_name((config or default_config()).workspace.private_store_name)
 
     @staticmethod
-    def default_dashboard_storage(standard_storage: str | Path) -> Path:
+    def default_dashboard_storage(standard_storage: str | Path, *, config: REQLConfig | None = None) -> Path:
         path = Path(standard_storage).expanduser().resolve(strict=False)
-        return path.with_name(AGENT_DASHBOARD_STORAGE_FILE)
+        return (config or default_config()).workspace.dashboard_path(path)
 
     @classmethod
     def new_agent_id(cls) -> str:
         return f"agent:{uuid4().hex[:12]}"
 
     @classmethod
-    def agent_storage_for(cls, standard_storage: str | Path, agent_id: str) -> Path:
+    def agent_storage_for(
+        cls, standard_storage: str | Path, agent_id: str, *, config: REQLConfig | None = None,
+    ) -> Path:
+        config = config or default_config()
         normalized = cls._normalize_agent_id(agent_id)
-        if normalized == DEFAULT_AGENT_ID:
-            return cls.default_agent_storage(standard_storage)
+        if normalized == config.workspace.default_agent_id:
+            return cls.default_agent_storage(standard_storage, config=config)
         path = Path(standard_storage).expanduser().resolve(strict=False)
-        return path.with_name(AGENT_SCOPE_DIR) / f"{cls._safe_agent_file_stem(normalized)}.reql"
+        return path.with_name(config.workspace.agents_dir) / f"{cls._safe_agent_file_stem(normalized)}.reql"
 
     def exists(self) -> bool:
         return self.paths.agent_storage.exists() and self.paths.agent_storage.stat().st_size > 0
@@ -133,14 +134,15 @@ class AgentWorkspace:
         standard_storage: str | Path,
         *,
         dashboard_storage: str | Path | None = None,
-        limit: int = 50,
+        limit: int | None = None,
         config: REQLConfig | None = None,
     ) -> dict[str, Any]:
         """Read the public dashboard without selecting a private agent."""
 
+        config = config or default_config()
         reader = cls(
             standard_storage,
-            agent_id=DEFAULT_AGENT_ID,
+            agent_id=config.workspace.default_agent_id,
             dashboard_storage=dashboard_storage,
             config=config,
         )
@@ -153,15 +155,13 @@ class AgentWorkspace:
 
         if next_task and (task_id is not None or expected_revision is not None):
             raise ValueError("Choose either the next task or an explicit task and revision")
-        if workstream is not None and (not next_task or not isinstance(workstream, str) or not workstream.strip()
-                                       or len(workstream) > MAX_WORK_RECORD_TEXT):
+        if workstream is not None and (not next_task or not isinstance(workstream, str) or not workstream.strip()):
             raise ValueError("A nonempty workstream can only filter the next task")
         task = self._assigned_task(task_id, expected_revision)
         session_name = name.strip() if name is not None else None
         if session_name == "":
             raise ValueError("Agent session name must not be empty")
-        init_lease = self.paths.agent_storage.with_name(f"{self.paths.agent_storage.name}.init")
-        with self._lifecycle_lease(), StoreLease(init_lease, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
+        with self._lifecycle_lease(), StoreLease(self.paths.initialization, blocking=True):
             already_initialized = self.exists()
             session_id = self._active_session_id() if already_initialized else None
             if task is not None:
@@ -191,7 +191,7 @@ class AgentWorkspace:
                 ))
             if include_work_context and (claimed := result.get("claimed_task")):
                 if next_task:
-                    result["work_context"] = self.coordination.context(record_id=claimed["id"], limit=6)
+                    result["work_context"] = self.coordination.context(record_id=claimed["id"])
                 else:
                     result.update(self.coordination.assignment_context(claimed["id"]))
         return result
@@ -398,7 +398,7 @@ class AgentWorkspace:
     @property
     def coordination(self) -> CoordinationStore:
         """Access the authoritative project work store without opening it."""
-        return CoordinationStore(self.paths.dashboard_storage)
+        return CoordinationStore(self.paths.dashboard_storage, config=self.config)
 
     def record(self, kind: str | None = None, content: str | None = None, **fields: Any) -> dict[str, Any]:
         """Persist session-authored work, retaining omitted text on revision-checked updates."""
@@ -489,7 +489,7 @@ class AgentWorkspace:
         limit: int = 20,
         include_metadata: bool = False,
     ) -> dict[str, Any]:
-        shared_matches = self.coordination.context(query, limit=min(40, max(1, limit)), include_history=True)["records"]
+        shared_matches = self.coordination.context(query, limit=max(1, limit), include_history=True)["records"]
         graph = self._require_agent(read_only=True)
         try:
             node_types = {node_type} if node_type else None
@@ -555,8 +555,21 @@ class AgentWorkspace:
         finally:
             graph.close()
 
-    def public_dashboard(self, *, limit: int = 50) -> dict[str, Any]:
-        """Return the shared dashboard: agents, active task summaries, and context."""
+    @staticmethod
+    def _dashboard_limit(limit: int | None) -> int:
+        """Resolve the dashboard row count and validate explicit requests."""
+        if limit is None:
+            return 5
+        if type(limit) is not int or limit < 1:
+            raise ValueError("Agent dashboard limit must be a positive integer")
+        return limit
+
+    def public_dashboard(self, *, limit: int | None = None) -> dict[str, Any]:
+        """Return a bounded shared dashboard for display."""
+        return self._public_dashboard(limit=self._dashboard_limit(limit))
+
+    def _public_dashboard(self, *, limit: int | None = None) -> dict[str, Any]:
+        """Read the shared roster and records, optionally limiting display rows."""
         if not self.paths.dashboard_storage.exists() or self.paths.dashboard_storage.stat().st_size == 0:
             return {
                 "format": "reql-agent-public-dashboard-v2",
@@ -596,7 +609,9 @@ class AgentWorkspace:
     def list_registered_agents(
         cls, standard_storage: str | Path, *, include_all: bool = False, config: REQLConfig | None = None
     ) -> list[dict[str, Any]]:
-        dashboard = cls.read_public_dashboard(standard_storage, limit=500, config=config)
+        config = config or default_config()
+        reader = cls(standard_storage, agent_id=config.workspace.default_agent_id, config=config)
+        dashboard = reader._public_dashboard()
         agents = dashboard["agents"]
         return agents if include_all else [agent for agent in agents if agent["status"] == "active"]
 
@@ -607,7 +622,7 @@ class AgentWorkspace:
         """Terminate a stale agent and release its private operational store."""
         workspace = cls(standard_storage, agent_id=agent_id, config=config)
         with workspace._lifecycle_lease():
-            dashboard = workspace.public_dashboard(limit=10_000)
+            dashboard = workspace._public_dashboard()
             if not any(item["agent_id"] == workspace.agent_id for item in dashboard["agents"]):
                 raise ValueError(f"Agent is not registered: {workspace.agent_id}")
             closed_sessions: list[str] = []
@@ -643,8 +658,9 @@ class AgentWorkspace:
         needle = query.strip()
         if not needle:
             raise ValueError("Dashboard search query must not be empty")
-        reader = cls(standard_storage, agent_id=DEFAULT_AGENT_ID, config=config)
-        dashboard = reader.public_dashboard(limit=10_000)
+        config = config or default_config()
+        reader = cls(standard_storage, agent_id=config.workspace.default_agent_id, config=config)
+        dashboard = reader._public_dashboard()
         results: list[dict[str, Any]] = []
         for entry in [*dashboard["context"], *dashboard["active_tasks"]]:
             context = str(entry.get("content") or "")
@@ -671,7 +687,7 @@ class AgentWorkspace:
                         })
             finally:
                 graph.close()
-        for item in reader.coordination.context(needle, limit=min(40, max(1, limit)), include_history=True)["records"]:
+        for item in reader.coordination.context(needle, limit=max(1, limit), include_history=True)["records"]:
             results.append({"timestamp": item["updated_at"], "agent_id": item["agent_id"],
                             "context": item["content"] + " — " + item["rationale"], "scope": "work", "id": item["id"]})
         results.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
@@ -694,12 +710,11 @@ class AgentWorkspace:
     def dashboard(
         self,
         *,
-        limit: int = DASHBOARD_DEFAULT_LIMIT,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         """Read the public dashboard together with this agent's private dashboard."""
 
-        if limit < 1 or limit > DASHBOARD_MAX_LIMIT:
-            raise ValueError(f"Agent dashboard limit must be between 1 and {DASHBOARD_MAX_LIMIT}")
+        limit = self._dashboard_limit(limit)
         return {
             "format": "reql-agent-dashboard-v3",
             "public": self.public_dashboard(limit=limit),
@@ -707,8 +722,9 @@ class AgentWorkspace:
             "overview_command": "reql project overview",
         }
 
-    def private_dashboard(self, *, limit: int = 50) -> dict[str, Any]:
+    def private_dashboard(self, *, limit: int | None = None) -> dict[str, Any]:
         """Return bounded orientation: what failed, what finished, and what remains."""
+        limit = self._dashboard_limit(limit)
         overview = self.operational_overview()
         return {
             "format": "reql-agent-private-dashboard-v3",
@@ -749,24 +765,23 @@ class AgentWorkspace:
 
     @classmethod
     def project_operational_overview(
-        cls, standard_storage: str | Path, *, config: REQLConfig | None = None, limit: int = 5, include_private: bool = True
+        cls, standard_storage: str | Path, *, config: REQLConfig | None = None, limit: int | None = None, include_private: bool = True
     ) -> dict[str, Any]:
         """Collect complete operational history from every registered agent."""
-        dashboard_storage = cls.default_dashboard_storage(standard_storage)
+        config = config or default_config()
+        dashboard_storage = cls.default_dashboard_storage(standard_storage, config=config)
         agents = []
-        for agent_id in cls._registered_agent_ids(dashboard_storage) if include_private else []:
+        for agent_id in cls._registered_agent_ids(dashboard_storage, config) if include_private else []:
             workspace = cls(standard_storage, agent_id=agent_id, config=config)
             if workspace.exists():
                 agents.append(workspace.operational_overview())
-        dashboard = cls.read_public_dashboard(standard_storage, limit=10_000, config=config)
-        work = CoordinationStore(dashboard_storage).overview(limit=limit)
+        reader = cls(standard_storage, agent_id=config.workspace.default_agent_id, config=config)
+        dashboard = reader._public_dashboard()
+        work = reader.coordination.overview(limit=limit)
         return {"agents": agents, "context": dashboard["context"], "work": work}
 
     def finish(self, summary: str | None = None, *, task_id: str | None = None,
-               expected_revision: int | None = None,
-               before_finish: Callable[[], dict[str, Any]] | None = None,
-               prepare_verification: Callable[[list[str]], None] | None = None,
-               completion_guard: Callable[[], AbstractContextManager[object]] | None = None) -> dict[str, Any]:
+               expected_revision: int | None = None) -> dict[str, Any]:
         """Close the session, publish its outcome and return its saved checkpoint receipt."""
 
         if not self.exists():
@@ -774,38 +789,17 @@ class AgentWorkspace:
         summary_text = (summary or "").strip()
         if not summary_text:
             raise ValueError("Finish message must not be empty")
-        if len(summary_text) > MAX_WORK_RECORD_TEXT:
-            raise ValueError(f"Finish message must fit {MAX_WORK_RECORD_TEXT} characters")
-        if prepare_verification is not None and before_finish is None:
-            raise ValueError("Preparing changes for completion requires verification")
         checked_session = self._active_session_id() if task_id is not None else None
         committed = checked_session is not None and self.coordination.finish_committed(checked_session)
         task = None if committed else self._assigned_task(task_id, expected_revision)
-        verification = None
-        if before_finish is not None and not committed:
-            if task is None:
-                raise ValueError("Verified completion requires an assigned task")
-            with self._lifecycle_lease() if prepare_verification is not None else nullcontext():
-                if checked_session is None:
-                    raise ValueError("No current agent session. Run `reql agent init --name \"...\"` first.")
-                require_task_claim(task, self.agent_id, checked_session)
-                if prepare_verification is not None:
-                    with self.coordination.claimed_edit(
-                        task["id"], task["revision"], agent_id=self.agent_id, session_id=checked_session,
-                    ) as files:
-                        prepare_verification(files)
-            # Tests can run for minutes. Recheck this session and the task's
-            # revision at completion without holding the workspace lease here.
-            verification = before_finish()
         with self._lifecycle_lease():
             session_id, title = self._record_session()
             if checked_session is not None and session_id != checked_session:
-                raise ValueError("Agent session changed during verification; reconcile before completing the task")
-            with completion_guard() if completion_guard is not None and not committed else nullcontext():
-                handoff = self.coordination.finish_session(
-                    summary_text, agent_id=self.agent_id, session_id=session_id, session_title=title,
-                    task_id=task_id, task_revision=task["revision"] if task is not None else None,
-                )
+                raise ValueError("Agent session changed before task completion; reconcile before retrying")
+            handoff = self.coordination.finish_session(
+                summary_text, agent_id=self.agent_id, session_id=session_id, session_title=title,
+                task_id=task_id, task_revision=task["revision"] if task is not None else None,
+            )
             checkpoint = handoff["checkpoint"]
             graph = self._require_agent()
             closed_session = None
@@ -835,7 +829,6 @@ class AgentWorkspace:
             status = "active" if remaining_sessions else "finished"
             self._register_agent(status=status, session_id=closed_session)
             retention = self._prune_completed_agents()
-            retention["work_records_removed"] = self.coordination.prune()
         result = {
             "agent_id": self.agent_id,
             "status": status,
@@ -847,8 +840,6 @@ class AgentWorkspace:
         }
         if handoff["completed_task"] is not None:
             result["completed_task"] = handoff["completed_task"]
-        if verification is not None:
-            result["verification"] = verification
         return result
 
     def _publish(
@@ -949,7 +940,7 @@ class AgentWorkspace:
 
     def _recreate(self, *, remove_existing: bool = True) -> dict[str, Any]:
         if remove_existing:
-            self._remove_agent_store()
+            self._remove_agent_store_path(self.paths.agent_storage, blocking=True)
         agent = self._open_agent()
         try:
             initialized_at = utcnow_iso()
@@ -984,16 +975,13 @@ class AgentWorkspace:
         finally:
             agent.close()
 
-    def _remove_agent_store(self) -> dict[str, int]:
-        return self._remove_agent_store_path(self.paths.agent_storage)
-
-    def _remove_agent_store_path(self, base: Path) -> dict[str, int]:
+    def _remove_agent_store_path(self, base: Path, *, blocking: bool) -> dict[str, int]:
         """Remove private data under its writer lock, preserving live readers."""
         if base.resolve() in {self.paths.standard_storage, self.paths.dashboard_storage}:
             raise ValueError(f"Cannot remove a project or public dashboard store as agent memory: {base}")
         files_removed = 0
         bytes_reclaimed = 0
-        with exclusive_store_lock(base, timeout_seconds=0.0):
+        with StoreLease(base, blocking=blocking):
             for path in self._agent_store_files(base):
                 try:
                     size = path.stat().st_size
@@ -1007,9 +995,8 @@ class AgentWorkspace:
     @contextmanager
     def _lifecycle_lease(self) -> Iterator[None]:
         """Serialize initialization, completion, and retention across agents."""
-        path = self.paths.dashboard_storage.with_name(f"{self.paths.dashboard_storage.name}.lifecycle")
         try:
-            with StoreLease(path, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
+            with StoreLease(self.paths.lifecycle, blocking=True):
                 yield
         except StorageError as exc:
             raise ValueError(f"Cannot update agent lifecycle: {exc}") from exc
@@ -1029,14 +1016,14 @@ class AgentWorkspace:
             identities = {str(node.properties.get("agent_id") or node.label): node for node in nodes if node.type == "agent"}
             protected = {agent_id for agent_id, node in identities.items() if node.status == "active"}
             active_paths = {
-                Path(str(identities[agent_id].properties.get("agent_storage") or self.agent_storage_for(self.paths.standard_storage, agent_id))).resolve()
+                Path(str(identities[agent_id].properties.get("agent_storage") or self.agent_storage_for(self.paths.standard_storage, agent_id, config=self.config))).resolve()
                 for agent_id in protected
             }
             deferred: set[str] = set()
             for agent_id, identity in identities.items():
                 if identity.status not in {"finished", "terminated"}:
                     continue
-                base = self.agent_storage_for(self.paths.standard_storage, agent_id)
+                base = self.agent_storage_for(self.paths.standard_storage, agent_id, config=self.config)
                 registered_path = Path(str(identity.properties.get("agent_storage") or base)).resolve()
                 if agent_id == self.agent_id:
                     base = self.paths.agent_storage
@@ -1053,10 +1040,9 @@ class AgentWorkspace:
                 if not any(path.exists() for path in self._agent_store_files(base)):
                     continue
                 try:
-                    removed = self._remove_agent_store_path(base)
-                except StorageError as exc:
-                    if "locked" not in str(exc).casefold():
-                        raise
+                    # Retention holds the dashboard lease. Never wait here for a private store.
+                    removed = self._remove_agent_store_path(base, blocking=False)
+                except StorageBusyError:
                     result["busy_agents"].append(agent_id)
                     deferred.add(agent_id)
                     protected.add(agent_id)
@@ -1122,24 +1108,25 @@ class AgentWorkspace:
         dashboard_storage: Path,
         explicit_agent_id: str | None,
         activity_id: str | None,
+        config: REQLConfig,
     ) -> tuple[str, str, bool]:
         if explicit_agent_id:
             return cls._normalize_agent_id(explicit_agent_id), "explicit", True
         if activity_id:
             derived = stable_id("agent-activity", str(standard_storage).casefold(), activity_id)
             return f"agent:{derived.split(':')[-1][:16]}", "activity", True
-        registered = cls._registered_agent_ids(dashboard_storage)
+        registered = cls._registered_agent_ids(dashboard_storage, config)
         if len(registered) > 1:
             raise AgentIdentitySelectionError(registered)
         if len(registered) == 1:
             return registered[0], "single-agent", True
-        return DEFAULT_AGENT_ID, "default", False
+        return cls._normalize_agent_id(config.workspace.default_agent_id), "default", False
 
     @classmethod
-    def _registered_agent_ids(cls, dashboard_storage: Path) -> list[str]:
+    def _registered_agent_ids(cls, dashboard_storage: Path, config: REQLConfig) -> list[str]:
         if not dashboard_storage.exists() or dashboard_storage.stat().st_size == 0:
             return []
-        graph = MemoryGraph.open(dashboard_storage, read_only=True)
+        graph = MemoryGraph.open(dashboard_storage, read_only=True, config=config, wait_for_lock=True)
         try:
             return sorted(
                 {
@@ -1205,7 +1192,7 @@ class AgentWorkspace:
                 "source": "dashboard",
                 "agent_id": self.agent_id,
                 "agent_storage": str(self.paths.agent_storage),
-                "role": DEFAULT_AGENT_ID if self.agent_id == DEFAULT_AGENT_ID else "worker",
+                "role": "master" if self.agent_id == self.config.workspace.default_agent_id else "worker",
                 "title": self.agent_id,
                 "content": self.agent_id,
                 "last_activity_at": now,
@@ -1264,33 +1251,8 @@ class AgentWorkspace:
         return self._open_agent(read_only=read_only)
 
     def _open_agent(self, *, read_only: bool = False) -> MemoryGraph:
-        self.paths.agent_storage.parent.mkdir(parents=True, exist_ok=True)
-        last_error: StorageError | None = None
-        for attempt in range(AGENT_LOCK_RETRY_ATTEMPTS):
-            try:
-                lock_timeout = AGENT_READ_LOCK_TIMEOUT_SECONDS if read_only else AGENT_LOCK_TIMEOUT_SECONDS
-                store = BlockGraphStore(
-                    self.paths.agent_storage,
-                    read_only=read_only,
-                    lock_timeout_seconds=lock_timeout,
-                )
-                try:
-                    return MemoryGraph(store, config=self.config)
-                except Exception:
-                    store.close()
-                    raise
-            except StorageError as exc:
-                if "locked" not in str(exc).casefold():
-                    raise
-                last_error = exc
-                if attempt + 1 < AGENT_LOCK_RETRY_ATTEMPTS:
-                    time.sleep(AGENT_LOCK_RETRY_DELAY_SECONDS)
-        mode = "read" if read_only else "write"
-        raise ValueError(
-            f"Agent workspace is busy; could not acquire {mode} access to {self.paths.agent_storage}. "
-            f"The lock wait budget of {_agent_lock_wait_budget(read_only=read_only):.2f}s was exhausted. "
-            "Retry the command, or avoid running multiple `reql agent` commands in parallel."
-        ) from last_error
+        """Wait for a private store lease before opening its graph."""
+        return MemoryGraph.open(self.paths.agent_storage, config=self.config, read_only=read_only, wait_for_lock=True)
 
     def _ensure_public_dashboard(self) -> MemoryGraph:
         graph = self._open_public_dashboard()
@@ -1304,33 +1266,8 @@ class AgentWorkspace:
             raise
 
     def _open_public_dashboard(self, *, read_only: bool = False) -> MemoryGraph:
-        self.paths.dashboard_storage.parent.mkdir(parents=True, exist_ok=True)
-        last_error: StorageError | None = None
-        for attempt in range(AGENT_LOCK_RETRY_ATTEMPTS):
-            try:
-                lock_timeout = AGENT_READ_LOCK_TIMEOUT_SECONDS if read_only else AGENT_LOCK_TIMEOUT_SECONDS
-                store = BlockGraphStore(
-                    self.paths.dashboard_storage,
-                    read_only=read_only,
-                    lock_timeout_seconds=lock_timeout,
-                )
-                try:
-                    return MemoryGraph(store, config=self.config)
-                except Exception:
-                    store.close()
-                    raise
-            except StorageError as exc:
-                if "locked" not in str(exc).casefold():
-                    raise
-                last_error = exc
-                if attempt + 1 < AGENT_LOCK_RETRY_ATTEMPTS:
-                    time.sleep(AGENT_LOCK_RETRY_DELAY_SECONDS)
-        mode = "read" if read_only else "write"
-        raise ValueError(
-            f"Public dashboard is busy; could not acquire {mode} access to {self.paths.dashboard_storage}. "
-            f"The lock wait budget of {_agent_lock_wait_budget(read_only=read_only):.2f}s was exhausted. "
-            "Retry the command, or avoid running multiple public-dashboard writes in parallel."
-        ) from last_error
+        """Wait for a dashboard lease before opening its graph."""
+        return MemoryGraph.open(self.paths.dashboard_storage, config=self.config, read_only=read_only, wait_for_lock=True)
 
     def _public_dashboard_node(self, graph: MemoryGraph, now: str) -> MemoryNode:
         existing = graph.get_node(PUBLIC_DASHBOARD_NODE_ID)

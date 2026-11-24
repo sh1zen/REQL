@@ -4,12 +4,17 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from functools import lru_cache
 from itertools import pairwise
 from types import MappingProxyType
 
-_WORD_RE = re.compile(r"[\w\u00C0-\u017F][\w\u00C0-\u017F'\-]{1,}", re.UNICODE)
+from ..config.loader import default_config
+from ..config.policies import LexicalNormalizationPolicy, SeedExtractionPolicy
+
+_DEFAULT_LEXICAL = default_config().lexical
+
+_WORD_RE = re.compile(r"[\w][\w'\-]*")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 TOKEN_ANALYSIS_CACHE_SIZE = 1024
@@ -29,13 +34,23 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value)
 
 
-@lru_cache(maxsize=8192)
-def canonicalize(value: str) -> str:
-    """Reuse normalization of immutable text across ranking and indexing passes."""
+def canonicalize(value: str, *, fold_accents: bool = True) -> str:
+    """Reuse short normalized strings without retaining large source bodies."""
+    normalize = _cached_canonicalize if len(value) <= TOKEN_ANALYSIS_MAX_CHARS else _canonicalize
+    return normalize(value, fold_accents)
+
+
+def _canonicalize(value: str, fold_accents: bool) -> str:
     value = normalize_text(value).lower()
-    value = strip_accents(value)
-    value = re.sub(r"[^a-z0-9_\-\s]", " ", value)
+    if fold_accents:
+        value = strip_accents(value)
+        value = re.sub(r"[^a-z0-9_\-\s]", " ", value)
+    else:
+        value = re.sub(r"[^\w\-\s]", " ", unicodedata.normalize("NFC", value))
     return re.sub(r"\s+", " ", value).strip()
+
+
+_cached_canonicalize = lru_cache(maxsize=8192)(_canonicalize)
 
 
 def token_signal_score(token: str) -> float:
@@ -72,39 +87,49 @@ def _token_signal_score_stripped(token: str) -> float:
     return min(1.0, score)
 
 
-def tokenize(value: str, *, keep_stopwords: bool = False) -> list[str]:
+def tokenize(value: str, *, keep_stopwords: bool = False,
+             policy: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> list[str]:
     """Return independent tokens while reusing bounded immutable text analysis."""
-    tokens, _ = _tokenize_with_signal_scores(value, keep_stopwords=keep_stopwords)
+    tokens, _ = _tokenize_with_signal_scores(value, keep_stopwords=keep_stopwords, policy=policy)
     return list(tokens)
 
 
-@lru_cache(maxsize=8192)
-def identifier_expanded_text(value: str) -> str:
+def identifier_expanded_text(value: str, *, split_identifiers: bool = True) -> str:
     """Expose path and identifier components as ordinary lexical words."""
+    value = str(value)
+    if not split_identifiers:
+        return value
+    expand = _cached_identifier_expansion if len(value) <= TOKEN_ANALYSIS_MAX_CHARS else _expand_identifiers
+    return expand(value)
 
-    separated = str(value).replace("\\", " ").replace("/", " ").replace(".", " ")
+
+def _expand_identifiers(value: str) -> str:
+    separated = value.replace("\\", " ").replace("/", " ").replace(".", " ")
     separated = separated.replace("_", " ").replace("-", " ").replace(":", " ")
     return _CAMEL_BOUNDARY_RE.sub(" ", separated)
 
 
+_cached_identifier_expansion = lru_cache(maxsize=8192)(_expand_identifiers)
+
+
 @lru_cache(maxsize=32768)
-def expanded_tokens(value: str) -> tuple[str, ...]:
+def expanded_tokens(value: str, *, policy: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> tuple[str, ...]:
     """Return deterministic tokens including identifier and plural forms."""
 
     tokens: list[str] = []
     seen: set[str] = set()
-    for candidate in (value, identifier_expanded_text(value)):
-        for token in tokenize(candidate):
-            for variant in token_variants(token):
+    for candidate in dict.fromkeys((value, identifier_expanded_text(value, split_identifiers=policy.split_identifiers))):
+        for token in tokenize(candidate, policy=policy):
+            for variant in token_variants(token, expand_plurals=policy.expand_plurals):
                 if variant not in seen:
                     seen.add(variant)
                     tokens.append(variant)
     return tuple(tokens)
 
 
-def token_variants(token: str) -> tuple[str, ...]:
+def token_variants(token: str, *, expand_plurals: bool = True) -> tuple[str, ...]:
     variants = [token]
-    singular = singular_token(token)
+    singular = singular_token(token) if expand_plurals else None
     if singular and singular != token:
         variants.append(singular)
     return tuple(variants)
@@ -135,27 +160,28 @@ def singular_source_variants(token: str) -> tuple[str, ...]:
     return tuple(candidate for candidate in candidates if singular_token(candidate) == token)
 
 
-def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False) -> tuple[tuple[str, ...], Mapping[str, float]]:
+def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False,
+                                 policy: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> tuple[tuple[str, ...], Mapping[str, float]]:
     """Share short-text analysis without retaining large source bodies in this cache."""
-    canonical = canonicalize(value)
+    canonical = canonicalize(value, fold_accents=policy.fold_accents)
     if len(canonical) > TOKEN_ANALYSIS_MAX_CHARS:
-        return _analyze_token_signals(canonical, keep_stopwords)
-    return _cached_token_signals(canonical, keep_stopwords)
+        return _analyze_token_signals(canonical, keep_stopwords, policy.min_token_chars, policy.min_token_signal)
+    return _cached_token_signals(canonical, keep_stopwords, policy.min_token_chars, policy.min_token_signal)
 
 
 @lru_cache(maxsize=TOKEN_ANALYSIS_CACHE_SIZE)
-def _cached_token_signals(canonical: str, keep_stopwords: bool) -> tuple[tuple[str, ...], Mapping[str, float]]:
+def _cached_token_signals(canonical: str, keep_stopwords: bool, min_chars: int, min_signal: float) -> tuple[tuple[str, ...], Mapping[str, float]]:
     """Memoize immutable results keyed by the actual normalized text and token policy."""
-    return _analyze_token_signals(canonical, keep_stopwords)
+    return _analyze_token_signals(canonical, keep_stopwords, min_chars, min_signal)
 
 
-def _analyze_token_signals(canonical: str, keep_stopwords: bool) -> tuple[tuple[str, ...], Mapping[str, float]]:
+def _analyze_token_signals(canonical: str, keep_stopwords: bool, min_chars: int, min_signal: float) -> tuple[tuple[str, ...], Mapping[str, float]]:
     """Calculate the same ordered tokens and signal weights for cached and large inputs."""
     tokens: list[str] = []
     signal_scores: dict[str, float] = {}
     for match in _WORD_RE.finditer(canonical):
         token = match.group(0).strip("_-")
-        if len(token) < 2:
+        if len(token) < min_chars:
             continue
         if keep_stopwords:
             tokens.append(token)
@@ -164,60 +190,75 @@ def _analyze_token_signals(canonical: str, keep_stopwords: bool) -> tuple[tuple[
         if score is None:
             score = _token_signal_score_stripped(token)
             signal_scores[token] = score
-        if score > 0.0:
+        if score > 0.0 and score >= min_signal:
             tokens.append(token)
     return tuple(tokens), MappingProxyType(signal_scores)
 
 
-def split_sentences(value: str) -> list[str]:
-    value = normalize_text(value)
-    pieces = [p.strip() for p in _SENTENCE_RE.split(value) if p.strip()]
+def split_sentences(value: str, *, policy: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> list[str]:
+    pieces = [normalize_text(piece) for piece in _SENTENCE_RE.split(value) if piece.strip()]
     # Split very long comma-heavy statements into semantically useful chunks.
     out: list[str] = []
     for piece in pieces:
-        if len(piece) > 260 and ";" in piece:
+        if len(piece) > policy.sentence_clause_chars and ";" in piece:
             out.extend([p.strip() for p in piece.split(";") if p.strip()])
         else:
             out.append(piece)
-    return out or ([value] if value else [])
+    return out
 
 
-def keyword_scores(value: str, *, max_terms: int = 12) -> list[tuple[str, float]]:
-    tokens, token_scores = _tokenize_with_signal_scores(value)
-    if not tokens:
-        return []
-    counts = Counter(tokens)
-    # Add compact bigrams when both sides have useful structural signal.
-    for a, b in pairwise(tokens):
-        if token_scores[a] >= 0.5 and token_scores[b] >= 0.5:
-            counts[f"{a} {b}"] += 1.25
-    max_count = max(counts.values()) or 1
-    scored = []
-    for term, count in counts.items():
-        if " " in term:
-            specificity = 1.15 + min(token_scores[part] for part in term.split())
-        else:
-            specificity = token_scores[term]
-        scored.append((term, min(1.0, (count / max_count) * specificity)))
-    scored.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
+def keyword_scores(value: str, *, max_terms: int = 12,
+                   policy: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> list[tuple[str, float]]:
+    tokens, token_scores = _tokenize_with_signal_scores(value, policy=policy)
+    scored = sorted(
+        _iter_keyword_scores(tokens, token_scores, policy),
+        key=lambda item: (item[1], len(item[0])),
+        reverse=True,
+    )
     return scored[:max_terms]
 
 
-def extract_capitalized_entities(value: str) -> list[str]:
+def _iter_keyword_scores(
+    tokens: tuple[str, ...],
+    token_scores: Mapping[str, float],
+    policy: LexicalNormalizationPolicy,
+    *,
+    token_counts: Counter[str] | None = None,
+) -> Iterator[tuple[str, float]]:
+    """Score all keywords and phrases from one lexical analysis."""
+    if not tokens:
+        return
+    counts = Counter(tokens) if token_counts is None else token_counts.copy()
+    # Add compact bigrams when both sides have useful structural signal.
+    for a, b in pairwise(tokens):
+        if min(token_scores[a], token_scores[b]) >= policy.phrase_min_signal:
+            counts[f"{a} {b}"] += policy.phrase_frequency
+    max_count = max(counts.values()) or 1
+    for term, count in counts.items():
+        if " " in term:
+            specificity = policy.phrase_specificity + min(token_scores[part] for part in term.split())
+        else:
+            specificity = token_scores[term]
+        yield term, min(1.0, (count / max_count) * specificity)
+
+
+def extract_capitalized_entities(value: str, *,
+                                 policy: SeedExtractionPolicy = _DEFAULT_LEXICAL.seeds,
+                                 normalization: LexicalNormalizationPolicy = _DEFAULT_LEXICAL.normalization) -> list[str]:
     candidates: list[str] = []
     # Quoted strings and code-like tokens carry useful entity signal without a language list.
-    for quoted in re.findall(r"['\"]([^'\"]{2,60})['\"]", value):
-        candidates.append(quoted.strip())
-    for token in re.findall(r"\b[A-Z\u00C0-\u017F][\w\u00C0-\u017F0-9+#.-]{1,}\b", value):
-        if _looks_entity_like(token):
-            candidates.append(token)
-    for token in re.findall(r"\b(?:[A-Z]{2,}|[A-Za-z]+\d[A-Za-z0-9]*)\b", value):
-        if _looks_entity_like(token):
-            candidates.append(token)
+    if policy.quoted_entities:
+        candidates.extend(quoted.strip() for quoted in re.findall(r"['\"]([^'\"]{2,60})['\"]", value))
+    if policy.capitalized_entities:
+        candidates.extend(token for token in re.findall(r"\b[A-Z\u00C0-\u017F][\w+#.-]{1,}\b", value)
+                          if _looks_entity_like(token))
+    if policy.structured_entities:
+        candidates.extend(token for token in re.findall(r"\b(?:[A-Z]{2,}|[A-Za-z]+\d[A-Za-z0-9]*)\b", value)
+                          if _looks_entity_like(token))
     seen = set()
     out = []
     for candidate in candidates:
-        key = canonicalize(candidate)
+        key = canonicalize(candidate, fold_accents=normalization.fold_accents)
         if key and key not in seen:
             seen.add(key)
             out.append(candidate.strip())

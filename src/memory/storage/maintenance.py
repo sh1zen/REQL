@@ -11,7 +11,7 @@ from ..artifacts.cache import artifact_cache_path
 from ..artifacts.options import CompilationOptions
 from ..config import REQLConfig
 from ..domain.exceptions import StorageError
-from .adapters.block_store import exclusive_store_lock
+from .adapters.store_lock import StoreLease, exclusive_store_lock
 
 
 def clear_project_storage(
@@ -20,7 +20,7 @@ def clear_project_storage(
     *,
     config: REQLConfig,
     config_path: str | Path | None = None,
-    max_file_size_bytes: int,
+    max_file_size_bytes: int | None,
     parsing_options: CompilationOptions,
 ) -> dict[str, Any]:
     """Replace a store with a clean graph compiled from the current project tree.
@@ -87,7 +87,7 @@ def _compile_clean_store(
     *,
     config: REQLConfig,
     config_path: str | Path | None,
-    max_file_size_bytes: int,
+    max_file_size_bytes: int | None,
     parsing_options: CompilationOptions,
 ) -> dict[str, Any]:
     # Imported lazily to keep the storage package importable by MemoryGraph.
@@ -141,7 +141,7 @@ def _remove_obsolete_sidecars(target: Path) -> list[str]:
     for suffix in (".wal", ".usage.jsonl"):
         sidecar = target.with_name(f"{target.name}{suffix}")
         if suffix == ".usage.jsonl":
-            with exclusive_store_lock(sidecar):
+            with StoreLease(sidecar, blocking=True):
                 if sidecar.exists():
                     sidecar.unlink()
                     removed.append(str(sidecar))

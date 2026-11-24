@@ -52,6 +52,14 @@ REQL_MCP_API_KEY="change-this-key" reql-mcp --transport http --host 127.0.0.1 --
 
 `--api-key-env NAME` selects another environment variable; `--api-key` supplies
 the key directly. Requests go to `/mcp`; `/health` is the health endpoint.
+The `mcp.host` and `mcp.port` settings supply the HTTP address when their flags
+are omitted. Explicit CLI flags take precedence.
+
+`initialize` returns the requested protocol version when supported. Otherwise
+it offers `2025-11-25`. The server also accepts `2025-06-18` and `2025-03-26`
+for its handshake-based tool surface. `serverInfo.version` identifies the REQL
+package release. HTTP callers can send their negotiated version in the
+`MCP-Protocol-Version` header. Unsupported header values receive HTTP 400.
 Binding `0.0.0.0` exposes all interfaces; see [Security notes](#security-notes).
 
 ## Tools
@@ -62,7 +70,7 @@ Binding `0.0.0.0` exposes all interfaces; see [Security notes](#security-notes).
 | `query_explore` | Selected dependency views such as owners, callers and serialization paths |
 | `query_graph` | Seeds, expanded nodes/edges, source records and graph diagnostics |
 | `query_memories` | Ranked memory/source texts |
-| `reql_query` | REQL columns, bounded rows and diagnostics; rejects mutating analysis statements |
+| `reql_query` | REQL columns, rows capped by the server and diagnostics. Use the CLI for `ACTIVATE`, `COMMUNITIES`, and `HUBS`. |
 | `reql_project_status` | Registered project and last-compilation status |
 | `reql_work_context` | Focused shared work without opening the canonical project graph |
 | `reql_work_overview` | Project direction, workstreams, execution and next steps |
@@ -93,13 +101,22 @@ Configuration uses the same owner and precedence as the CLI; see
 [Configuration](CONFIGURATION.md#overrides). Project tools discover `reql.conf`
 from their project path upward when no explicit config is supplied.
 The server also honors `REQL_CONFIG`, `REQL_CONFIG_OVERRIDES`, `--config` and
-repeated `--set` overrides.
+repeated `--set` overrides. Work tools use the target project's `workspace`
+paths. Work context and overview return all matching records by default.
+Pass `limit` to restrict the returned rows.
 
-Limits depend on the tool: `top_k` is capped at 50, `max_depth` at 5, graph nodes
-at 200, graph edges at 400, context items at 50, memory text at 2,000 characters
-per snippet and REQL rows at 200. Query-context defaults are `20/3/20` for
-`top_k`/`max_depth`/`max_items`. Inspect the tool schema for required arguments
-and command-specific limits.
+The server uses the startup `mcp` settings for maximum depth, seed and item
+counts, graph nodes and edges, REQL rows and memory text length. `tools/list`
+advertises those limits and adjusts advertised defaults when a limit is lower.
+The same limits apply to tool execution. Per-request configuration still
+controls project behavior within the server's startup limits. The default
+query-context budget is `20/3/20` for `top_k`, `max_depth` and `max_items`.
+[Configuration options](CONFIGURATION.md#behavior)
+
+Both transports return JSON-RPC parse errors for malformed input, invalid
+request or parameter errors for invalid messages and an internal error for
+unexpected tool failures. Internal errors retain the request ID and log the
+exception locally.
 
 ## Codex `config.toml`
 
@@ -114,13 +131,15 @@ Client-specific configuration controls the server's working directory and permis
 
 ## HTTP JSON-RPC
 
-HTTP uses the same JSON-RPC messages as stdio:
+HTTP uses the same JSON-RPC messages as stdio. POST sends a single message.
+Notifications receive an empty HTTP 202 response. GET on the MCP endpoint
+returns HTTP 405 because this transport responds with JSON to POST requests.
 
 ```bash
 curl -s http://127.0.0.1:8765/mcp \
   -H "Authorization: Bearer change-this-key" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example","version":"1.0"}}}'
 ```
 
 ## Claude Desktop

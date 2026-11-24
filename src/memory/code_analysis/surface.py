@@ -21,9 +21,19 @@ class CssAnalysis:
     classes: dict[str, list[int]] = field(default_factory=dict)
     selectors: dict[str, list[int]] = field(default_factory=dict)
     overridden_declarations: list[CssDeclaration] = field(default_factory=list)
+    possibly_overridden_declarations: list[CssDeclaration] = field(default_factory=list)
 
 
 _NESTED_RULE_AT_RULES = ("@container", "@document", "@layer", "@media", "@scope", "@supports")
+
+
+_TEMPLATE_RENDER_CALL_NAMES = frozenset({"display", "include_view", "partial", "render", "render_template", "template", "view"})
+
+
+def is_template_render_call(target: str | None) -> bool:
+    """Recognize conventional template-render method names across analyzers."""
+    value = (target or "").strip().casefold().replace("\\", ".")
+    return re.split(r"[.>:]+", value)[-1].strip() in _TEMPLATE_RENDER_CALL_NAMES
 
 
 def analyze_css(text: str) -> CssAnalysis:
@@ -31,8 +41,8 @@ def analyze_css(text: str) -> CssAnalysis:
 
     The parser is intentionally dependency-free, but it still respects strings,
     comments, parentheses, brackets, nested conditional rules, and ``!important``.
-    A declaration is reported as overridden only when a later declaration has the
-    same selector and at-rule context (or repeats the property in the same block).
+    Identical declarations in one rule are redundant. A different value or a
+    separate rule can be a browser or cascade fallback, so it needs validation.
     """
 
     cleaned = _strip_comments_preserving_lines(text)
@@ -81,12 +91,14 @@ def _parse_rule_region(
                 normalized_selectors.append(normalized_selector)
                 selector_line = base_line + text.count("\n", 0, prelude_start)
                 analysis.selectors.setdefault(normalized_selector, []).append(selector_line)
-                for class_name in re.findall(r"\.([A-Za-z_][\w-]*)", selector):
-                    analysis.identifiers.add(f"class:{class_name.casefold()}")
-                    analysis.classes.setdefault(class_name.casefold(), []).append(selector_line)
-                for element_id in re.findall(r"#([A-Za-z_][\w-]*)", selector):
-                    analysis.identifiers.add(f"id:{element_id.casefold()}")
+                for marker, name in selector_identifiers(selector):
+                    if marker == ".":
+                        analysis.identifiers.add(f"class:{name}")
+                        analysis.classes.setdefault(name, []).append(selector_line)
+                    else:
+                        analysis.identifiers.add(f"id:{name}")
             rule_selector = ", ".join(normalized_selectors)
+            declarations_in_rule: dict[str, CssDeclaration] = {}
             for declaration in declarations:
                 item = CssDeclaration(
                     selector=rule_selector,
@@ -98,13 +110,14 @@ def _parse_rule_region(
                 )
                 key = (context, rule_selector, declaration.property_name)
                 previous = latest.get(key)
-                if (
-                    previous is not None
-                    and (item.important or not previous.important)
-                    and previous not in analysis.overridden_declarations
-                ):
-                    analysis.overridden_declarations.append(previous)
-                latest[key] = item
+                if previous is None or item.important or not previous.important:
+                    if previous is not None:
+                        if previous is declarations_in_rule.get(item.property_name) and item.value == previous.value:
+                            analysis.overridden_declarations.append(previous)
+                        else:
+                            analysis.possibly_overridden_declarations.append(previous)
+                    latest[key] = item
+                    declarations_in_rule[item.property_name] = item
         cursor = closing + 1
 
 
@@ -132,8 +145,20 @@ def _parse_declarations(block: str, base_line: int) -> list[CssDeclaration]:
     return values
 
 
+_SELECTOR_IDENTIFIER_RE = re.compile(r"""\[(?:[^\]'"]|"[^"]*"|'[^']*')*\]|([.#])([A-Za-z_-][\w-]*)""")
+
+
+def selector_identifiers(selector: str) -> list[tuple[str, str]]:
+    """Read literal class and ID selectors outside attribute selectors."""
+    return [(match[1], match[2]) for match in _SELECTOR_IDENTIFIER_RE.finditer(selector) if match[1]]
+
+
 def _strip_comments_preserving_lines(text: str) -> str:
-    return re.sub(r"/\*.*?\*/", lambda match: "\n" * match.group(0).count("\n"), text, flags=re.DOTALL)
+    return re.sub(
+        r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|/\*.*?\*/""",
+        lambda match: match[1] if match[1] is not None else "\n" * match[0].count("\n"),
+        text, flags=re.DOTALL,
+    )
 
 
 def _find_top_level(text: str, needle: str, start: int) -> int:

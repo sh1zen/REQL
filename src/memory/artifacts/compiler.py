@@ -1,7 +1,8 @@
 """Document-aware source artifact compiler for incremental graph updates."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import builtins
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 import hashlib
@@ -9,14 +10,16 @@ import posixpath
 import re
 from typing import Any, Sequence
 
-from ..code_analysis.catalog import detect_code_language
-from ..code_analysis.models import CodeCall, CodeImport, CodeModule, CodeParseResult, CodeSymbol, CodeText
+from ..code_analysis.catalog import ECMASCRIPT_EXTENSIONS, PHP_EXTENSIONS, detect_code_language, language_key
+from ..code_analysis.markup import markup_surface_attributes
+from ..code_analysis.models import CodeCall, CodeImport, CodeModule, CodeParseResult, CodeRoute, CodeSymbol, CodeText
 from ..code_analysis.parser_base import CodeParserRegistry, default_code_parser_registry
-from ..code_analysis.surface import CssDeclaration, analyze_css
+from ..code_analysis.surface import CssDeclaration, analyze_css, is_template_render_call, selector_identifiers
 from ..code_analysis.symbol_table import SymbolTable, is_computed_reference
 from ..document_ingestion.base import ParserRegistry, default_parser_registry
 from ..document_ingestion.metadata import make_fragment
 from ..document_ingestion.models import DocumentFragment, DocumentLink, DocumentParseResult
+from ..domain.constants import PROJECT_USAGE_ARCHIVE_REASON
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
@@ -24,161 +27,23 @@ from ..extraction.document_processor import DocumentProcessingResult, DocumentPr
 from ..extraction.normalization import canonicalize
 from ..storage.graph_store import GraphStore
 from .compile_identity import ArtifactCompileIdentity
-from .context_scope import artifact_context_scope
-from .fingerprint import DEFAULT_CHUNKING_VERSION, DEFAULT_PARSER_VERSION, options_hash
+from .context_scope import (
+    TEMPLATE_FILE_EXTENSIONS, application_surface_kind, artifact_context_scope, matches_test_case_name,
+)
+from .fingerprint import options_hash
 from .models import ArtifactCompilationResult, SourceArtifact
 from .options import CompilationOptions, normalize_compilation_options
+from .text_encoding import decode_text
 
 
 DOCUMENT_CODE_LINK_NODE_TYPES = {"Module", "Function", "Class", "Interface", "Method", "Endpoint", "Schema"}
-DOCUMENT_CODE_LINK_STOP_TERMS = {
-    "agent",
-    "agents",
-    "api",
-    "app",
-    "architecture",
-    "cache",
-    "cli",
-    "code",
-    "config",
-    "data",
-    "docs",
-    "edge",
-    "file",
-    "files",
-    "graph",
-    "guide",
-    "item",
-    "lib",
-    "main",
-    "memory",
-    "node",
-    "parser",
-    "path",
-    "project",
-    "query",
-    "readme",
-    "result",
-    "src",
-    "status",
-    "store",
-    "test",
-    "text",
-    "usage",
-    "user",
-    "users",
-}
 MAX_DOCUMENT_CODE_LINKS_PER_FRAGMENT = 8
 APPLICATION_SURFACE_LINKER = "application_surface_linker"
-TEMPLATE_RENDER_CALL_NAMES = {
-    "display",
-    "include_view",
-    "partial",
-    "render",
-    "render_template",
-    "template",
-    "view",
-}
-TEMPLATE_FILE_EXTENSIONS = (".php", ".phtml", ".html", ".htm", ".twig", ".blade.php")
-STYLESHEET_EXTENSIONS = (".css", ".scss", ".sass", ".less")
-SCRIPT_EXTENSIONS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
-MAX_DOCUMENT_CODE_LINKS_PER_RUN = 1000
 _CodeMatcher = tuple[tuple[int, str, str, str, str], MemoryNode, str]
-
-LANGUAGE_BUILTIN_GLOBALS = {
-    "AbortController",
-    "AbortSignal",
-    "abi",
-    "addmod",
-    "Array",
-    "assert",
-    "block",
-    "blockhash",
-    "Blob",
-    "Boolean",
-    "Date",
-    "Error",
-    "False",
-    "File",
-    "FormData",
-    "Headers",
-    "Intl",
-    "JSON",
-    "Map",
-    "Math",
-    "None",
-    "Number",
-    "Object",
-    "payable",
-    "Promise",
-    "Proxy",
-    "RangeError",
-    "Reflect",
-    "RegExp",
-    "require",
-    "Request",
-    "Response",
-    "revert",
-    "Set",
-    "selfdestruct",
-    "sha256",
-    "String",
-    "Symbol",
-    "tx",
-    "TextDecoder",
-    "TextEncoder",
-    "True",
-    "TypeError",
-    "URL",
-    "URLSearchParams",
-    "WeakMap",
-    "WeakSet",
-    "abs",
-    "all",
-    "any",
-    "bool",
-    "bytes",
-    "callable",
-    "console",
-    "dict",
-    "dir",
-    "enumerate",
-    "filter",
-    "float",
-    "getattr",
-    "hasattr",
-    "hash",
-    "id",
-    "int",
-    "isinstance",
-    "iter",
-    "len",
-    "list",
-    "map",
-    "max",
-    "min",
-    "msg",
-    "next",
-    "object",
-    "open",
-    "parseFloat",
-    "parseInt",
-    "print",
-    "range",
-    "repr",
-    "reversed",
-    "round",
-    "set",
-    "setattr",
-    "sorted",
-    "str",
-    "sum",
-    "super",
-    "tuple",
-    "type",
-    "vars",
-    "zip",
-}
+_DOCUMENT_LINK_WORD = re.compile(r"[^\W\d]\w*")
+_BARE_DOCUMENT_IDENTIFIER = re.compile(r"(?<![\w./\\])[^\W\d]\w*(?![\w/\\]|[.]\w)")
+_EXPLICIT_DOCUMENT_IDENTIFIER = re.compile(r"(?<!\x60)\x60([^\W\d]\w*)(?:\(\))?\x60(?!\x60)|"
+                                           r"(?<![\w./\\])[^\W\d]\w*(?=\()")
 
 CODE_GRAPH_NODE_TYPES = {
     "Module",
@@ -245,31 +110,29 @@ class ArtifactCompiler:
         enable_pdf: bool = True,
         document_processor: DocumentProcessor | None = None,
         options: CompilationOptions | None = None,
-        parser_version: str = DEFAULT_PARSER_VERSION,
-        chunking_version: str = DEFAULT_CHUNKING_VERSION,
     ) -> None:
         options = normalize_compilation_options(options)
         self.options = options
-        self.parser_version = parser_version
-        self.chunking_version = chunking_version
         self.identity = ArtifactCompileIdentity(
-            parser_version, chunking_version, options_hash(options.cache_payload()),
+            options_hash(options.cache_payload()),
             scoped=type(self) is ArtifactCompiler,
             scoped_documents=parser_registry is None and document_processor is None and enable_pdf,
             code_parsers=code_parser_registry,
         )
         self.enable_pdf = enable_pdf and options.format_ingest_enabled("pdf")
-        self.document_processor = document_processor or DocumentProcessor()
+        self.document_processor = document_processor or DocumentProcessor(policy=options.document_extraction)
         self.parser_registry = parser_registry or default_parser_registry(
             enable_pdf=enable_pdf,
         )
         self.code_parser_registry = code_parser_registry or default_code_parser_registry()
 
     def compile_artifact(self, store: GraphStore, artifact: SourceArtifact) -> ArtifactCompilationResult:
+        if artifact.test_discovery is None:
+            artifact = replace(artifact, test_discovery=self.options.test_discovery)
         content = self._read_verified_content(artifact)
         code_result: CodeParseResult | None = None
         if _is_code_artifact(artifact) and type(self).build_fragments is ArtifactCompiler.build_fragments:
-            code_text = content.decode("utf-8-sig", errors="replace")
+            code_text = decode_text(content, errors="replace")
             code_result = self.parse_code_text(artifact, code_text)
             parse_result = _document_result_from_code(artifact, code_result, code_text)
         elif _is_document_artifact(artifact) and not self.document_ingest_enabled(artifact):
@@ -280,6 +143,12 @@ class ArtifactCompiler:
         else:
             parse_result = self.build_fragments(artifact)
         result = ArtifactCompilationResult(artifact_id=artifact.id, errors=list(parse_result.errors))
+        if not _is_code_artifact(artifact):
+            previous_module = _get_node(store, stable_id("module", artifact.id))
+            if previous_module is not None and previous_module.status != "archived":
+                _archive_code_nodes(store, result, [
+                    node for node in _code_nodes_for_artifact(store, artifact) if node.status != "archived"
+                ])
         classification_result = self._persist_compile_classification(store, artifact)
         result.merge(classification_result)
 
@@ -305,9 +174,6 @@ class ArtifactCompiler:
         relation_result = self._persist_document_relations(store, artifact, parse_result, fragment_id_map)
         result.merge(relation_result)
 
-        surface_result = _persist_application_surface_links(store, artifact, parse_result, fragment_id_map, code_result=code_result)
-        result.merge(surface_result)
-
         if self.document_processing_enabled(artifact):
             processing_result = self._persist_document_processing(store, artifact, parse_result, fragment_id_map)
             result.merge(processing_result)
@@ -319,6 +185,9 @@ class ArtifactCompiler:
         if code_result is not None and code_result.parser_name != "none":
             code_graph_result = self._persist_code_graph(store, artifact, code_result, parse_result)
             result.merge(code_graph_result)
+
+        surface_result = _persist_application_surface_links(store, artifact, parse_result, fragment_id_map, code_result=code_result)
+        result.merge(surface_result)
 
         for node in existing:
             if node.id in persisted_fragment_ids or node.status == "archived":
@@ -343,9 +212,12 @@ class ArtifactCompiler:
 
     def _read_verified_content(self, artifact: SourceArtifact) -> bytes:
         path = Path(artifact.path)
-        before = path.stat()
-        content = path.read_bytes()
-        after = path.stat()
+        try:
+            before = path.stat()
+            content = path.read_bytes()
+            after = path.stat()
+        except (FileNotFoundError, IsADirectoryError) as exc:
+            raise ArtifactContentChangedError("source disappeared or was replaced during compilation") from exc
         digest = hashlib.sha256(content).hexdigest()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns or digest != artifact.sha256:
             raise ArtifactContentChangedError(
@@ -361,6 +233,8 @@ class ArtifactCompiler:
         return parser.parse(artifact, content)
 
     def parse_code_text(self, artifact: SourceArtifact, text: str) -> CodeParseResult:
+        if artifact.test_discovery is None:
+            artifact = replace(artifact, test_discovery=self.options.test_discovery)
         language = detect_code_language(artifact)
         parser = self.code_parser_registry.parser_for(artifact)
         if parser is None:
@@ -373,7 +247,7 @@ class ArtifactCompiler:
     def document_ingest_enabled(self, artifact: SourceArtifact) -> bool:
         if not self.options.ingest_documents or not _is_document_artifact(artifact):
             return False
-        if _is_application_surface_path(artifact.relative_path):
+        if application_surface_kind(artifact.relative_path) is not None:
             return True
         return self.options.document_ingest_enabled(artifact)
 
@@ -446,6 +320,18 @@ class ArtifactCompiler:
             node_upserts.append(("config", _config_node(artifact)))
         if _is_test_artifact(artifact):
             node_upserts.append(("test", _test_node(artifact)))
+        else:
+            # A changed discovery policy can remove a test classification in place.
+            test_id = stable_id("test", artifact.project_id, artifact.relative_path)
+            previous = store.get_node(test_id, clone=False)
+            if previous is not None and previous.status == "active":
+                _archive_node(store, previous)
+                result.archived_nodes.add(test_id)
+                result.affected_node_ids.add(test_id)
+                if edge := store.get_edge_by_pattern(file_id, test_id, "DEFINES"):
+                    _archive_edge(store, edge)
+                    result.archived_edges.add(edge.id)
+                    result.affected_edge_ids.add(edge.id)
         for kind, (node, created) in zip([kind for kind, _ in node_upserts], _batch_upsert_nodes(store, [node for _, node in node_upserts])):
             result.record_node(node.id, created=created)
             edges.append(
@@ -527,14 +413,14 @@ class ArtifactCompiler:
         current_node_ids: set[str],
         current_edge_ids: set[str],
     ) -> None:
-        for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=100000):
+        for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=None):
             if edge.properties.get("extractor") != "document_processor" or edge.id in current_edge_ids or edge.properties.get("status") == "archived":
                 continue
             _archive_edge(store, edge)
             result.archived_edges.add(edge.id)
             result.affected_edge_ids.add(edge.id)
         for node_type in ("Concept", "RawEvent"):
-            for node in _find_nodes_by_property(store, "artifact_id", artifact.id, type_=node_type, limit=100000):
+            for node in _find_nodes_by_property(store, "artifact_id", artifact.id, type_=node_type, limit=None):
                 if node.properties.get("extractor") != "document_processor" or node.id in current_node_ids or node.status == "archived":
                     continue
                 _archive_node(store, node)
@@ -560,11 +446,17 @@ class ArtifactCompiler:
         external_nodes: dict[tuple[str, str], MemoryNode] = {}
         import_node_ids: dict[str, str] = {}
         imported_names = _imported_binding_names(code_result.imports)
+        external_bindings = imported_names
+        if language_key(code_result.module.language) == "python":
+            external_bindings = imported_names | vars(builtins).keys()
         table = SymbolTable(code_result)
 
-        def pending_external(name: str | None, kind: str) -> MemoryNode | None:
-            clean_name = _clean_external_symbol_name(name, imported_names=imported_names)
+        def pending_external(name: str | None, kind: str, *, include_known_binding: bool = False) -> MemoryNode | None:
+            clean_name = _clean_call_target(name)
             if clean_name is None:
+                return None
+            head = re.split(r"[\[<{.]", clean_name, maxsplit=1)[0].strip()
+            if not include_known_binding and head in external_bindings:
                 return None
             key = (clean_name, kind)
             cached = external_nodes.get(key)
@@ -689,7 +581,7 @@ class ArtifactCompiler:
                 )
             )
 
-        endpoint_upserts: list[tuple[CodeSymbol, str, str, MemoryNode]] = []
+        endpoint_upserts: dict[str, tuple[CodeSymbol, str, str, MemoryNode]] = {}
         for symbol in code_result.symbols:
             node = symbol_nodes.get(symbol.qualified_name)
             if not node:
@@ -699,9 +591,9 @@ class ArtifactCompiler:
                 if target is None:
                     continue
                 pending_edges.append(_typed_edge(node.id, target.id, "DECORATED_BY", {"project_id": artifact.project_id, "artifact_id": artifact.id, "decorator": decorator}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=decorator))
-                endpoint_node = _endpoint_node_for_decorator(artifact, symbol, decorator)
-                if endpoint_node is not None:
-                    endpoint_upserts.append((symbol, node.id, decorator, endpoint_node))
+            for route in code_result.routes.get(symbol.id, ()):
+                endpoint_node = _endpoint_node(artifact, symbol, route)
+                endpoint_upserts.setdefault(endpoint_node.id, (symbol, node.id, route.decorator, endpoint_node))
             for base in symbol.bases:
                 target = symbol_resolver.resolve(base) or pending_external(base, "external")
                 if target is None:
@@ -712,7 +604,9 @@ class ArtifactCompiler:
             target = pending_external(symbol.returns, "external")
             if target is not None:
                 pending_edges.append(_typed_edge(node.id, target.id, "RETURNS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "hint": symbol.returns}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=symbol.returns or ""))
-        for (symbol, handler_node_id, decorator, _), (endpoint, endpoint_created) in zip(endpoint_upserts, _batch_upsert_nodes(store, [node for _, _, _, node in endpoint_upserts])):
+        for (symbol, handler_node_id, decorator, _), (endpoint, endpoint_created) in zip(
+            endpoint_upserts.values(), _batch_upsert_nodes(store, [row[3] for row in endpoint_upserts.values()]),
+        ):
             current_ids.add(endpoint.id)
             result.record_node(endpoint.id, created=endpoint_created)
             pending_edges.append(
@@ -745,13 +639,6 @@ class ArtifactCompiler:
                 properties = {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "resolved_relative_path": resolved_file.properties.get("relative_path")}
                 pending_edges.append(_typed_edge(file_id, resolved_file.id, "IMPORTS", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
                 pending_edges.append(_typed_edge(module_node.id, resolved_file.id, "IMPORTS", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
-                for target_symbol in _resolved_import_symbol_nodes(store, artifact, item, resolved_file):
-                    symbol_properties = {
-                        **properties,
-                        "import_name": item.name,
-                        "target_symbol": target_symbol.properties.get("qualified_name") or target_symbol.properties.get("name"),
-                    }
-                    pending_edges.append(_typed_edge(node.id, target_symbol.id, "IMPORTS", symbol_properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             if _is_package_init_artifact(artifact):
                 pending_edges.append(_typed_edge(module_node.id, node.id, "RE_EXPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "alias": item.alias}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
         for (item, _), (dependency, dep_created) in zip(dependency_nodes, _batch_upsert_nodes(store, [node for _, node in dependency_nodes])):
@@ -786,7 +673,7 @@ class ArtifactCompiler:
                      "receiver": bool(resolution.evidence)},
                 )
             if resolution.status in {"ambiguous", "dynamic"} or _should_record_unresolved_call(
-                call.target, imported_names=imported_names,
+                call.target, external_bindings,
             ):
                 unresolved_calls_by_owner.setdefault(caller_node.id, []).append(
                     {
@@ -812,7 +699,7 @@ class ArtifactCompiler:
             if target_node is None and reference.access in {"raise", "return"}:
                 if _reference_targets_local_argument(reference, symbol_nodes):
                     continue
-                target_node = pending_external(reference.name, "external")
+                target_node = pending_external(reference.name, "external", include_known_binding=reference.access == "raise")
             if target_node is None or owner.id == target_node.id:
                 continue
             relation = {"read": "READS", "write": "WRITES", "raise": "RAISES", "return": "RETURNS"}.get(str(reference.access or ""), "REFERENCES")
@@ -906,24 +793,25 @@ class ArtifactCompiler:
 
         _upsert_edges_deduped(store, result, pending_edges)
         current_relations = {edge.id for edge in pending_edges}
-        for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=100000):
+        for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=None):
             if (edge.id not in current_relations and edge.properties.get("status") != "archived"
-                    and edge.type in {"CALLS", "INSTANTIATES", "REFERENCES", "READS", "WRITES", "RETURNS", "RAISES"}
+                    and edge.type in {"CALLS", "INSTANTIATES", "REFERENCES", "READS", "WRITES", "RETURNS", "RAISES", "IMPORTS"}
                     and edge.properties.get("extractor") == code_result.parser_name):
                 _archive_edge(store, edge)
                 result.archived_edges.add(edge.id)
                 result.affected_edge_ids.add(edge.id)
 
-        stale_nodes = [old_node for old_node in _code_nodes_for_artifact(store, artifact) if old_node.id not in current_ids and old_node.status != "archived"]
-        stale_edges = _code_related_edges_for_nodes(store, stale_nodes)
-        for old_node in stale_nodes:
-            _archive_node(store, old_node)
-            result.archived_nodes.add(old_node.id)
-            result.affected_node_ids.add(old_node.id)
-        for edge in stale_edges:
-            _archive_edge(store, edge)
-            result.archived_edges.add(edge.id)
-            result.affected_edge_ids.add(edge.id)
+        stale_nodes: list[MemoryNode] = []
+        for old_node in _code_nodes_for_artifact(store, artifact):
+            if old_node.id in current_ids:
+                continue
+            if old_node.status != "archived":
+                stale_nodes.append(old_node)
+            elif old_node.type == "StaticAnalysisFinding" and old_node.properties.get("archived_reason") == PROJECT_USAGE_ARCHIVE_REASON:
+                # The current source no longer emits this locally eligible finding.
+                _archive_node(store, old_node)
+                result.record_node(old_node.id, created=False)
+        _archive_code_nodes(store, result, stale_nodes)
 
         return result
 
@@ -941,24 +829,17 @@ def archive_artifact_fragments(store: GraphStore, artifact: SourceArtifact | Mem
             _archive_edge(store, edge)
             result.archived_edges.add(edge.id)
             result.affected_edge_ids.add(edge.id)
-    code_nodes = [node for node in _code_nodes_for_artifact(store, artifact) if node.status != "archived"]
-    code_edges = _code_related_edges_for_nodes(store, code_nodes)
-    for node in code_nodes:
-        _archive_node(store, node)
-        result.archived_nodes.add(node.id)
-        result.affected_node_ids.add(node.id)
-    for edge in code_edges:
-        _archive_edge(store, edge)
-        result.archived_edges.add(edge.id)
-        result.affected_edge_ids.add(edge.id)
+    _archive_code_nodes(store, result, [
+        node for node in _code_nodes_for_artifact(store, artifact) if node.status != "archived"
+    ])
     for node_type in ("Concept", "RawEvent"):
-        for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_=node_type, limit=100000):
+        for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_=node_type, limit=None):
             if node.status == "archived" or node.properties.get("extractor") != "document_processor":
                 continue
             _archive_node(store, node)
             result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
-            for edge in _incident_edges(store, [node.id], limit=10000):
+            for edge in _incident_edges(store, [node.id], limit=None):
                 if edge.properties.get("artifact_id") != artifact_id or edge.properties.get("status") == "archived":
                     continue
                 _archive_edge(store, edge)
@@ -977,34 +858,22 @@ def link_document_fragments_to_code(
     """Link compiled documentation fragments to code symbols they explicitly mention."""
 
     result = ArtifactCompilationResult(artifact_id="*")
+    if artifact_ids is not None and not artifact_ids:
+        return result
     fragments = _semantic_document_fragments(store, project_id, artifact_ids)
-    if not fragments:
-        return result
-    code_nodes = _project_code_nodes(store, project_id)
-    if not code_nodes:
-        return result
-
+    code_nodes = _project_code_nodes(store, project_id) if fragments else []
     pending_edges: list[MemoryEdge] = []
-    current_targets_by_fragment: dict[str, set[str]] = {}
+    current_fragment_code_pairs: set[tuple[str, str]] = set()
     current_term_code_pairs: set[tuple[str, str]] = set()
-    has_existing_document_code_links = any(
-        edge.properties.get("extractor") in {"document_code_linker", "document_processor"}
-        for edge in _find_edges_by_property(store, "project_id", project_id, type_="REFERENCES", limit=100000)
-    )
-    simple_index, complex_index, complex_fallback = _document_code_link_index(code_nodes)
-    link_limit_reached = False
+    simple_index, complex_index = _document_code_link_index(code_nodes)
     for fragment in fragments:
-        if len(pending_edges) >= MAX_DOCUMENT_CODE_LINKS_PER_RUN:
-            link_limit_reached = True
-            break
         text = str(fragment.text or "")
         if not text.strip():
             continue
         matched_targets: set[str] = set()
         fragment_terms: list[MemoryNode] | None = None
-        for code_node, evidence in _matching_code_targets(text, simple_index, complex_index, complex_fallback):
-            if len(matched_targets) >= MAX_DOCUMENT_CODE_LINKS_PER_FRAGMENT or len(pending_edges) >= MAX_DOCUMENT_CODE_LINKS_PER_RUN:
-                link_limit_reached = len(pending_edges) >= MAX_DOCUMENT_CODE_LINKS_PER_RUN
+        for code_node, evidence in _matching_code_targets(text, simple_index, complex_index):
+            if len(matched_targets) >= MAX_DOCUMENT_CODE_LINKS_PER_FRAGMENT:
                 break
             if code_node.id in matched_targets:
                 continue
@@ -1048,6 +917,7 @@ def link_document_fragments_to_code(
                             "target_type": code_node.type,
                             "target_artifact_id": code_node.properties.get("artifact_id"),
                             "fragment_id": fragment.id,
+                            "source_layer": "project_document",
                             "rank": term_node.properties.get("rank", 0.0),
                         },
                         source_file=str(fragment.properties.get("relative_path") or ""),
@@ -1059,12 +929,12 @@ def link_document_fragments_to_code(
                         is_technical=True,
                     )
                 )
-        current_targets_by_fragment[fragment.id] = matched_targets
+        current_fragment_code_pairs.update((fragment.id, target_id) for target_id in matched_targets)
 
     _upsert_edges_deduped(store, result, pending_edges)
-    if has_existing_document_code_links and not link_limit_reached:
-        _archive_stale_document_code_links(store, result, project_id=project_id, current_targets_by_fragment=current_targets_by_fragment)
-        _archive_stale_document_processor_code_links(store, result, project_id=project_id, current_pairs=current_term_code_pairs)
+    _archive_stale_document_code_links(
+        store, result, project_id, artifact_ids, current_fragment_code_pairs, current_term_code_pairs,
+    )
     return result
 
 
@@ -1192,11 +1062,16 @@ def _persist_application_surface_links(
         for fragment in parse_result.fragments
     ]
 
+    has_template_references = False
     for call in (code_result.calls if code_result is not None else []):
-        if not _is_template_render_call(call):
+        if not is_template_render_call(call.target):
             continue
+        template_names = _template_names_from_call(call)
+        if not template_names:
+            continue
+        has_template_references = True
         caller_id = _surface_call_owner_id(store, artifact, call) or current_file_id
-        for template_name in _template_names_from_call(call):
+        for template_name in template_names:
             target = _resolve_template_file_node(store, artifact, template_name)
             if target is None:
                 continue
@@ -1229,8 +1104,9 @@ def _persist_application_surface_links(
         metadata = item.metadata if isinstance(item.metadata, dict) else {}
         if not metadata.get("is_partial") or metadata.get("dynamic"):
             continue
+        has_template_references = True
         target = _resolved_import_file_node(store, artifact, item)
-        if target is None or not _is_application_template_path(str(target.properties.get("relative_path") or "")):
+        if target is None or application_surface_kind(str(target.properties.get("relative_path") or "")) != "template":
             continue
         edges.append(
             _typed_edge(
@@ -1257,7 +1133,10 @@ def _persist_application_surface_links(
             )
         )
 
-    if current_fragments and _is_application_surface_path(current_path):
+    if has_template_references:
+        parse_result.metadata["has_template_references"] = True
+
+    if current_fragments and application_surface_kind(current_path) is not None:
         compatible_fragments = _compatible_application_surface_fragments(store, artifact, current_path)
         for source in current_fragments:
             if not source.identifiers:
@@ -1307,7 +1186,7 @@ def _persist_application_surface_links(
     _upsert_edges_deduped(store, result, edges)
     current_edge_ids.update(result.added_edges)
     current_edge_ids.update(result.updated_edges)
-    for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=100000):
+    for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=None):
         if edge.properties.get("extractor") != APPLICATION_SURFACE_LINKER or edge.id in current_edge_ids or edge.properties.get("status") == "archived":
             continue
         _archive_edge(store, edge)
@@ -1326,16 +1205,8 @@ class _SurfaceFragment:
     identifiers: set[str]
 
 
-def _is_template_render_call(call: CodeCall) -> bool:
-    target = str(call.target or "").strip().casefold().replace("\\", "/")
-    tail = re.split(r"[.>:]+", target)[-1].strip()
-    return tail in TEMPLATE_RENDER_CALL_NAMES
-
-
 def _template_names_from_call(call: CodeCall) -> list[str]:
-    values = call.metadata.get("template_names") if isinstance(call.metadata, dict) else []
-    if not values and isinstance(call.metadata, dict):
-        values = call.metadata.get("arguments")
+    values = call.metadata.get("template_names", call.metadata.get("arguments"))
     if not isinstance(values, list):
         return []
     names: list[str] = []
@@ -1351,7 +1222,7 @@ def _template_names_from_call(call: CodeCall) -> list[str]:
 def _surface_call_owner_id(store: GraphStore, artifact: SourceArtifact, call: CodeCall) -> str | None:
     if not call.caller:
         return None
-    for node in _find_nodes_by_property(store, "artifact_id", artifact.id, limit=100000):
+    for node in _find_nodes_by_property(store, "artifact_id", artifact.id, limit=None):
         if node.type in {"Function", "Method"} and node.properties.get("qualified_name") == call.caller:
             return node.id
     return None
@@ -1381,7 +1252,7 @@ def _candidate_template_relative_paths(source_relative_path: str, template_name:
         normalized = _normalize_relative_candidate(base)
         if not normalized:
             continue
-        if Path(normalized).suffix:
+        if application_surface_kind(normalized) == "template":
             candidates.append(normalized)
         for extension in TEMPLATE_FILE_EXTENSIONS:
             if normalized.endswith(extension):
@@ -1391,25 +1262,27 @@ def _candidate_template_relative_paths(source_relative_path: str, template_name:
 
 
 def _candidate_template_roots(source_relative_path: str) -> list[str]:
-    value = source_relative_path.replace("\\", "/").casefold()
+    parts = source_relative_path.replace("\\", "/").split("/")
     roots = ["app/Views", "app/views", "resources/views", "templates", "views", "app/templates"]
-    if "/controllers/" in value:
-        prefix = source_relative_path.replace("\\", "/").split("/Controllers/", 1)[0]
-        if prefix and prefix not in {".", source_relative_path}:
-            roots.insert(0, f"{prefix}/Views")
+    for index, part in enumerate(parts[:-1]):
+        if part.casefold() == "controllers":
+            prefix = "/".join(parts[:index])
+            sibling_names = ("views", "Views") if part.islower() else ("Views", "views")
+            roots[:0] = ["/".join(filter(None, (prefix, name))) for name in sibling_names]
+            break
     return _dedupe_strings(roots)
 
 
 def _compatible_application_surface_fragments(store: GraphStore, artifact: SourceArtifact, current_path: str) -> list[_SurfaceFragment]:
-    current_kind = _surface_path_kind(current_path)
+    current_kind = application_surface_kind(current_path)
     if current_kind is None:
         return []
     values: list[_SurfaceFragment] = []
-    for node in _find_nodes_by_property(store, "project_id", artifact.project_id, type_="SourceFragment", status="active", limit=100000):
+    for node in _find_nodes_by_property(store, "project_id", artifact.project_id, type_="SourceFragment", status="active", limit=None):
         if node.properties.get("artifact_id") == artifact.id:
             continue
         path = str(node.properties.get("relative_path") or "").replace("\\", "/")
-        if not path or not _surface_kinds_are_compatible(current_kind, _surface_path_kind(path)):
+        if not path or not _surface_kinds_are_compatible(current_kind, application_surface_kind(path)):
             continue
         identifiers = _surface_identifiers_for_text(path, node.text or "")
         if not identifiers:
@@ -1427,18 +1300,6 @@ def _compatible_application_surface_fragments(store: GraphStore, artifact: Sourc
     return values
 
 
-def _surface_path_kind(path: str) -> str | None:
-    value = path.replace("\\", "/").casefold()
-    suffix = Path(value).suffix
-    if suffix in STYLESHEET_EXTENSIONS:
-        return "style"
-    if suffix in SCRIPT_EXTENSIONS:
-        return "script"
-    if suffix in TEMPLATE_FILE_EXTENSIONS or _is_application_template_path(value):
-        return "template"
-    return None
-
-
 def _surface_kinds_are_compatible(left: str | None, right: str | None) -> bool:
     if left is None or right is None or left == right:
         return False
@@ -1446,7 +1307,7 @@ def _surface_kinds_are_compatible(left: str | None, right: str | None) -> bool:
 
 
 def _surface_identifiers_for_text(path: str, text: str) -> set[str]:
-    kind = _surface_path_kind(path)
+    kind = application_surface_kind(path)
     if kind == "style":
         return _css_surface_identifiers(text)
     if kind == "script":
@@ -1457,56 +1318,61 @@ def _surface_identifiers_for_text(path: str, text: str) -> set[str]:
 
 
 def _template_surface_identifiers(text: str) -> set[str]:
-    values: set[str] = set()
-    for match in re.finditer(r"""\b(class|id|name|type)\s*=\s*["']([^"']+)["']""", text, flags=re.IGNORECASE):
-        attr = match.group(1).casefold()
-        for token in re.split(r"\s+", match.group(2).strip()):
-            _add_surface_identifier(values, attr, token)
-    return values
+    identifiers: set[str] = set()
+    for name, value in markup_surface_attributes(text):
+        for token in value.split() if name == "class" else (value,):
+            _add_surface_identifier(identifiers, name, token)
+    return identifiers
 
 
 def _css_surface_identifiers(text: str) -> set[str]:
     return analyze_css(text).identifiers
 
 
+_JS_STRING = re.compile(r"""(?:"([^"\\]*)"|'([^'\\]*)')""")
+
+
 def _script_surface_identifiers(text: str) -> set[str]:
-    values: set[str] = set()
-    for raw in re.findall(r"""["']([.#][A-Za-z_][\w-]*)["']""", text):
-        prefix = "class" if raw.startswith(".") else "id"
-        _add_surface_identifier(values, prefix, raw[1:])
-    for token in re.findall(r"""getElementById\(\s*["']([^"']+)["']\s*\)""", text):
-        _add_surface_identifier(values, "id", token)
-    for token in re.findall(r"""getElementsByClassName\(\s*["']([^"']+)["']\s*\)""", text):
-        _add_surface_identifier(values, "class", token)
-    for token in re.findall(r"""classList\.(?:add|remove|toggle|contains)\(\s*["']([^"']+)["']""", text):
-        _add_surface_identifier(values, "class", token)
-    for token in re.findall(r"""(?:closest|matches|querySelector(?:All)?)\(\s*["'][^"']*\.([A-Za-z_][\w-]*)""", text):
-        _add_surface_identifier(values, "class", token)
-    for token in re.findall(r"""(?:className\s*=|setAttribute\(\s*["']class["']\s*,)\s*["']([^"']+)["']""", text):
-        for item in re.split(r"\s+", token.strip()):
-            _add_surface_identifier(values, "class", item)
-    return values
+    identifiers: set[str] = set()
+    for match in re.finditer(
+        rf"\b(closest|matches|querySelector(?:All)?|getElementById|getElementsByClassName)\s*\(\s*{_JS_STRING.pattern}\s*\)",
+        text,
+    ):
+        method, double, single = match.groups()
+        value = double if double is not None else single
+        if method == "getElementById":
+            _add_surface_identifier(identifiers, "id", value)
+        elif method == "getElementsByClassName":
+            for token in value.split():
+                _add_surface_identifier(identifiers, "class", token)
+        else:
+            for marker, token in selector_identifiers(value):
+                _add_surface_identifier(identifiers, "class" if marker == "." else "id", token)
+    for match in re.finditer(r"\bclassList\s*\.\s*(add|remove|replace|toggle|contains)\s*\(([^)]*)\)", text):
+        method, arguments = match.groups()
+        args = arguments.split(",")
+        if method in {"toggle", "contains"}:
+            args = args[:1]
+        for arg in args:
+            literal = _JS_STRING.fullmatch(arg.strip())
+            if literal is not None:
+                double, single = literal.groups()
+                _add_surface_identifier(identifiers, "class", double if double is not None else single)
+    for match in re.finditer(
+        rf"""(?:\bclassName\s*=(?!=)|\bsetAttribute\s*\(\s*['"]class['"]\s*,)\s*{_JS_STRING.pattern}(?!\s*\+)""",
+        text,
+    ):
+        double, single = match.groups()
+        for token in (double if double is not None else single).split():
+            _add_surface_identifier(identifiers, "class", token)
+    return identifiers
 
 
 def _add_surface_identifier(values: set[str], kind: str, raw_value: str) -> None:
-    value = raw_value.strip().strip(".#").casefold()
-    if not value or len(value) > 80:
+    value = raw_value.strip()
+    if not value or len(value) > 80 or not re.fullmatch(r"[\w-]+", value):
         return
-    if not re.match(r"^[a-z0-9_-]+$", value):
-        return
-    values.add(f"{kind.casefold()}:{value}")
-
-
-def _is_application_surface_path(path: str) -> bool:
-    value = path.replace("\\", "/").lstrip("/").casefold()
-    return _is_application_template_path(value) or _surface_path_kind(value) in {"style", "script"}
-
-
-def _is_application_template_path(path: str) -> bool:
-    value = path.replace("\\", "/").lstrip("/").casefold()
-    if value.startswith(("app/views/", "app/templates/", "resources/views/", "templates/", "views/")):
-        return True
-    return any(part in value for part in ("/views/", "/templates/"))
+    values.add(f"{kind}:{value if kind in {'class', 'id'} else value.casefold()}")
 
 
 def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> ArtifactCompilationResult:
@@ -1521,15 +1387,15 @@ def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> 
             project_id,
             type_="SourceFragment",
             status="active",
-            limit=100000,
+            limit=None,
         )
-        if _surface_path_kind(str(node.properties.get("relative_path") or "")) in {"style", "script", "template"}
+        if application_surface_kind(str(node.properties.get("relative_path") or "")) in {"style", "script", "template"}
     ]
     usage_identifiers: set[str] = set()
     style_fragments: list[MemoryNode] = []
     for fragment in fragments:
         path = str(fragment.properties.get("relative_path") or "")
-        kind = _surface_path_kind(path)
+        kind = application_surface_kind(path)
         if kind == "style":
             style_fragments.append(fragment)
         else:
@@ -1560,26 +1426,31 @@ def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> 
                 removal_safety="validate",
             )
             findings.append((finding, css_artifact_id, _file_id_for_relative_path(project_id, path)))
-        for declaration in analysis.overridden_declarations:
-            line = fragment_line + declaration.line - 1
-            context = f" inside {' / '.join(declaration.context)}" if declaration.context else ""
-            finding = _css_surface_finding_node(
-                project_id,
-                css_artifact_id,
-                path,
-                finding_type="always_overridden_css_declaration",
-                subject=f"{declaration.selector} {declaration.property_name}",
-                line=line,
-                reason=(
-                    f"Declaration {declaration.property_name}: {declaration.value} for {declaration.selector}{context} "
-                    "is always overridden by a later declaration with the same selector and cascade context."
-                ),
-                confidence=0.98,
-                cleanup_priority="high",
-                removal_safety="safe",
-                declaration=declaration,
-            )
-            findings.append((finding, css_artifact_id, _file_id_for_relative_path(project_id, path)))
+        for confirmed, declarations in (
+            (True, analysis.overridden_declarations),
+            (False, analysis.possibly_overridden_declarations),
+        ):
+            for declaration in declarations:
+                line = fragment_line + declaration.line - 1
+                context = f" inside {' / '.join(declaration.context)}" if declaration.context else ""
+                description = f"Declaration {declaration.property_name}: {declaration.value} for {declaration.selector}{context}"
+                finding = _css_surface_finding_node(
+                    project_id,
+                    css_artifact_id,
+                    path,
+                    finding_type="always_overridden_css_declaration" if confirmed else "possibly_overridden_css_declaration",
+                    subject=f"{declaration.selector} {declaration.property_name}",
+                    line=line,
+                    reason=(
+                        f"{description} is repeated in the same rule."
+                        if confirmed else f"{description} may be a fallback for a later declaration."
+                    ),
+                    confidence=0.98 if confirmed else 0.82,
+                    cleanup_priority="high" if confirmed else "medium",
+                    removal_safety="safe" if confirmed else "validate",
+                    declaration=declaration,
+                )
+                findings.append((finding, css_artifact_id, _file_id_for_relative_path(project_id, path)))
 
     expected_node_ids = {finding.id for finding, _, _ in findings}
     finding_nodes = [finding for finding, _, _ in findings]
@@ -1618,7 +1489,7 @@ def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> 
             "project_id",
             project_id,
             type_="StaticAnalysisFinding",
-            limit=100000,
+            limit=None,
         )
         if node.properties.get("extractor") == APPLICATION_SURFACE_LINKER
     ]
@@ -1628,13 +1499,13 @@ def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> 
             _archive_node(store, node)
             result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
-    for edge in _find_edges_by_property(store, "extractor", APPLICATION_SURFACE_LINKER, limit=100000):
-        if edge.type != "HAS_FINDING" or edge.id in expected_edge_ids or edge.properties.get("status") == "archived":
+    for edge in _find_edges_by_property(store, "project_id", project_id, type_="HAS_FINDING", limit=None):
+        if (edge.properties.get("extractor") != APPLICATION_SURFACE_LINKER
+                or edge.id in expected_edge_ids or edge.properties.get("status") == "archived"):
             continue
-        if edge.to_id in stale_ids or edge.to_id not in expected_node_ids:
-            _archive_edge(store, edge)
-            result.archived_edges.add(edge.id)
-            result.affected_edge_ids.add(edge.id)
+        _archive_edge(store, edge)
+        result.archived_edges.add(edge.id)
+        result.affected_edge_ids.add(edge.id)
     return result
 
 
@@ -1736,7 +1607,7 @@ def _artifact_fragments(store: GraphStore, artifact: SourceArtifact) -> list[Mem
 def _fragments_for_artifact_id(store: GraphStore, project_id: str, artifact_id: str) -> list[MemoryNode]:
     return [
         node
-        for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_="SourceFragment", limit=100000)
+        for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_="SourceFragment", limit=None)
         if node.type == "SourceFragment"
         and node.properties.get("project_id") == project_id
         and node.properties.get("artifact_id") == artifact_id
@@ -1754,19 +1625,12 @@ def _fragment_related_edges(store: GraphStore, node: MemoryNode) -> list[MemoryE
         "REFERENCES",
         "MENTIONS",
     ]
-    edges: list[MemoryEdge] = []
-    for edge_type in edge_types:
-        edges.extend(_get_edges(store, from_id=node.id, type_=edge_type, limit=100))
-        edges.extend(_get_edges(store, to_id=node.id, type_=edge_type, limit=100))
-    deduped: dict[str, MemoryEdge] = {}
-    for edge in edges:
-        deduped[edge.id] = edge
-    return list(deduped.values())
+    return _incident_edges(store, [node.id], edge_types=set(edge_types), limit=None)
 
 
 def _concepts_for_fragment(store: GraphStore, fragment: MemoryNode) -> list[MemoryNode]:
     concepts: dict[str, MemoryNode] = {}
-    for edge in _get_edges(store, from_id=fragment.id, type_="CONTAINS", limit=100):
+    for edge in _get_edges(store, from_id=fragment.id, type_="CONTAINS", limit=None):
         node = _get_node(store, edge.to_id)
         if node is not None and node.type == "Concept":
             concepts[node.id] = node
@@ -1775,7 +1639,7 @@ def _concepts_for_fragment(store: GraphStore, fragment: MemoryNode) -> list[Memo
 
 def _document_processor_terms_for_fragment(store: GraphStore, fragment: MemoryNode) -> list[MemoryNode]:
     terms: dict[str, MemoryNode] = {}
-    for edge in _get_edges(store, from_id=fragment.id, type_="MENTIONS", limit=100):
+    for edge in _get_edges(store, from_id=fragment.id, type_="MENTIONS", limit=None):
         if edge.properties.get("extractor") != "document_processor":
             continue
         node = _get_node(store, edge.to_id)
@@ -1791,7 +1655,7 @@ def _semantic_document_fragments(
     artifact_ids: set[str] | None,
 ) -> list[MemoryNode]:
     fragments: list[MemoryNode] = []
-    for node in _find_nodes_by_property(store, "project_id", project_id, type_="SourceFragment", limit=100000):
+    for node in _find_nodes_by_property(store, "project_id", project_id, type_="SourceFragment", limit=None):
         if node.status == "archived":
             continue
         if node.properties.get("project_id") != project_id:
@@ -1808,7 +1672,7 @@ def _semantic_document_fragments(
 
 def _project_code_nodes(store: GraphStore, project_id: str) -> list[MemoryNode]:
     nodes: list[MemoryNode] = []
-    for node in _find_nodes_by_property(store, "project_id", project_id, limit=100000):
+    for node in _find_nodes_by_property(store, "project_id", project_id, limit=None):
         if node.status != "archived" and node.type in DOCUMENT_CODE_LINK_NODE_TYPES and node.properties.get("project_id") == project_id:
             nodes.append(node)
     nodes.sort(key=lambda item: (item.type, item.label.casefold(), item.id))
@@ -1816,190 +1680,113 @@ def _project_code_nodes(store: GraphStore, project_id: str) -> list[MemoryNode]:
 
 
 def _source_fragment_node_should_link_to_code(node: MemoryNode) -> bool:
-    fragment_type = str(node.properties.get("fragment_type") or "")
-    text = str(node.text or "")
-    stripped = text.strip()
-    if fragment_type in {"code_block", "metadata"} or len(stripped) < 3:
-        return False
-    if fragment_type == "heading":
-        heading_key = re.sub(r"[^A-Za-z0-9_]+", " ", stripped).strip().casefold()
-        if heading_key in DOCUMENT_CODE_LINK_STOP_TERMS or len(heading_key.split()) <= 2 and any(token in DOCUMENT_CODE_LINK_STOP_TERMS for token in heading_key.split()):
-            return False
-    return True
+    """Apply the same evidence rules to headings and other prose fragments."""
+    return node.properties.get("fragment_type") not in {"code_block", "metadata"} and bool((node.text or "").strip())
 
 
 def _code_node_terms(node: MemoryNode) -> list[str]:
+    """Collect full spellings and short names from indexed code facts."""
     raw_terms = [
         node.label,
         node.properties.get("name"),
         node.properties.get("qualified_name"),
-        node.properties.get("handler"),
         node.properties.get("route"),
         node.properties.get("path"),
     ]
-    terms: set[str] = set()
-    for raw in raw_terms:
-        if not raw:
-            continue
-        value = str(raw).strip()
-        if not _useful_code_link_term(value, node):
-            continue
-        terms.add(value)
-        tail = value.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-        if _useful_code_link_term(tail, node) and _qualified_tail_is_safe(value, tail):
-            terms.add(tail)
-        qualified_tail = value.rsplit(".", 1)[-1]
-        if _useful_code_link_term(qualified_tail, node) and _qualified_tail_is_safe(value, qualified_tail):
-            terms.add(qualified_tail)
-    return sorted(terms, key=lambda item: (-len(item), item.casefold()))
-
-
-def _useful_code_link_term(value: str, node: MemoryNode) -> bool:
-    stripped = value.strip()
-    if len(stripped) < 3:
-        return False
-    if stripped.casefold() in DOCUMENT_CODE_LINK_STOP_TERMS:
-        return False
-    if len(stripped) < 5 and not any(separator in stripped for separator in ("/", "\\", ".", "_", "-")):
-        return False
-    if (
-        node.type in {"Module", "Function", "Method", "Class", "Interface"}
-        and stripped == str(node.properties.get("name") or "")
-        and len(stripped) < 6
-    ):
-        return False
-    return any(char.isalpha() for char in stripped)
-
-
-def _qualified_tail_is_safe(value: str, tail: str) -> bool:
-    if tail == value:
-        return True
-    if len(tail) >= 8:
-        return True
-    return "_" in tail or any(char.isupper() for char in tail[1:])
+    if node.type == "Module":
+        path = str(node.properties.get("relative_path") or "")
+        raw_terms.extend((path, path.rsplit("/", 1)[-1]))
+    return sorted({
+        raw.strip() for raw in raw_terms
+        if isinstance(raw, str) and _DOCUMENT_LINK_WORD.search(raw)
+    })
 
 
 def _document_code_link_index(
     code_nodes: list[MemoryNode],
-) -> tuple[dict[str, list[_CodeMatcher]], dict[str, list[_CodeMatcher]], list[_CodeMatcher]]:
-    simple_index: dict[str, list[_CodeMatcher]] = {}
+) -> tuple[dict[str, _CodeMatcher], dict[str, list[_CodeMatcher]]]:
+    simple_index: dict[str, _CodeMatcher] = {}
     complex_index: dict[str, list[_CodeMatcher]] = {}
-    complex_fallback: list[_CodeMatcher] = []
+    spellings: dict[str, dict[str, _CodeMatcher]] = {}
     for node in code_nodes:
         for term in _code_node_terms(node):
             priority = (-len(term), node.type, node.label.casefold(), node.id, term.casefold())
-            entry = (priority, node, term)
-            if _term_requires_regex(term):
-                anchor = _complex_term_anchor(term)
-                if anchor:
-                    complex_index.setdefault(anchor, []).append(entry)
-                else:
-                    complex_fallback.append(entry)
-            else:
-                simple_index.setdefault(term.casefold(), []).append(entry)
-    for entries in simple_index.values():
-        entries.sort(key=lambda item: item[0])
-    for entries in complex_index.values():
-        entries.sort(key=lambda item: item[0])
-    complex_fallback.sort(key=lambda item: item[0])
-    return simple_index, complex_index, complex_fallback
+            # Prefer the spelling of the indexed declaration over aliases that differ only in case.
+            entries = spellings.setdefault(term.casefold(), {})
+            if node.id not in entries or term == node.properties.get("name"):
+                entries[node.id] = (priority, node, term)
+    for key, entries in spellings.items():
+        if len(entries) != 1:
+            continue
+        entry = next(iter(entries.values()))
+        if key.isidentifier():
+            simple_index[key] = entry
+        elif anchor := _complex_term_anchor(key):
+            complex_index.setdefault(anchor, []).append(entry)
+    return simple_index, complex_index
 
 
 def _matching_code_targets(
     text: str,
-    simple_index: dict[str, list[_CodeMatcher]],
+    simple_index: dict[str, _CodeMatcher],
     complex_index: dict[str, list[_CodeMatcher]],
-    complex_fallback: list[_CodeMatcher],
 ) -> list[tuple[MemoryNode, str]]:
     candidates: list[_CodeMatcher] = []
-    seen_complex: set[tuple[str, str]] = set()
-    tokens = _document_link_tokens(text)
-    for token in tokens:
-        candidates.extend(simple_index.get(token, []))
+    explicit = {(match[1] or match[0]).casefold() for match in _EXPLICIT_DOCUMENT_IDENTIFIER.finditer(text)}
+    for word in {match[0] for match in _BARE_DOCUMENT_IDENTIFIER.finditer(text)}:
+        key = word.casefold()
+        entry = simple_index.get(key)
+        if entry is not None:
+            _, _, term = entry
+            structured = "_" in term.strip("_") or any(char.isdigit() for char in term) or any(char.isupper() for char in term[1:])
+            if key in explicit or (structured and word == term):
+                candidates.append(entry)
+    tokens = {match[0].casefold() for match in _DOCUMENT_LINK_WORD.finditer(text)}
     for token in tokens:
         for entry in complex_index.get(token, []):
-            _, node, term = entry
-            key = (node.id, term)
-            if key in seen_complex:
-                continue
-            seen_complex.add(key)
-            if _text_mentions_term(text, term):
+            if _term_pattern(entry[2]).search(text):
                 candidates.append(entry)
-    for entry in complex_fallback:
-        _, _, term = entry
-        if _text_mentions_term(text, term):
-            candidates.append(entry)
     candidates.sort(key=lambda item: item[0])
     return [(node, term) for _, node, term in candidates]
 
 
-def _document_link_tokens(text: str) -> set[str]:
-    return {match.group(0).casefold() for match in re.finditer(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]{2,}(?![A-Za-z0-9_])", text)}
-
-
 def _complex_term_anchor(term: str) -> str | None:
-    tokens = [match.group(0).casefold() for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", term)]
-    if not tokens:
-        return None
-    return min(tokens, key=lambda item: (-len(item), item))
-
-
-def _term_requires_regex(term: str) -> bool:
-    return any(separator in term for separator in ("/", "\\", ".", "-"))
-
-
-def _text_mentions_term(text: str, term: str) -> bool:
-    return bool(_term_pattern(term).search(text))
+    tokens = (match[0] for match in _DOCUMENT_LINK_WORD.finditer(term))
+    return min(tokens, key=lambda item: (-len(item), item), default=None)
 
 
 @lru_cache(maxsize=32768)
 def _term_pattern(term: str) -> re.Pattern[str]:
-    escaped = re.escape(term.strip())
-    if not escaped:
-        return re.compile(r"a\A")
-    if any(separator in term for separator in ("/", "\\", ".", "_", "-")):
-        return re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])", flags=re.IGNORECASE)
-    return re.compile(rf"\b{escaped}\b", flags=re.IGNORECASE)
+    return re.compile(rf"(?<![\w./\\]){re.escape(term)}(?![\w/\\]|[.]\w)", flags=re.IGNORECASE)
 
 
 def _archive_stale_document_code_links(
     store: GraphStore,
     result: ArtifactCompilationResult,
-    *,
-
     project_id: str,
-    current_targets_by_fragment: dict[str, set[str]],
+    artifact_ids: set[str] | None,
+    current_fragment_code_pairs: set[tuple[str, str]],
+    current_term_code_pairs: set[tuple[str, str]],
 ) -> None:
-    current_pairs = {
-        (fragment_id, target_id)
-        for fragment_id, target_ids in current_targets_by_fragment.items()
-        for target_id in target_ids
-    }
-    existing = _find_edges_by_property(store, "project_id", project_id, type_="REFERENCES", limit=100000)
-    for edge in existing:
-        if edge.properties.get("extractor") != "document_code_linker":
+    """Reconcile document-code edges owned by the artifacts selected for relinking."""
+    scopes = [("project_id", project_id)] if artifact_ids is None else [
+        ("artifact_id", artifact_id) for artifact_id in sorted(artifact_ids)
+    ]
+    for edge in (
+        edge for property_name, value in scopes
+        for edge in _find_edges_by_property(store, property_name, value, type_="REFERENCES", limit=None)
+    ):
+        if edge.properties.get("status") == "archived" or edge.properties.get("project_id") != project_id:
             continue
-        if (edge.from_id, edge.to_id) in current_pairs or edge.properties.get("status") == "archived":
+        extractor = edge.properties.get("extractor")
+        if extractor == "document_code_linker":
+            current_pairs = current_fragment_code_pairs
+        elif (extractor == "document_processor" and edge.properties.get("is_technical")
+              and (edge.properties.get("source_layer") == "project_document" or edge.properties.get("fragment_id"))):
+            current_pairs = current_term_code_pairs
+        else:
             continue
-        _archive_edge(store, edge)
-        result.archived_edges.add(edge.id)
-        result.affected_edge_ids.add(edge.id)
-
-
-def _archive_stale_document_processor_code_links(
-    store: GraphStore,
-    result: ArtifactCompilationResult,
-    *,
-    project_id: str,
-    current_pairs: set[tuple[str, str]],
-) -> None:
-    existing = _find_edges_by_property(store, "project_id", project_id, type_="REFERENCES", limit=100000)
-    for edge in existing:
-        if edge.properties.get("extractor") != "document_processor":
-            continue
-        if edge.properties.get("source_layer") != "project_document" or not edge.properties.get("is_technical"):
-            continue
-        if (edge.from_id, edge.to_id) in current_pairs or edge.properties.get("status") == "archived":
+        if (edge.from_id, edge.to_id) in current_pairs:
             continue
         _archive_edge(store, edge)
         result.archived_edges.add(edge.id)
@@ -2016,8 +1803,10 @@ def _int_or_none(value: object) -> int | None:
 
 
 def _archive_node(store: GraphStore, node: MemoryNode) -> None:
-    """Archive a compiled node while retaining its properties and timestamp semantics."""
+    """Archive a stale compiled node and discard any temporary usage suppression."""
     properties = dict(node.properties)
+    if properties.get("archived_reason") == PROJECT_USAGE_ARCHIVE_REASON:
+        del properties["archived_reason"]
     properties["status"] = "archived"
     properties["updated_at"] = utcnow_iso()
     store.update_node_fields(node.id, status="archived", properties=properties)
@@ -2284,7 +2073,7 @@ def _find_nodes_by_property(
     *,
     type_: str | None = None,
     status: str | Sequence[str] | None = None,
-    limit: int = 1000,
+    limit: int | None = 1000,
 ) -> list[MemoryNode]:
     return store.find_nodes_by_property(property_name, value, type_=type_, status=status, limit=limit, clone=False)
 
@@ -2295,7 +2084,7 @@ def _find_edges_by_property(
     value: Any,
     *,
     type_: str | None = None,
-    limit: int = 1000,
+    limit: int | None = 1000,
 ) -> list[MemoryEdge]:
     return store.find_edges_by_property(property_name, value, type_=type_, limit=limit, clone=False)
 
@@ -2310,7 +2099,7 @@ def _get_edges(
     from_id: str | None = None,
     to_id: str | None = None,
     type_: str | Sequence[str] | None = None,
-    limit: int = 1000,
+    limit: int | None = 1000,
 ) -> list[MemoryEdge]:
     return store.get_edges(from_id=from_id, to_id=to_id, type_=type_, limit=limit, clone=False)
 
@@ -2321,7 +2110,7 @@ def _incident_edges(
     *,
     edge_types: set[str] | None = None,
     ignored_edge_types: set[str] | None = None,
-    limit: int = 10000,
+    limit: int | None = 10000,
 ) -> list[MemoryEdge]:
     return store.incident_edges(node_ids, edge_types=edge_types, ignored_edge_types=ignored_edge_types, limit=limit, clone=False)
 
@@ -2526,6 +2315,9 @@ def _symbol_node(artifact: SourceArtifact, symbol: CodeSymbol, code_result: Code
                  *, ambiguous: bool = False) -> MemoryNode:
     node_type = _symbol_node_type(symbol)
     properties = symbol.to_dict()
+    scope = artifact_context_scope(artifact)
+    if scope == "test" and node_type in {"Function", "Method"}:
+        properties["test_case"] = bool(symbol.metadata.get("test_case") or matches_test_case_name(symbol.name))
     properties.update(
         {
             "project_id": artifact.project_id,
@@ -2533,7 +2325,7 @@ def _symbol_node(artifact: SourceArtifact, symbol: CodeSymbol, code_result: Code
             "source_path": artifact.path,
             "line_start": symbol.start_line,
             "line_end": symbol.end_line,
-            "context_scope": artifact_context_scope(artifact),
+            "context_scope": scope,
             "parser_name": code_result.parser_name,
             "parser_version": code_result.parser_version,
             "ambiguous_declaration": ambiguous,
@@ -2699,36 +2491,43 @@ def _resolved_import_file_node(store: GraphStore, artifact: SourceArtifact, item
 
 
 def _resolve_import_relative_path(store: GraphStore, artifact: SourceArtifact, item: CodeImport) -> str | None:
-    for relative_path in _candidate_import_relative_paths(artifact.relative_path, item):
+    for relative_path in _candidate_import_relative_paths(artifact.relative_path, item, artifact.language):
         node = _get_node(store, _file_id_for_relative_path(artifact.project_id, relative_path))
         if node is not None and node.type == "File" and node.status != "archived":
             return relative_path
     return None
 
 
-def _candidate_import_relative_paths(source_relative_path: str, item: CodeImport) -> list[str]:
+def _candidate_import_relative_paths(source_relative_path: str, item: CodeImport, source_language: str | None) -> list[str]:
     source_path = Path(source_relative_path.replace("\\", "/"))
     source_dir = "" if str(source_path.parent) == "." else source_path.parent.as_posix()
     metadata = item.metadata if isinstance(item.metadata, dict) else {}
     import_form = str(metadata.get("import_form") or "").casefold()
-    if source_path.suffix.casefold() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}:
+    suffix = source_path.suffix.casefold()
+    language = language_key(source_language)
+    if suffix in ECMASCRIPT_EXTENSIONS or language in {"javascript", "typescript", "tsx"}:
         module = item.module or ""
         if not module.startswith(("./", "../")) or "\\" in module:
             return []
         path = _normalize_relative_candidate(posixpath.normpath(posixpath.join(source_dir, module)))
         if not path:
             return []
-        suffix = Path(path).suffix
-        if suffix:
-            variants = [f"{path[:-len(suffix)]}{extension}" for extension in (".ts", ".tsx")] if suffix in {".js", ".jsx"} else []
-            return [path, *variants]
-        extensions = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
-        return [*(path + ext for ext in extensions), *(f"{path}/index{ext}" for ext in extensions)]
-    if source_path.suffix.casefold() in {".php", ".phtml"} and import_form in {"include", "include_once", "require", "require_once"}:
+        target_suffix = Path(path).suffix
+        substitutions = {".js": (".ts", ".tsx"), ".jsx": (".ts", ".tsx"), ".mjs": (".mts",), ".cjs": (".cts",)}
+        if target_suffix in ECMASCRIPT_EXTENSIONS:
+            return [path, *(path[:-len(target_suffix)] + extension for extension in substitutions.get(target_suffix, ()))]
+        return [
+            path,
+            *(path + ext for ext in ECMASCRIPT_EXTENSIONS),
+            *(f"{path}/index{ext}" for ext in ECMASCRIPT_EXTENSIONS),
+        ]
+    if (suffix in PHP_EXTENSIONS or language == "php") and import_form in {"include", "include_once", "require", "require_once"}:
         if metadata.get("dynamic"):
             return []
         raw_target = str(item.module or item.name or "").replace("\\", "/").strip()
         relative_to = str(metadata.get("relative_to") or "source_or_project")
+        if not raw_target or (relative_to == "source_or_project" and (raw_target.startswith("/") or Path(raw_target).is_absolute())):
+            return []
         bases = [""]
         if relative_to == "source_dir":
             bases = [source_dir]
@@ -2747,7 +2546,11 @@ def _candidate_import_relative_paths(source_relative_path: str, item: CodeImport
             if not Path(normalized).suffix:
                 candidates.extend(f"{normalized}{extension}" for extension in (".php", ".phtml", ".blade.php"))
         return _dedupe_strings(candidates)
-    module = str(item.module or item.name or "").strip(".")
+    if language != "python" and suffix not in {".py", ".pyi", ".pyw"}:
+        return []
+    module = str(item.module or "").strip(".")
+    if not module and item.level > 0:
+        module = item.name or ""
     if not module or module == "*":
         return []
     module_parts = [part for part in module.split(".") if part]
@@ -2755,7 +2558,9 @@ def _candidate_import_relative_paths(source_relative_path: str, item: CodeImport
     base_dirs: list[str] = []
     if item.level > 0:
         source_parts = [] if not source_dir else source_dir.split("/")
-        keep = max(0, len(source_parts) - (item.level - 1))
+        keep = len(source_parts) - (item.level - 1)
+        if keep < 0:
+            return []
         base_dirs.append("/".join(source_parts[:keep]))
     else:
         base_dirs.append("")
@@ -2766,31 +2571,12 @@ def _candidate_import_relative_paths(source_relative_path: str, item: CodeImport
     seen: set[str] = set()
     for base_dir in base_dirs:
         module_path = "/".join([part for part in [base_dir, *module_parts] if part])
-        for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
+        for candidate in (f"{module_path}/__init__.py", f"{module_path}.py", f"{module_path}/__init__.pyi", f"{module_path}.pyi"):
             normalized = candidate.replace("\\", "/").strip("/")
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 candidates.append(normalized)
     return candidates
-
-
-def _resolved_import_symbol_nodes(store: GraphStore, artifact: SourceArtifact, item: CodeImport, resolved_file: MemoryNode) -> list[MemoryNode]:
-    import_name = str(item.name or "").strip()
-    if not import_name or import_name == "*":
-        return []
-    resolved_path = str(resolved_file.properties.get("relative_path") or "")
-    if not resolved_path:
-        return []
-    symbols = _find_nodes_by_property(store, "relative_path", resolved_path, status="active", limit=10000)
-    out: list[MemoryNode] = []
-    for node in symbols:
-        if node.type not in DOCUMENT_CODE_LINK_NODE_TYPES:
-            continue
-        if node.properties.get("project_id") != artifact.project_id:
-            continue
-        if str(node.properties.get("name") or "") == import_name:
-            out.append(node)
-    return out
 
 
 def _config_node(artifact: SourceArtifact) -> MemoryNode:
@@ -2893,18 +2679,16 @@ def _dependency_node(artifact: SourceArtifact, item: CodeImport) -> MemoryNode:
     )
 
 
-def _endpoint_node_for_decorator(artifact: SourceArtifact, symbol: CodeSymbol, decorator: str) -> MemoryNode | None:
-    parsed = _parse_route_decorator(decorator)
-    if parsed is None:
-        return None
-    method, path = parsed
-    endpoint_id = stable_id("endpoint", artifact.project_id, method, path)
+def _endpoint_node(artifact: SourceArtifact, symbol: CodeSymbol, route: CodeRoute) -> MemoryNode:
+    """Keep distinct handlers separate even when their HTTP routes coincide."""
+    method, path = route.method, route.path
+    endpoint_id = stable_id("endpoint", artifact.id, symbol.qualified_name, method, path)
     return MemoryNode(
         id=endpoint_id,
 
         type="Endpoint",
         label=f"{method} {path}".strip(),
-        canonical_key=f"{artifact.project_id}:endpoint:{method}:{path}",
+        canonical_key=endpoint_id,
         properties={
             "project_id": artifact.project_id,
             "artifact_id": artifact.id,
@@ -2925,47 +2709,20 @@ def _endpoint_node_for_decorator(artifact: SourceArtifact, symbol: CodeSymbol, d
     )
 
 
-def _parse_route_decorator(decorator: str) -> tuple[str, str] | None:
-    value = decorator.strip()
-    if "(" not in value or ")" not in value:
-        return None
-    head = value.split("(", 1)[0]
-    tail = value.split("(", 1)[1]
-    method = head.split(".")[-1].upper()
-    if method == "ROUTE":
-        method = "ANY"
-    if method not in {"ANY", "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "WEBSOCKET"}:
-        return None
-    quote_positions = [index for index, char in enumerate(tail) if char in {"'", '"'}]
-    if len(quote_positions) < 2:
-        return None
-    start = quote_positions[0]
-    quote = tail[start]
-    end = tail.find(quote, start + 1)
-    if end <= start:
-        return None
-    path = tail[start + 1 : end]
-    if not path.startswith("/"):
-        return None
-    return method, path
-
-
 def _external_code_symbol_node(artifact: SourceArtifact, name: str, kind: str) -> MemoryNode:
-    clean_name = _clean_external_symbol_name(name)
-    if clean_name is None:
-        raise ValueError("external code symbol name must be meaningful")
+    """Represent an external name that the compiler could not resolve locally."""
     return MemoryNode(
-        id=stable_id("external-code-symbol", artifact.project_id, clean_name, kind),
+        id=stable_id("external-code-symbol", artifact.project_id, name, kind),
 
         type="CodeSymbol",
-        label=clean_name,
-        canonical_key=f"external:{artifact.project_id}:{clean_name}:{kind}",
+        label=name,
+        canonical_key=f"external:{artifact.project_id}:{name}:{kind}",
         properties={
             "project_id": artifact.project_id,
             "artifact_id": artifact.id,
             "context_scope": artifact_context_scope(artifact),
-            "name": clean_name,
-            "qualified_name": clean_name,
+            "name": name,
+            "qualified_name": name,
             "kind": kind,
             "external": True,
             "synthetic": True,
@@ -3012,17 +2769,14 @@ def _solidity_base_is_interface(code_result: CodeParseResult, base: str, target:
     return bool(target.properties.get("synthetic") and base.split(".")[-1].startswith("I"))
 
 
-def _should_record_unresolved_call(target: str | None, *, imported_names: set[str] | None = None) -> bool:
+def _should_record_unresolved_call(target: str | None, external_bindings: set[str]) -> bool:
     """Keep computed dispatch visible even when its receiver starts with a builtin."""
     if target and is_computed_reference(target):
         return True
     clean = _clean_call_target(target)
     if clean is None:
         return False
-    if "." in clean:
-        head = clean.split(".", 1)[0]
-        return head not in (imported_names or set()) and head not in LANGUAGE_BUILTIN_GLOBALS
-    return clean not in (imported_names or set()) and clean not in LANGUAGE_BUILTIN_GLOBALS
+    return clean.split(".", 1)[0] not in external_bindings
 
 
 def _store_unresolved_call_summaries(store: GraphStore, calls_by_owner: dict[str, list[dict[str, Any]]]) -> None:
@@ -3459,12 +3213,10 @@ def _add_usage_name(names: set[str], value: str | None) -> None:
         return
     names.add(clean)
     names.add(clean.split(".", 1)[0])
-    names.add(clean.split(".")[-1])
     callable_name = re.split(r"[\[(]", clean, maxsplit=1)[0].strip()
     if callable_name:
         names.add(callable_name)
         names.add(callable_name.split(".", 1)[0])
-        names.add(callable_name.split(".")[-1])
 
 
 def _import_exposed_name(item: CodeImport) -> str | None:
@@ -3479,37 +3231,19 @@ def _import_exposed_name(item: CodeImport) -> str | None:
 
 def _should_skip_unused_import(artifact: SourceArtifact, item: CodeImport) -> bool:
     metadata = item.metadata if isinstance(item.metadata, dict) else {}
-    if str(metadata.get("import_form") or "").casefold() in {"include", "include_once", "require", "require_once"}:
+    if metadata.get("is_re_export") or str(metadata.get("import_form") or "").casefold() in {
+        "include", "include_once", "require", "require_once", "side_effect",
+    }:
         return True
     if item.module == "__future__":
         return True
     if _is_package_init_artifact(artifact):
         return True
-    return item.name == "*" or _import_exposed_name(item) is None
+    return (item.name == "*" and not item.alias) or _import_exposed_name(item) is None
 
 
 def _name_is_used(name: str, usage_names: set[str]) -> bool:
     return name in usage_names or any(candidate.startswith(f"{name}.") for candidate in usage_names)
-
-
-def _clean_external_symbol_name(name: str | None, *, imported_names: set[str] | None = None) -> str | None:
-    value = _clean_call_target(name)
-    if value is None:
-        return None
-    if not value or value.casefold() in {"none", "null", "undefined", "unknown", "nan"}:
-        return None
-    if _external_symbol_is_noise(value, imported_names=imported_names):
-        return None
-    return value
-
-
-def _external_symbol_is_noise(value: str, *, imported_names: set[str] | None = None) -> bool:
-    if value in LANGUAGE_BUILTIN_GLOBALS:
-        return True
-    head = re.split(r"[\[<({.]", value, maxsplit=1)[0].strip()
-    if head and head in LANGUAGE_BUILTIN_GLOBALS:
-        return True
-    return bool(head and head in (imported_names or set()))
 
 
 def _clean_call_target(name: str | None) -> str | None:
@@ -3537,12 +3271,21 @@ def _reference_targets_local_argument(reference: Any, symbol_nodes: dict[str, Me
 def _code_nodes_for_artifact(store: GraphStore, artifact: SourceArtifact | MemoryNode) -> list[MemoryNode]:
     return [
         node
-        for node in _find_nodes_by_property(store, "artifact_id", artifact.id, limit=100000)
+        for node in _find_nodes_by_property(store, "artifact_id", artifact.id, limit=None)
         if node.type in CODE_GRAPH_NODE_TYPES and node.properties.get("artifact_id") == artifact.id
     ]
 
 
-def _code_related_edges_for_nodes(store: GraphStore, nodes: list[MemoryNode]) -> list[MemoryEdge]:
+def _archive_code_nodes(store: GraphStore, result: ArtifactCompilationResult, nodes: list[MemoryNode]) -> None:
+    """Archive code records and their incident code relationships together."""
     if not nodes:
-        return []
-    return _incident_edges(store, [node.id for node in nodes], edge_types=CODE_GRAPH_EDGE_TYPES, limit=max(10000, len(nodes) * len(CODE_GRAPH_EDGE_TYPES) * 10))
+        return
+    edges = _incident_edges(store, [node.id for node in nodes], edge_types=CODE_GRAPH_EDGE_TYPES, limit=None)
+    for node in nodes:
+        _archive_node(store, node)
+        result.archived_nodes.add(node.id)
+        result.affected_node_ids.add(node.id)
+    for edge in edges:
+        _archive_edge(store, edge)
+        result.archived_edges.add(edge.id)
+        result.affected_edge_ids.add(edge.id)

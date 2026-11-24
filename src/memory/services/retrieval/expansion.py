@@ -1,7 +1,7 @@
-"""Bounded graph expansion for retrieval candidates."""
+"""Expand the graph within the requested depth and scope."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import MutableMapping
 
 from ...domain.constants import INACTIVE_STATUSES
@@ -27,12 +27,12 @@ class GraphExpansionMixin:
         scopes: set[str],
         metrics_cache: MutableMapping[str, NodeMatchMetrics] | None = None,
     ) -> tuple[OrderedDict[str, PathCandidate], OrderedDict[str, MemoryEdge]]:
+        policy = self.policy.ranking
         candidates: dict[str, PathCandidate] = {}
         candidate_edges: OrderedDict[str, MemoryEdge] = OrderedDict()
-        queue: list[tuple[str, int, float, float, set[str], list[str]]] = []
+        queue: deque[tuple[str, int, float, float, set[str]]] = deque()
         seen_depth: dict[str, int] = {}
         metrics_by_node = metrics_cache if metrics_cache is not None else {}
-        visit_budget = max(80, query.top_k * 8)
 
         def metrics_for(node: MemoryNode) -> NodeMatchMetrics:
             metrics = metrics_by_node.get(node.id)
@@ -58,24 +58,21 @@ class GraphExpansionMixin:
                 path_coverage=self._coverage(seed_tokens, query_profile),
                 depth=0,
                 edge_signal=1.0,
-                edge_ids=[],
                 metrics=seed_metrics,
             )
-            queue.append((seed_id, 0, seed_score, seed_score, seed_tokens, []))
+            queue.append((seed_id, 0, seed_score, seed_score, seed_tokens))
             seen_depth[seed_id] = 0
 
-        cursor = 0
-        while cursor < len(queue):
-            current_id, depth, root_seed_score, current_path_score, path_tokens, path_edge_ids = queue[cursor]
-            cursor += 1
-            if depth >= query.max_depth:
+        while queue:
+            current_id, depth, root_seed_score, current_path_score, path_tokens = queue.popleft()
+            if query.max_depth is not None and depth >= query.max_depth:
                 continue
             neighbors = self.store.neighbors(
                 current_id,
                 direction="both",
                 edge_types=edge_types,
-                min_weight=0.01,
-                limit=64,
+                min_weight=policy.min_edge_weight,
+                limit=None,
                 clone=False,
             )
             current_coverage = self._coverage(path_tokens, query_profile)
@@ -98,17 +95,11 @@ class GraphExpansionMixin:
                     and existing.coverage >= coverage
                 ):
                     continue
-                if (
-                    next_depth > 1
-                    and metrics.match_score <= 0.0
-                    and coverage <= current_coverage
-                ):
-                    continue
                 edge_signal = clamp(edge.weight * edge.confidence * max(edge.polarity, 0))
                 if edge.type in {"CALLS", "REFERENCES", "WRAPS", "TESTS"} and not edge.properties.get("resolver"):
-                    edge_signal *= 0.35
-                next_path_score = clamp(0.55 * current_path_score + 0.25 * coverage + 0.20 * edge_signal)
-                next_edge_ids = [*path_edge_ids, edge.id]
+                    edge_signal *= policy.unresolved_edge_factor
+                next_path_score = clamp(policy.step_previous_weight * current_path_score + policy.step_coverage_weight * coverage
+                                        + policy.step_edge_weight * edge_signal)
                 candidate_edges.setdefault(edge.id, edge)
                 self._add_path_candidate(
                     candidates,
@@ -118,12 +109,12 @@ class GraphExpansionMixin:
                     path_coverage=coverage,
                     depth=next_depth,
                     edge_signal=next_path_score,
-                    edge_ids=next_edge_ids,
+                    last_edge_id=edge.id,
                     metrics=metrics,
                 )
-                if (previous_depth is None or next_depth < previous_depth) and len(queue) < visit_budget:
+                if previous_depth is None or next_depth < previous_depth:
                     seen_depth[neighbor.id] = next_depth
-                    queue.append((neighbor.id, next_depth, root_seed_score, next_path_score, combined_tokens, next_edge_ids))
+                    queue.append((neighbor.id, next_depth, root_seed_score, next_path_score, combined_tokens))
 
         ordered = OrderedDict(
             sorted(
@@ -139,7 +130,7 @@ class GraphExpansionMixin:
         return ordered, candidate_edges
 
     def _candidate_node_allowed(self, node: MemoryNode, query: MemoryQuery, *, code_context: bool, scopes: set[str]) -> bool:
-        if not self._is_graph_layer_node(node):
+        if not self._is_graph_layer_node(node) or not query.allows_project(node):
             return False
         if code_context and not self._is_code_context_node(node):
             return False
@@ -159,26 +150,28 @@ class GraphExpansionMixin:
         path_coverage: float,
         depth: int,
         edge_signal: float,
-        edge_ids: list[str],
+        last_edge_id: str | None = None,
         metrics: NodeMatchMetrics | None = None,
     ) -> None:
+        policy = self.policy.ranking
         metrics = metrics or self._node_match_metrics(node, query_profile)
         direct_coverage = metrics.coverage
         path_coverage = max(direct_coverage, path_coverage)
         type_bonus = self._retrieval_type_bonus(node, metrics.match_score)
-        depth_penalty = min(0.30, depth * 0.08)
-        path_score = clamp(0.60 * edge_signal + 0.40 * path_coverage)
+        depth_penalty = min(policy.depth_penalty_max, depth * policy.depth_penalty_per_hop)
+        path_score = clamp(policy.path_edge_weight * edge_signal + policy.path_coverage_weight * path_coverage)
         score = clamp(
-            0.52 * metrics.match_score
-            + 0.28 * path_coverage
-            + 0.14 * path_score
-            + 0.06 * seed_score
+            policy.direct_weight * metrics.match_score
+            + policy.coverage_weight * path_coverage
+            + policy.path_weight * path_score
+            + policy.seed_weight * seed_score
             + type_bonus
             - depth_penalty
         )
         if node.type in SOURCE_NODE_TYPES:
-            score = clamp(score - (0.08 if edge_ids else 0.16))
-        if len(query_profile.informative_tokens) >= 4 and metrics.match_score < 0.10 and path_coverage < 0.35:
+            score = clamp(score - (policy.linked_source_penalty if last_edge_id is not None else policy.unlinked_source_penalty))
+        if (len(query_profile.informative_tokens) >= policy.weak_query_min_terms
+                and metrics.match_score < policy.weak_match_min_score and path_coverage < policy.weak_path_min_coverage):
             return
         existing = candidates.get(node.id)
         candidate = PathCandidate(
@@ -190,7 +183,7 @@ class GraphExpansionMixin:
             type_bonus=type_bonus,
             seed_score=seed_score,
             depth_penalty=depth_penalty,
-            edge_ids=edge_ids,
+            last_edge_id=last_edge_id,
         )
         if existing is None or candidate.score > existing.score:
             candidates[node.id] = candidate

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
+from ..domain.constants import PROJECT_USAGE_ARCHIVE_REASON
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import parse_dt, utcnow
 from .graph_store import GraphStore
@@ -77,10 +78,18 @@ def prune_project_data(
         if node.id == project_id or str(node.properties.get("project_id") or "") == project_id
     }
     protected_history = _retained_history_ids(nodes, revisions[:retention_commits])
+    live_ids = {node.id for node in nodes if node.status == "active"}
+    suppressed_findings = {
+        node.id for node in nodes
+        if node.type == "StaticAnalysisFinding"
+        and node.properties.get("archived_reason") == PROJECT_USAGE_ARCHIVE_REASON
+        and node.properties.get("symbol_id") in live_ids
+    }
     removal_ids = {
         node.id
         for node in nodes
-        if _expired_project_node(node, project_id, cutoff_dt, protected_history)
+        if node.id not in suppressed_findings
+        and _expired_project_node(node, project_id, cutoff_dt, protected_history)
     }
 
     edges_by_id = {
@@ -107,7 +116,8 @@ def prune_project_data(
         for edge in edges_by_id.values()
         if edge.from_id in removal_ids
         or edge.to_id in removal_ids
-        or _expired_project_edge(edge, project_id, project_node_ids, cutoff_dt)
+        or ((edge.type != "HAS_FINDING" or edge.to_id not in suppressed_findings)
+            and _expired_project_edge(edge, project_id, project_node_ids, cutoff_dt))
     }
     if removal_ids or removal_edge_ids:
         with store.transaction():

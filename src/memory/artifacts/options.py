@@ -1,10 +1,12 @@
 """Canonical typed options for artifact compilation."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from ..config.loader import default_config
+from ..config.policies import DocumentExtractionPolicy, TestDiscoveryPolicy
 from ..config.models import CompileConfig, REQLConfig, ScanConfig
 from .models import SourceArtifact
 
@@ -52,6 +54,8 @@ class CompilationOptions:
     ingest_documents: bool = True
     document_policies: tuple[DocumentPolicy, ...] = ()
     ignore_defaults: bool = False
+    document_extraction: DocumentExtractionPolicy = field(default_factory=lambda: default_config().lexical.documents)
+    test_discovery: TestDiscoveryPolicy = field(default_factory=lambda: default_config().testing.discovery)
     _policies_by_format: Mapping[str, DocumentPolicy] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -62,10 +66,13 @@ class CompilationOptions:
 
     @classmethod
     def from_config(cls, config: REQLConfig) -> "CompilationOptions":
-        return cls.from_sections(config.compile, config.scan)
+        return cls.from_sections(config.compile, config.scan, document_extraction=config.lexical.documents,
+                                 test_discovery=config.testing.discovery)
 
     @classmethod
-    def from_sections(cls, compile_config: CompileConfig, scan_config: ScanConfig) -> "CompilationOptions":
+    def from_sections(cls, compile_config: CompileConfig, scan_config: ScanConfig, *,
+                      document_extraction: DocumentExtractionPolicy | None = None,
+                      test_discovery: TestDiscoveryPolicy | None = None) -> "CompilationOptions":
         policies = tuple(
             DocumentPolicy(
                 format=format_name,
@@ -75,10 +82,16 @@ class CompilationOptions:
             )
             for format_name, definition in compile_config.document_formats.items()
         )
+        if document_extraction is None or test_discovery is None:
+            defaults = default_config()
+            document_extraction = document_extraction or defaults.lexical.documents
+            test_discovery = test_discovery or defaults.testing.discovery
         return cls(
             ingest_documents=compile_config.ingest_documents,
             document_policies=policies,
             ignore_defaults=scan_config.ignore_defaults,
+            document_extraction=document_extraction,
+            test_discovery=test_discovery,
         )
 
     def document_ingest_enabled(self, artifact: SourceArtifact) -> bool:
@@ -116,6 +129,8 @@ class CompilationOptions:
             "compile": {
                 "ingest_documents": self.ingest_documents,
                 "documents": [policy.to_dict() for policy in self.document_policies],
+                "document_extraction": asdict(self.document_extraction),
+                "test_discovery": asdict(self.test_discovery),
             }
         }
 

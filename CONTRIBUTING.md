@@ -122,14 +122,14 @@ implementation idea. Include:
 ## Release Expectations
 
 Keep pending notes under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md).
-For a release, move its notes into `## [vMAJOR.MINOR.PATCH] - YYYY-MM-DD`
-and leave `Unreleased` at the top. Update the versions in `pyproject.toml`
-and `src/memory/__init__.py` to match the tag, then commit the changes.
-For example, for version `0.3.0`:
+For a release, set `VERSION` in `src/config.py` to the release date in `YY.MM.DD`
+format. Package metadata and the runtime both use that value. Move the
+release notes into `## [vYY.MM.DD] - YYYY-MM-DD`, leave `Unreleased` at the
+top, and commit the changes. For a release dated 2026-11-24, use these commands.
 
 ```bash
-git tag -a v0.3.0 -m "REQL v0.3.0"
-git push origin v0.3.0
+git tag -a v26.11.24 -m "REQL v26.11.24"
+git push origin v26.11.24
 ```
 
 The **Release** workflow tests the tagged sources and publishes a GitHub Release

@@ -1,4 +1,4 @@
-"""Capture bounded source spans from files that match a committed graph revision."""
+"""Capture source spans from files that match a committed graph revision."""
 from __future__ import annotations
 
 from codecs import BOM_UTF8
@@ -6,39 +6,82 @@ import hashlib
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any, Sequence
+from unicodedata import category, normalize
+from urllib.parse import unquote
 
 from ....artifacts.revision import ProjectRevision, RevisionRepository
-from ....artifacts.fingerprint import read_bounded_file
-from ....document_ingestion.formats.markdown import FENCE_RE, HEADING_RE
+from ....artifacts.scanner import fingerprint_file
+from ....artifacts.text_encoding import TEXT_SAMPLE_BYTES, utf16_encoding
+from ....config.loader import default_config
+from ....config.policies import SourceEvidencePolicy
+from ....document_ingestion.formats.markdown import FENCE_RE, HEADING_RE, closes_fence
 from ....domain.models import MemoryNode
+from ....domain.query_context import SeenSourceRange
 from ....storage.graph_store import GraphStore
+from ..common import source_symbol_references
 
 
-MAX_SOURCE_FILES = 3
-MAX_SOURCE_REGIONS = 6
-MAX_SOURCE_BYTES = 4 * 1024 * 1024
-MAX_SOURCE_LINES = 120
-MAX_SOURCE_CHARS = 6000
-_BRIEF_SOURCE_LINES = 32
-_BRIEF_SOURCE_CHARS = 1600
-_MARKDOWN_SECTION_REF = re.compile(r"(?:^|[\s`(])([\w./-]+\.md)#([a-z0-9_-]+)(?![\w#/%?=&-])")
-_MAX_SECTION_HEADINGS = 128
-_TASK_GUIDANCE_LINES = 24
-_TASK_GUIDANCE_CHARS = 1400
+_DEFAULT_SOURCE = default_config().retrieval.source
+_MARKDOWN_SECTION_REF = re.compile(
+    r"(?:^|[\s`(])([^\s`()<>\[\]\"'#?=&]+\.(?i:md|markdown))#([^\s`()<>\[\]\"'#/?=&]+)(?![^\s`()<>\[\]\"'])",
+)
 _TASK_SPAN = re.compile(r"`([^`#\r\n]+)#L([1-9][0-9]{0,7})-L([1-9][0-9]{0,7})@([0-9a-f]{64})`")
-_MAX_TASK_SPANS = 4
-_TASK_SPAN_LINES = 60
-_TASK_SPAN_CHARS = 2600
-_TASK_FILE_LINES = 90
-_TASK_FILE_BYTES = 4600
-_QUALIFIED_TASK_SYMBOL = re.compile(r"\b[A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)+\b")
-_TASK_DEFINITION_LIMIT = 128
-_TASK_REFERENCE_LIMIT = 24
 
 
-def _read_bounded_source(path: Path) -> bytes | None:
-    """Share one byte ceiling for verified excerpts and ordinary source previews."""
-    return read_bounded_file(path, MAX_SOURCE_BYTES)
+def limit_brief_source(payload: dict[str, Any], max_chars: int) -> None:
+    """Keep requested bodies first and retain verified locations when a body does not fit."""
+    spent = 0
+    selected: list[dict[str, Any]] = []
+
+    def limit(rows: Sequence[dict[str, Any]]) -> None:
+        nonlocal spent
+        for row in rows:
+            text = row.get("text")
+            if not text:
+                continue
+            size = len(text)
+            verified = row.get("source_status") == "verified" and not row.get("truncated")
+            if verified and _covers_verified_span(selected, row["path"], row["line_start"], row["line_end"], row["sha256"]):
+                del row["text"]
+                row["body_omitted"] = True
+            elif spent + size <= max_chars:
+                spent += size
+                if verified:
+                    selected.append(row)
+            else:
+                del row["text"]
+                row["body_omitted"] = True
+
+    limit(payload.get("task_edit_spans", {}).get("spans", ()))
+    if row := payload.get("task_source_file"):
+        limit((row,))
+    limit(payload.get("snippets", ()))
+    for key in ("task_documentation_source", "task_owner_source", "task_test_source", "linked_section"):
+        if row := payload.get(key):
+            limit((row,))
+    for key in ("task_local_source", "task_contract_source"):
+        limit(payload.get(key, ()))
+    if payload.get("source_mode") == "verified":
+        for read in payload.get("read_plan", ()):
+            read["snippet_embedded"] = any(
+                row["path"] == read["path"] and row["line_start"] <= read["line_start"]
+                and read["line_end"] <= row["line_end"] for row in selected
+            )
+
+
+def _source_body(lines: Sequence[str], start: int, end: int, max_chars: int | None) -> dict[str, Any]:
+    """Materialize a complete body only when its joined text fits."""
+    if max_chars is not None and (max_chars == 0 or end - start > max_chars):
+        return {"body_omitted": True}
+    body_lines = lines[start - 1:end]
+    if max_chars is not None and sum(map(len, body_lines)) + len(body_lines) - 1 > max_chars:
+        return {"body_omitted": True}
+    return {"text": "\n".join(body_lines)}
+
+
+def _read_source_file(path: Path) -> bytes:
+    """Read the filesystem snapshot shared by source projections."""
+    return path.read_bytes()
 
 
 def capture_source_excerpts(
@@ -48,8 +91,8 @@ def capture_source_excerpts(
     complete_only: bool = False,
     snapshots: dict[str, dict[str, Any]] | None = None,
     revisions: dict[str, ProjectRevision | None] | None = None,
-    shown: Sequence[dict[str, Any]] = (),
-    new_file_budget: int | None = None,
+    max_chars: int | None = None,
+    seen_source: Sequence[SeenSourceRange] = (),
 ) -> list[dict[str, Any]]:
     """Read each selected file once, merge overlaps, and expose exact coverage or failure."""
     regions: list[dict[str, Any]] = []
@@ -68,70 +111,87 @@ def capture_source_excerpts(
             first = overlapping[0]
             first["line_start"] = min(start, *(row["line_start"] for row in overlapping))
             first["line_end"] = max(end, *(row["line_end"] for row in overlapping))
+            first["indexed_span"] = first["indexed_span"] and all(row["indexed_span"] for row in overlapping)
+            first["contains_declaration"] = any(row["contains_declaration"] for row in overlapping)
             for row in overlapping[1:]:
                 regions.remove(row)
         else:
-            regions.append({"path": item.get("path"), "line_start": start, "line_end": end,
-                            "node_id": node.id, "artifact_id": artifact_id, "type": node.type})
+            first = {"path": item.get("path"), "line_start": start, "line_end": end,
+                     "node_id": node.id, "artifact_id": artifact_id, "type": node.type, "indexed_span": True,
+                     "contains_declaration": False}
+            regions.append(first)
+        node_start, node_end = node.properties.get("start_line"), node.properties.get("end_line")
+        first["indexed_span"] &= type(node_start) is int and type(node_end) is int and node_start <= start <= end <= node_end
+        first["contains_declaration"] |= bool(node_start == start and node.properties.get("name"))
 
     snapshots = {} if snapshots is None else snapshots
-    file_limit = MAX_SOURCE_FILES if new_file_budget is None else len(snapshots) + new_file_budget
     revisions = {} if revisions is None else revisions
     result: list[dict[str, Any]] = []
-    # A brief preview is useful only if it replaces an entire owner read.
-    lines_left, chars_left = (_BRIEF_SOURCE_LINES, _BRIEF_SOURCE_CHARS) if complete_only else (MAX_SOURCE_LINES, MAX_SOURCE_CHARS)
-    for item in shown:
-        if item.get("source_status") == "verified" and "text" in item:
-            lines_left -= item["line_end"] - item["line_start"] + 1
-            chars_left -= len(item["text"])
-    for region in regions[:MAX_SOURCE_REGIONS]:
+    remaining = max_chars
+    for region in regions:
         artifact_id = region["artifact_id"]
-        if artifact_id not in snapshots:
-            if len(snapshots) >= file_limit:
-                if new_file_budget is None:
-                    break
-                continue
+        start, requested_end = region["line_start"], region["line_end"]
+        # Each pair of lines has a separator. A declaration line also contains source text.
+        minimum_size = requested_end - start + region.pop("contains_declaration")
+        verify_only = (region.pop("indexed_span") and remaining is not None
+                       and (remaining == 0 or minimum_size > remaining))
+        seen_candidates = tuple(span for span in seen_source if span.path == region["path"]
+                                and span.line_start <= start and requested_end <= span.line_end)
+        snapshot = snapshots.get(artifact_id)
+        if snapshot is None or (not verify_only and snapshot["status"] == "verified" and "lines" not in snapshot):
             artifact = store.get_node(artifact_id, clone=False) if artifact_id else None
             project_id = str(artifact.properties.get("project_id") or "") if artifact else ""
             if project_id not in revisions:
                 revisions[project_id] = RevisionRepository(store).latest(project_id) if project_id else None
-            snapshots[artifact_id] = _source_snapshot(store, artifact, revisions[project_id])
-        snapshot = snapshots[artifact_id]
+            revision = revisions[project_id]
+            entry = revision.manifest.get(region["path"]) if revision else None
+            already_seen = entry is not None and any(span.sha256 == entry["sha256"] for span in seen_candidates)
+            snapshot = _cached_source_snapshot(
+                store, artifact, revision, snapshots, verify_only=verify_only or already_seen,
+            )
         row = {**region, "source": "disk", "source_status": snapshot["status"]}
         if snapshot["status"] != "verified":
             row["reason"] = snapshot["reason"]
-            result.append(row)
-            continue
-        if lines_left <= 0 or chars_left <= 0:
-            break
-        lines = snapshot["lines"]
-        start, end = region["line_start"], min(region["line_end"], len(lines))
-        selected: list[str] = []
-        used_chars = 0
-        for line in lines[start - 1:end][:lines_left]:
-            cost = len(line) + bool(selected)
-            if used_chars + cost > chars_left:
-                break
-            selected.append(line)
-            used_chars += cost
-        if complete_only and len(selected) < region["line_end"] - start + 1:
-            continue
-        if not selected:
-            row.update(source_status="unavailable", reason="source span is outside the file or exceeds the remaining budget")
+        elif any(span.sha256 == snapshot["sha256"] for span in seen_candidates):
+            row.update(requested_line_end=requested_end, sha256=snapshot["sha256"], truncated=False, already_seen=True)
+        elif "lines" not in snapshot:
+            row.update(requested_line_end=requested_end, sha256=snapshot["sha256"], truncated=False, body_omitted=True)
         else:
-            actual_end = start + len(selected) - 1
-            row.update(line_end=actual_end, requested_line_end=region["line_end"],
-                       text="\n".join(selected), sha256=snapshot["sha256"],
-                       truncated=actual_end < region["line_end"])
-            if row["truncated"]:
-                row["next_line"] = actual_end + 1
-            lines_left -= len(selected)
-            chars_left -= used_chars
+            lines = snapshot["lines"]
+            actual_end = min(requested_end, len(lines))
+            if complete_only and actual_end < requested_end:
+                continue
+            if start > actual_end:
+                row.update(source_status="unavailable", reason="source span is outside the file")
+            else:
+                row.update(line_end=actual_end, requested_line_end=requested_end, sha256=snapshot["sha256"],
+                           truncated=actual_end < requested_end)
+                row.update(_source_body(lines, start, actual_end, remaining))
+                if remaining is not None and "text" in row:
+                    remaining -= len(row["text"])
+                if row["truncated"]:
+                    row["next_line"] = actual_end + 1
         result.append(row)
     return result
 
 
-def _source_snapshot(store: GraphStore, artifact: MemoryNode | None, revision: ProjectRevision | None) -> dict[str, Any]:
+def _cached_source_snapshot(
+    store: GraphStore, artifact: MemoryNode | None, revision: ProjectRevision | None,
+    snapshots: dict[str, dict[str, Any]], *, verify_only: bool = False,
+) -> dict[str, Any]:
+    """Reuse verification and load text only when a consumer needs it."""
+    if artifact is None:
+        return _source_snapshot(store, artifact, revision, verify_only=verify_only)
+    snapshot = snapshots.get(artifact.id)
+    if snapshot is None or (not verify_only and snapshot["status"] == "verified" and "lines" not in snapshot):
+        snapshot = _source_snapshot(store, artifact, revision, verify_only=verify_only)
+        snapshots[artifact.id] = snapshot
+    return snapshot
+
+
+def _source_snapshot(
+    store: GraphStore, artifact: MemoryNode | None, revision: ProjectRevision | None, *, verify_only: bool = False,
+) -> dict[str, Any]:
     """Check project confinement and committed fingerprints before exposing file text."""
     unavailable = {"status": "unavailable", "reason": "no committed source metadata for this span"}
     if artifact is None or artifact.type != "SourceArtifact" or artifact.status != "active" or revision is None:
@@ -157,29 +217,31 @@ def _source_snapshot(store: GraphStore, artifact: MemoryNode | None, revision: P
             return {"status": "unavailable", "reason": "source path is outside the project"}
         if not path.is_file():
             return {"status": "stale", "reason": "indexed source file is missing or is no longer a regular file"}
-        content = _read_bounded_source(path)
-        if content is None:
-            return {"status": "unavailable", "reason": "source file exceeds the 4 MiB read limit"}
-        digest = hashlib.sha256(content).hexdigest()
+        if verify_only:
+            _, digest, _ = fingerprint_file(path)
+        else:
+            content = _read_source_file(path)
+            digest = hashlib.sha256(content).hexdigest()
         if digest != entry["sha256"]:
             return {"status": "stale", "reason": "source changed after indexing; graph spans require a refresh"}
-        lines = content.decode("utf-8-sig").splitlines()
-        crlf = content.count(b"\r\n")
+        if verify_only:
+            return {"status": "verified", "sha256": digest}
+        encoding = utf16_encoding(content[:TEXT_SAMPLE_BYTES])
+        text = content.decode(encoding or "utf-8-sig")
+        crlf = text.count("\r\n")
         endings = [name for name, count in (
-            ("CRLF", crlf), ("LF", content.count(b"\n") - crlf), ("CR", content.count(b"\r") - crlf),
+            ("CRLF", crlf), ("LF", text.count("\n") - crlf), ("CR", text.count("\r") - crlf),
         ) if count]
-        return {"status": "verified", "sha256": digest, "lines": lines,
-                "encoding": "UTF-8 BOM" if content.startswith(BOM_UTF8) else "UTF-8",
+        return {"status": "verified", "sha256": digest, "lines": text.splitlines(),
+                "encoding": encoding.upper() if encoding else "UTF-8 BOM" if content.startswith(BOM_UTF8) else "UTF-8",
                 "line_endings": endings[0] if len(endings) == 1 else "mixed" if endings else "none"}
     except (OSError, UnicodeError, ValueError) as exc:
         return {"status": "unavailable", "reason": f"cannot read source: {type(exc).__name__}"}
 
 
 def _current_headings(store: GraphStore, artifact: MemoryNode, digest: str) -> list[MemoryNode]:
-    """Read bounded heading coordinates tied to the verified Markdown source."""
-    edges = store.get_edges(from_id=artifact.id, type_="HAS_SECTION", limit=_MAX_SECTION_HEADINGS + 1, clone=False)
-    if len(edges) > _MAX_SECTION_HEADINGS:
-        return []
+    """Read heading coordinates tied to the verified Markdown source."""
+    edges = store.get_edges(from_id=artifact.id, type_="HAS_SECTION", limit=None, clone=False)
     return sorted(
         (node for node in store.get_nodes([edge.to_id for edge in edges], clone=False)
          if node.status == "active" and node.properties.get("artifact_id") == artifact.id
@@ -212,19 +274,18 @@ def _short_pinned_section(
         stop = _section_end(headings, heading, len(lines))
         while stop > end and not lines[stop - 1].strip():
             stop -= 1
-        if 0 < stop - end <= _TASK_GUIDANCE_LINES:
+        if stop > end:
             return stop
     # Explicit task excerpts can include a nearby fenced example even if
     # general document indexing is disabled.
-    ceiling = min(end + _TASK_GUIDANCE_LINES, len(lines))
-    first = next((index for index in range(end, ceiling) if lines[index].strip()), None)
+    first = next((index for index in range(end, len(lines)) if lines[index].strip()), None)
     if first is None:
         return end
     fence = FENCE_RE.match(lines[first])
     if fence is None or fence.group(2) is None:
         return end
-    return next((index + 1 for index in range(first + 1, ceiling)
-                 if lines[index].startswith(fence.group(1)[:3])), end)
+    return next((index + 1 for index in range(first + 1, len(lines))
+                 if closes_fence(lines[index], fence[1])), end)
 
 
 def locate_linked_section(
@@ -236,47 +297,51 @@ def locate_linked_section(
 ) -> dict[str, Any] | None:
     """Locate one explicitly named Markdown section in the owner's verified revision."""
     for owner in owners:
-        if owner["source_status"] != "verified" or owner["truncated"]:
+        if owner["source_status"] != "verified" or owner["truncated"] or not owner.get("text"):
             continue
         # Only project-relative links in verified bodies can select documentation.
-        reference = _MARKDOWN_SECTION_REF.search(owner["text"])
-        if reference is None:
-            continue
-        path, anchor = reference.groups()
         source = store.get_node(owner["artifact_id"], clone=False)
         project_id = source.properties.get("project_id") if source else None
         revision = revisions.get(project_id) if project_id else None
-        entry = revision.manifest.get(path) if revision else None
-        if not entry:
+        if revision is None:
             continue
-        artifact = store.get_node(entry["artifact_id"], clone=False)
-        if (artifact is None or artifact.properties.get("artifact_type") != "markdown"
-                or artifact.properties.get("project_id") != project_id
-                or artifact.properties.get("relative_path") != path):
-            continue
-        headings = _current_headings(store, artifact, entry["sha256"])
-        matching = [node for node in headings
-                    if re.sub(r"[^\w -]", "", node.text.casefold()).replace(" ", "-") == anchor]
-        if len(matching) != 1:
-            continue
-        heading = matching[0]
-        start = heading.properties["start_line"]
-        if artifact.id not in snapshots:
-            if len(snapshots) >= MAX_SOURCE_FILES:
+        for reference in _MARKDOWN_SECTION_REF.finditer(owner["text"]):
+            path = PurePosixPath(unquote(reference[1])).as_posix()
+            entry = revision.manifest.get(path)
+            if not entry:
                 continue
-            snapshots[artifact.id] = _source_snapshot(store, artifact, revision)
-        snapshot = snapshots[artifact.id]
-        if snapshot["status"] != "verified":
-            continue
-        lines = snapshot["lines"]
-        end = _section_end(headings, heading, len(lines))
-        if not 1 <= start <= end <= len(lines):
-            continue
-        while end > start and not lines[end - 1].strip():
-            end -= 1
-        return {"path": path, "node_id": heading.id, "line_start": start, "line_end": end,
-                "sha256": snapshot["sha256"], "source_status": "verified"}
+            artifact = store.get_node(entry["artifact_id"], clone=False)
+            if (artifact is None or artifact.properties.get("artifact_type") != "markdown"
+                    or artifact.properties.get("project_id") != project_id
+                    or artifact.properties.get("relative_path") != path):
+                continue
+            headings = _current_headings(store, artifact, entry["sha256"])
+            anchor = normalize("NFC", unquote(reference[2].rstrip(".,;:!")).casefold())
+            matching = [node for node in headings if _heading_anchor(node.text) == anchor]
+            if len(matching) != 1:
+                continue
+            heading = matching[0]
+            start = heading.properties["start_line"]
+            snapshot = _cached_source_snapshot(store, artifact, revision, snapshots)
+            if snapshot["status"] != "verified":
+                continue
+            lines = snapshot["lines"]
+            end = _section_end(headings, heading, len(lines))
+            if not 1 <= start <= end <= len(lines):
+                continue
+            while end > start and not lines[end - 1].strip():
+                end -= 1
+            return {"path": path, "node_id": heading.id, "line_start": start, "line_end": end,
+                    "sha256": snapshot["sha256"], "source_status": "verified"}
     return None
+
+
+def _heading_anchor(title: str) -> str:
+    """Build a Markdown anchor while preserving letters and combining marks."""
+    return "".join(
+        "-" if char == " " else char for char in normalize("NFC", title.casefold())
+        if char.isalnum() or char in " _-" or category(char).startswith("M")
+    )
 
 
 def capture_task_test_file(
@@ -286,25 +351,19 @@ def capture_task_test_file(
     snapshots: dict[str, dict[str, Any]],
     *,
     shown_paths: set[str],
-    extra_file_budget: int = 0,
-    require_test_scope: bool = True,
+    max_chars: int,
 ) -> dict[str, Any] | None:
-    """Reuse one small test file identified by the assignment or a saved check."""
-    file_limit = max(MAX_SOURCE_FILES, len(snapshots) + extra_file_budget)
+    """Show one indexed test file identified by the assignment."""
     for path in paths:
         entry = revision.manifest.get(path)
         if path in shown_paths or not entry:
             continue
         artifact_id = entry["artifact_id"]
         artifact = store.get_node(artifact_id, clone=False)
-        if (artifact is None or (require_test_scope and artifact.properties.get("context_scope") != "test")
-                or artifact.properties.get("size_bytes", _TASK_FILE_BYTES + 1) > _TASK_FILE_BYTES):
+        if artifact is None or artifact.properties.get("context_scope") != "test":
             continue
-        if artifact_id not in snapshots:
-            if len(snapshots) >= file_limit:
-                return None
-            snapshots[artifact_id] = _source_snapshot(store, artifact, revision)
-        if whole := _whole_task_file(path, artifact_id, snapshots[artifact_id]):
+        snapshot = _cached_source_snapshot(store, artifact, revision, snapshots)
+        if whole := _whole_task_file(path, artifact_id, snapshot, max_chars):
             return whole
     return None
 
@@ -317,9 +376,10 @@ def capture_assigned_documentation(
     snapshots: dict[str, dict[str, Any]],
     *,
     shown: Sequence[dict[str, Any]],
+    max_chars: int,
 ) -> dict[str, Any] | None:
     """Read one unambiguous prose paragraph referring to a qualified task symbol."""
-    symbols = set(_QUALIFIED_TASK_SYMBOL.findall(task))
+    symbols = {symbol for symbol in source_symbol_references(task) if "." in symbol or "::" in symbol}
     names = symbols | {re.split(r"\.|::", symbol)[-1] for symbol in symbols}
     if not names:
         return None
@@ -329,10 +389,8 @@ def capture_assigned_documentation(
         return None
     path = documents[0]
     artifact_id = revision.manifest[path]["artifact_id"]
-    if artifact_id not in snapshots:
-        artifact = store.get_node(artifact_id, clone=False)
-        snapshots[artifact_id] = _source_snapshot(store, artifact, revision)
-    snapshot = snapshots[artifact_id]
+    artifact = store.get_node(artifact_id, clone=False)
+    snapshot = _cached_source_snapshot(store, artifact, revision, snapshots)
     if snapshot["status"] != "verified":
         return None
     lines = snapshot["lines"]
@@ -346,7 +404,7 @@ def capture_assigned_documentation(
         if marker := FENCE_RE.match(line):
             if not fence:
                 fence = marker[1]
-            elif marker[1].startswith(fence) and marker[2] is None:
+            elif closes_fence(line, fence):
                 fence = ""
         if marker or fence or not line.strip() or HEADING_RE.match(line):
             if matched:
@@ -363,8 +421,8 @@ def capture_assigned_documentation(
     # An adjacent short example and its first explanation form a single passage.
     example = next((index for index in range(end, min(end + 3, len(lines))) if lines[index].strip()), None)
     if example is not None and (opening := FENCE_RE.match(lines[example])):
-        stop = next((index + 1 for index in range(example + 1, min(start + _TASK_GUIDANCE_LINES, len(lines)))
-                     if lines[index].strip() == opening[1]), None)
+        stop = next((index + 1 for index in range(example + 1, len(lines))
+                     if closes_fence(lines[index], opening[1])), None)
         if stop is not None:
             end = stop
             if end + 1 < len(lines) and not lines[end].strip():
@@ -373,64 +431,103 @@ def capture_assigned_documentation(
                     HEADING_RE.match(lines[paragraph]) or FENCE_RE.match(lines[paragraph])
                 ):
                     paragraph += 1
-                if paragraph <= start + _TASK_GUIDANCE_LINES:
-                    end = paragraph
-    text = "\n".join(lines[start:end])
-    if (end - start > _TASK_GUIDANCE_LINES or len(text) > _TASK_GUIDANCE_CHARS
-            or _covers_verified_span(shown, path, start + 1, end, snapshot["sha256"])):
+                end = paragraph
+    if _covers_verified_span(shown, path, start + 1, end, snapshot["sha256"]):
         return None
     return {"path": path, "node_id": artifact_id, "artifact_id": artifact_id,
             "line_start": start + 1, "line_end": end, "source_status": "verified", "sha256": snapshot["sha256"],
-            "encoding": snapshot["encoding"], "line_endings": snapshot["line_endings"], "truncated": False, "text": text}
+            "encoding": snapshot["encoding"], "line_endings": snapshot["line_endings"], "truncated": False,
+            **_source_body(lines, start + 1, end, max_chars)}
 
 
-def assigned_document_outline(
+def assigned_document_outlines(
     store: GraphStore, paths: Sequence[str], revision: ProjectRevision, snapshots: dict[str, dict[str, Any]],
-    *, shown: Sequence[dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Offer bounded, verified locations when an assignment has no precise document passage."""
-    documents = [path for path in dict.fromkeys(paths) if path in revision.manifest
-                 and PurePosixPath(path).suffix.casefold() in {".md", ".markdown"}]
-    if len(documents) != 1:
-        return None
-    path = documents[0]
-    if any(row["path"] == path and row.get("source_status") == "verified" and "text" in row for row in shown):
-        return None
-    indexed = _verified_document_headings(store, path, revision, snapshots)
-    if indexed is None:
-        return None
-    headings, snapshot = indexed
-    depth = min((node.properties["level"] for node in headings if node.properties["level"] > 1), default=1)
-    sections = [node for node in headings if node.properties["level"] == depth]
-    visible = sections if len(sections) <= 8 else sections[:4] + sections[-4:]
-    return {"path": path, "source_status": "verified", "sha256": snapshot["sha256"],
-            "omitted": len(sections) - len(visible),
-            "headings": [{"title": " ".join(node.text.split())[:100], "line_start": node.properties["start_line"],
-                          "line_end": _section_end(headings, node, len(snapshot["lines"]))} for node in visible]}
+    *, shown: Sequence[dict[str, Any]], max_items: int,
+) -> list[dict[str, Any]]:
+    """Share one section budget across assigned Markdown files with verified locations."""
+    shown_paths = {row["path"] for row in shown if row.get("source_status") == "verified" and "text" in row}
+    documents = []
+    for path in dict.fromkeys(paths):
+        if path in shown_paths or PurePosixPath(path).suffix.casefold() not in {".md", ".markdown"}:
+            continue
+        if indexed := _verified_document_headings(store, path, revision, snapshots):
+            documents.append((path, *indexed))
+            if len(documents) == max_items:
+                break
+    outlines = []
+    remaining = max_items
+    for index, (path, headings, snapshot) in enumerate(documents):
+        limit = remaining // (len(documents) - index)
+        depth = min((node.properties["level"] for node in headings if node.properties["level"] > 1), default=1)
+        file_end = len(snapshot["lines"])
+        boundary_lines = list(dict.fromkeys(
+            node.properties["start_line"] for node in headings if node.properties["level"] <= depth
+        ))
+        ends = dict(zip(boundary_lines, [*(min(line - 1, file_end) for line in boundary_lines[1:]), file_end]))
+        sections = [node for node in headings if node.properties["level"] == depth]
+        locations = [{"title": " ".join(node.text.split()), "line_start": node.properties["start_line"],
+                      "line_end": ends[node.properties["start_line"]]} for node in sections[:limit]]
+        remaining -= len(locations)
+        outlines.append({"path": path, "source_status": "verified", "sha256": snapshot["sha256"],
+                         "omitted": len(sections) - len(locations), "headings": locations})
+    return outlines
 
 
-def readme_setup_location(
+def task_setup_location(
     store: GraphStore, revision: ProjectRevision, snapshots: dict[str, dict[str, Any]],
+    *, excluded_paths: Sequence[str] = (),
+    policy: SourceEvidencePolicy = _DEFAULT_SOURCE,
 ) -> dict[str, Any] | None:
-    """Point to an unambiguous setup section without adding its body to the task brief."""
-    path = "README.md"
-    indexed = _verified_document_headings(store, path, revision, snapshots, max_files=len(snapshots) + 1)
-    if indexed is None:
+    """Locate a configured setup heading in a current indexed document."""
+    if not policy.setup_headings:
         return None
-    headings, snapshot = indexed
-    for title in ("quick start", "getting started", "development setup", "setup", "installation"):
-        matches = [node for node in headings if " ".join(node.text.casefold().split()) == title]
-        if len(matches) == 1:
-            heading = matches[0]
-            return {"path": path, "title": " ".join(heading.text.split()), "line_start": heading.properties["start_line"],
-                    "line_end": _section_end(headings, heading, len(snapshot["lines"])),
-                    "source_status": "verified", "sha256": snapshot["sha256"]}
-    return None
+    titles = tuple(_heading_key(title) for title in policy.setup_headings)
+    excluded = set(excluded_paths)
+    preferred = [path for path in policy.setup_preferred_paths if path not in excluded]
+
+    def location(path: str) -> dict[str, Any] | None:
+        entry = revision.manifest.get(path)
+        artifact = store.get_node(entry["artifact_id"], clone=False) if entry else None
+        if artifact is None or entry is None:
+            return None
+        headings = _current_headings(store, artifact, entry["sha256"])
+        keys = [_heading_key(node.text) for node in headings]
+        title = next((key for key in titles if keys.count(key) == 1), None)
+        if title is None:
+            return None
+        snapshot = _cached_source_snapshot(store, artifact, revision, snapshots)
+        if snapshot["status"] != "verified":
+            return None
+        heading = headings[keys.index(title)]
+        return {
+            "path": path, "title": " ".join(heading.text.split()),
+            "line_start": heading.properties["start_line"],
+            "line_end": _section_end(headings, heading, len(snapshot["lines"])),
+            "source_status": "verified", "sha256": snapshot["sha256"],
+        }
+
+    for path in preferred:
+        if found := location(path):
+            return found
+    paths: dict[str, int] = {}
+    for index, title in enumerate(titles):
+        for node, _ in store.lexical_search(title, top_k=None, node_types={"SourceFragment"},
+                                            project_id=revision.project_id, clone=False):
+            path = node.properties.get("relative_path")
+            if (isinstance(path, str) and path in revision.manifest and path not in excluded and path not in preferred
+                    and node.properties.get("fragment_type") == "heading" and _heading_key(node.text) == title):
+                paths.setdefault(path, index)
+    ordered = sorted(paths, key=lambda path: (paths[path], path.count("/"), path.casefold(), path))
+    return next((found for path in ordered if (found := location(path))), None)
+
+
+def _heading_key(title: str) -> str:
+    """Match a complete heading irrespective of casing or whitespace."""
+    return " ".join(title.casefold().split())
 
 
 def _verified_document_headings(
     store: GraphStore, path: str, revision: ProjectRevision, snapshots: dict[str, dict[str, Any]],
-    *, max_files: int = MAX_SOURCE_FILES,
 ) -> tuple[list[MemoryNode], dict[str, Any]] | None:
     """Read indexed sections from a single current, hash-verified Markdown file."""
     entry = revision.manifest.get(path)
@@ -439,50 +536,42 @@ def _verified_document_headings(
     artifact = store.get_node(entry["artifact_id"], clone=False)
     if artifact is None or not (headings := _current_headings(store, artifact, entry["sha256"])):
         return None
-    if artifact.id not in snapshots:
-        if len(snapshots) >= max_files:
-            return None
-        snapshots[artifact.id] = _source_snapshot(store, artifact, revision)
-    snapshot = snapshots[artifact.id]
+    snapshot = _cached_source_snapshot(store, artifact, revision, snapshots)
     return (headings, snapshot) if snapshot["status"] == "verified" else None
 
 
-def _whole_task_file(path: str, artifact_id: str, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+def _whole_task_file(path: str, artifact_id: str, snapshot: dict[str, Any], max_chars: int) -> dict[str, Any] | None:
     """Construct a complete file excerpt using an existing verified snapshot."""
-    if snapshot["status"] != "verified" or not 1 <= len(snapshot["lines"]) <= _TASK_FILE_LINES:
+    if snapshot["status"] != "verified" or not snapshot["lines"]:
         return None
     return {"path": path, "node_id": artifact_id, "artifact_id": artifact_id,
             "line_start": 1, "line_end": len(snapshot["lines"]), "whole_file": True,
             "source_status": "verified", "sha256": snapshot["sha256"], "truncated": False,
             "encoding": snapshot["encoding"], "line_endings": snapshot["line_endings"],
-            "text": "\n".join(snapshot["lines"])}
+            **_source_body(snapshot["lines"], 1, len(snapshot["lines"]), max_chars)}
 
 
 def complete_pinned_task_file(
     store: GraphStore, revision: ProjectRevision, snapshots: dict[str, dict[str, Any]],
     spans: Sequence[dict[str, Any]],
+    *, max_chars: int,
 ) -> dict[str, Any] | None:
-    """Fill one small production file when pinned ranges already cover much of it."""
+    """Fill one production file when pinned ranges already cover much of it."""
     paths = dict.fromkeys(row["path"] for row in spans if row.get("source_status") == "verified" and "text" in row)
     for path in paths:
         artifact_id = revision.manifest[path]["artifact_id"]
         artifact = store.get_node(artifact_id, clone=False)
         if (artifact is None or artifact.properties.get("artifact_type") != "code"
-                or artifact.properties.get("context_scope") == "test"
-                or artifact.properties.get("size_bytes", _TASK_FILE_BYTES + 1) > _TASK_FILE_BYTES):
+                or artifact.properties.get("context_scope") == "test"):
             continue
-        whole = _whole_task_file(path, artifact_id, snapshots[artifact_id])
+        whole = _whole_task_file(path, artifact_id, snapshots[artifact_id], max_chars)
         if whole is None:
             continue
         covered = {number for row in spans if row["path"] == path and row.get("sha256") == whole["sha256"]
                    for number in range(row["line_start"], row["line_end"] + 1)}
-        if (len(covered) < _BRIEF_SOURCE_LINES or len(covered) == whole["line_end"]
-                or len(covered) * 3 < whole["line_end"]):
+        if len(covered) == whole["line_end"] or len(covered) * 3 < whole["line_end"]:
             continue
-        added = sum(len(line) + 1 for number, line in enumerate(snapshots[artifact_id]["lines"], 1)
-                    if number not in covered)
-        if added <= _BRIEF_SOURCE_CHARS:
-            return whole
+        return whole
     return None
 
 
@@ -494,13 +583,14 @@ def pinned_code_context(
     instructions: str,
     *,
     shown: Sequence[dict[str, Any]],
+    max_chars: int,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """Complete a short owner and recover declarations connected to verified edit pins."""
+    """Complete an owner and recover declarations connected to verified edit pins."""
     completed = None
     reads: list[dict[str, Any]] = []
     loaded: dict[str, list[MemoryNode]] = {}
-    mentioned = set(re.findall(r"\b[A-Za-z_]\w*\b", instructions))
-    for row in uncovered_source_rows(spans, shown):
+    mentioned = set(source_symbol_references(instructions, qualified=False))
+    for row in spans:
         if row.get("source_status") != "verified":
             continue
         path = row["path"]
@@ -511,8 +601,8 @@ def pinned_code_context(
                 loaded[artifact_id] = []
             else:
                 definitions = store.get_edges(from_id=artifact_id, type_="DEFINES",
-                                              limit=_TASK_DEFINITION_LIMIT + 1, clone=False)
-                loaded[artifact_id] = [] if len(definitions) > _TASK_DEFINITION_LIMIT else [
+                                              limit=None, clone=False)
+                loaded[artifact_id] = [
                     node for node in store.get_nodes([edge.to_id for edge in definitions], clone=False)
                     if _local_definition(node, artifact_id)
                 ]
@@ -525,12 +615,12 @@ def pinned_code_context(
         if completed is None and len(tails) == 1:
             stop = tails[0].properties["end_line"]
             lines = snapshots[artifact_id]["lines"]
-            if stop <= len(lines) and stop - last <= 16:
-                tail = "\n".join(lines[last:stop])
-                if len(tail) <= 1000:
-                    completed = {**row, "line_end": stop, "node_id": tails[0].id, "artifact_id": artifact_id,
-                                 "text": row["text"] + "\n" + tail}
-        if len(reads) < 2 and owners:
+            if stop <= len(lines) and not _covers_verified_span(shown, path, first, stop, row["sha256"]):
+                completed = {**row, "line_end": stop, "node_id": tails[0].id, "artifact_id": artifact_id}
+                completed.pop("text", None)
+                completed.pop("body_omitted", None)
+                completed.update(_source_body(lines, first, stop, max_chars))
+        if owners:
             shown_now = (*shown, *spans, *([completed] if completed else []))
             reads.extend(_pinned_local_references(store, definitions, owners, row, mentioned, shown_now, reads))
     return completed, reads
@@ -555,14 +645,12 @@ def _pinned_local_references(
     shown: Sequence[dict[str, Any]],
     selected: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Prefer resolved local types, then short sibling methods named in the assignment."""
+    """Prefer resolved local types, then sibling methods named in the assignment."""
     types = {node.id: node for node in definitions if node.type in {"Class", "Interface"}}
     candidates: dict[str, MemoryNode] = {}
-    if types and len(owners) <= 8:
+    if types:
         for owner in sorted(owners, key=lambda node: node.properties["start_line"]):
-            edges = store.get_edges(from_id=owner.id, type_="READS", limit=_TASK_REFERENCE_LIMIT + 1, clone=False)
-            if len(edges) > _TASK_REFERENCE_LIMIT:
-                continue
+            edges = store.get_edges(from_id=owner.id, type_="READS", limit=None, clone=False)
             for edge in edges:
                 line = edge.properties.get("line_start")
                 if (edge.to_id in types and edge.properties.get("resolver") == "symbol_table"
@@ -584,12 +672,10 @@ def _pinned_local_references(
         candidate.type == "Method", candidate.properties["start_line"], candidate.id,
     )):
         first, last = node.properties["start_line"], node.properties["end_line"]
-        if (node.id not in used and last - first < _TASK_REFERENCE_LIMIT
+        if (node.id not in used
                 and (last < pin["line_start"] or first > pin["line_end"])
                 and not _covers_verified_span(shown, pin["path"], first, last, pin["sha256"])):
             result.append({"path": pin["path"], "node_id": node.id, "line_start": first, "line_end": last})
-            if len(result) + len(selected) == 2:
-                break
     return result
 
 def reuse_task_source(
@@ -600,26 +686,25 @@ def reuse_task_source(
     *,
     shown: Sequence[dict[str, Any]],
     include_guidance: bool = True,
+    max_chars: int,
 ) -> None:
-    """Make already verified task source edit-ready and include short linked guidance."""
+    """Make already verified task source edit-ready and include linked guidance."""
     for snippet in snippets:
         snapshot = snapshots.get(snippet.get("artifact_id", ""))
-        if (snippet.get("source_status") == "verified" and snapshot
+        if (snippet.get("source_status") == "verified" and snapshot and "lines" in snapshot
                 and snippet["sha256"] == snapshot.get("sha256")):
             snippet.update(encoding=snapshot["encoding"], line_endings=snapshot["line_endings"])
     if linked_section is None or not include_guidance:
         return
     path = linked_section["path"]
     start, end, digest = (linked_section[key] for key in ("line_start", "line_end", "sha256"))
-    if end - start + 1 > _TASK_GUIDANCE_LINES or _covers_verified_span(shown, path, start, end, digest):
+    if _covers_verified_span(shown, path, start, end, digest):
         return
     entry = revision.manifest.get(path)
     snapshot = snapshots.get(entry["artifact_id"]) if entry else None
     if snapshot is None or snapshot.get("sha256") != digest:
         return
-    section = "\n".join(snapshot["lines"][start - 1:end])
-    if len(section) <= _TASK_GUIDANCE_CHARS:
-        linked_section.update(text=section, truncated=False)
+    linked_section.update(truncated=False, **_source_body(snapshot["lines"], start, end, max_chars))
 
 
 def brief_task_next_action(value: str, shown: Sequence[dict[str, Any]]) -> str:
@@ -659,19 +744,15 @@ def capture_task_edit_spans(
     next_action: str,
     revision: ProjectRevision,
     snapshots: dict[str, dict[str, Any]],
-    *,
-    shown: Sequence[dict[str, Any]],
-    replaceable: Sequence[dict[str, Any]] = (),
-) -> tuple[list[dict[str, Any]], int]:
-    """Resolve pinned ranges and reuse the budget of verified excerpts they replace."""
+    *, max_chars: int,
+) -> list[dict[str, Any]]:
+    """Resolve every distinct pinned range against the committed source."""
     allowed = set(paths)
     references = list(dict.fromkeys(ref.groups() for ref in _TASK_SPAN.finditer(next_action)
                                     if ref[1] in allowed))
-    lines_left, chars_left = _TASK_SPAN_LINES, _TASK_SPAN_CHARS
     continuation_used = False
     results: list[dict[str, Any]] = []
-    remaining_excerpts = list(replaceable)
-    for path, first, last, expected_hash in references[:_MAX_TASK_SPANS]:
+    for path, first, last, expected_hash in references:
         start, end = int(first), int(last)
         row = {"path": path, "line_start": start, "line_end": end}
         entry = revision.manifest.get(path)
@@ -679,53 +760,32 @@ def capture_task_edit_spans(
             results.append({**row, "source_status": "stale",
                             "reason": "the saved range belongs to different source; read the current file"})
             continue
-        if _covers_verified_span((*shown, *results), path, start, end, expected_hash):
+        if _covers_verified_span(results, path, start, end, expected_hash):
             continue
-        displaced = [
-            excerpt for excerpt in (*remaining_excerpts, *results)
-            if excerpt.get("source_status") == "verified" and "text" in excerpt
-            and excerpt["path"] == path and excerpt["sha256"] == expected_hash
-            and start <= excerpt["line_start"] <= excerpt["line_end"] <= end
-        ]
-        line_credit = sum(excerpt["line_end"] - excerpt["line_start"] + 1 for excerpt in displaced)
-        char_credit = sum(len(excerpt["text"]) for excerpt in displaced)
-        size = end - start + 1
-        if size < 1 or size > lines_left + line_credit:
-            reason = "invalid saved line range" if size < 1 else "assigned source budget exceeded"
-            results.append({**row, "source_status": "unavailable", "reason": reason})
+        if end < start:
+            results.append({**row, "source_status": "unavailable", "reason": "invalid saved line range"})
             continue
         artifact_id = entry["artifact_id"]
-        if artifact_id not in snapshots:
-            artifact = store.get_node(artifact_id, clone=False)
-            snapshots[artifact_id] = _source_snapshot(store, artifact, revision)
-        snapshot = snapshots[artifact_id]
+        artifact = store.get_node(artifact_id, clone=False)
+        snapshot = _cached_source_snapshot(store, artifact, revision, snapshots)
         if snapshot["status"] != "verified":
             results.append({**row, "source_status": snapshot["status"], "reason": snapshot["reason"]})
             continue
         lines = snapshot["lines"]
-        content = "\n".join(lines[start - 1:end])
-        if end > len(lines) or len(content) > chars_left + char_credit:
-            reason = "saved line range is outside the file" if end > len(lines) else "assigned source budget exceeded"
-            results.append({**row, "source_status": "unavailable", "reason": reason})
+        if end > len(lines):
+            results.append({**row, "source_status": "unavailable", "reason": "saved line range is outside the file"})
             continue
-        pinned_chars = len(content)
         if not continuation_used and path.lower().endswith((".md", ".markdown")):
             artifact = store.get_node(artifact_id, clone=False)
             if artifact is not None and artifact.properties.get("artifact_type") == "markdown":
                 stop = _short_pinned_section(store, artifact, expected_hash, lines, start, end)
-                extension = "\n".join(lines[end:stop])
-                if extension and len(extension) <= _TASK_GUIDANCE_CHARS:
+                if stop > end and (stop > end + 1 or lines[end]):
                     row["pinned_line_end"] = end
                     row["line_end"] = stop
-                    content += "\n" + extension
                     continuation_used = True
         current = {**row, "source_status": "verified", "sha256": expected_hash,
                         "encoding": snapshot["encoding"], "line_endings": snapshot["line_endings"],
-                        "truncated": False, "text": content}
-        if displaced:
-            results = uncovered_source_rows(results, (current,))
-            remaining_excerpts = uncovered_source_rows(remaining_excerpts, (current,))
+                        "truncated": False, **_source_body(lines, start, row["line_end"], max_chars)}
+        results = uncovered_source_rows(results, (current,))
         results.append(current)
-        lines_left += line_credit - size
-        chars_left += char_credit - pinned_chars
-    return results, max(0, len(references) - _MAX_TASK_SPANS)
+    return results

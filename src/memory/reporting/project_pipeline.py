@@ -1,13 +1,17 @@
 """Mermaid and interactive HTML renderers for project pipelines."""
 from __future__ import annotations
 
+from dataclasses import asdict
 from html import escape
 import json
 import os
 from pathlib import Path
 import re
 
+from ..config import default_config
+from ..config.models import HTMLReportPolicy
 from ..pipeline import ProjectPipeline
+from .html_assets import vis_network_script
 
 
 def write_pipeline_mermaid(pipeline: ProjectPipeline, output_path: str | Path) -> Path:
@@ -16,10 +20,12 @@ def write_pipeline_mermaid(pipeline: ProjectPipeline, output_path: str | Path) -
     return _write_text_atomic(Path(output_path), render_pipeline_mermaid(pipeline))
 
 
-def write_pipeline_html(pipeline: ProjectPipeline, output_path: str | Path) -> Path:
+def write_pipeline_html(
+    pipeline: ProjectPipeline, output_path: str | Path, *, policy: HTMLReportPolicy | None = None,
+) -> Path:
     """Atomically write an interactive HTML project-pipeline view."""
 
-    return _write_text_atomic(Path(output_path), render_pipeline_html(pipeline))
+    return _write_text_atomic(Path(output_path), render_pipeline_html(pipeline, policy=policy))
 
 
 def render_pipeline_mermaid(pipeline: ProjectPipeline) -> str:
@@ -124,10 +130,11 @@ def render_pipeline_mermaid(pipeline: ProjectPipeline) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_pipeline_html(pipeline: ProjectPipeline) -> str:
+def render_pipeline_html(pipeline: ProjectPipeline, *, policy: HTMLReportPolicy | None = None) -> str:
     """Render an interactive browser view with an embedded pipeline payload."""
 
-    payload = _safe_json(pipeline.to_dict())
+    policy = policy if policy is not None else default_config().reporting.html
+    payload = _safe_json({**pipeline.to_dict(), "display": asdict(policy)})
     project_name = escape(str(pipeline.project.get("name") or "Project"), quote=True)
     template = """<!doctype html>
 <html lang="en">
@@ -135,9 +142,7 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>REQL Project Pipeline — __PROJECT_NAME__</title>
-  <script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"
-          integrity="sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1"
-          crossorigin="anonymous"></script>
+  <script>__VIS_NETWORK__</script>
   <style>
     * { box-sizing: border-box; }
     html, body { width: 100%; height: 100%; margin: 0; }
@@ -215,6 +220,7 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
   <aside id="details"><section class="panel"><h2>Details</h2><div id="detail-content"><p>Select a node to inspect its evidence.</p></div></section></aside>
   <script>
     const pipeline = __PIPELINE_DATA__;
+    const limits = pipeline.display;
     const layerColors = { interface:'#2563eb', application:'#0f766e', domain:'#a16207', core:'#4b5563', infrastructure:'#be123c' };
     const workflowPalette = ['#8b5cf6','#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6','#eab308','#60a5fa'];
     const workflowById = new Map(pipeline.workflows.map(item => [item.id, item]));
@@ -261,7 +267,7 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
     let network = null;
     let visibleNodeById = new Map();
     if (typeof vis === 'undefined' || !vis.Network) {
-      graph.innerHTML = '<div style="display:grid;height:100%;place-items:center;color:#fca5a5;padding:24px;text-align:center">vis-network failed to load. Check your connection to unpkg.com.</div>';
+      graph.innerHTML = '<div style="display:grid;height:100%;place-items:center;color:#fca5a5;padding:24px;text-align:center">vis-network failed to load. The embedded graph viewer is unavailable.</div>';
     } else {
       network = new vis.Network(graph, {nodes:new vis.DataSet(),edges:new vis.DataSet()}, {
         layout:{randomSeed:1729,improvedLayout:false}, physics:{enabled:false},
@@ -301,18 +307,19 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
     document.getElementById('fit').addEventListener('click', () => network && network.fit({animation:{duration:300}}));
     document.getElementById('reset').addEventListener('click', () => { workflowFilter.value=''; layerFilters.querySelectorAll('input').forEach(input => input.checked=true); applyFilters(); });
 
-    const DENSE_GRAPH_THRESHOLD = 40;
     function nodeColor(background,border) {
       return {background,border,highlight:{background,border:'#f8fafc'},hover:{background,border:'#e0e7ff'}};
     }
     function frameReadableView(visibleNodes,visibleEdges,workflowId) {
+        const fitNodeLimit = 40;
+        const focusScale = 0.68;
         if (!network) return;
-        if (workflowId || visibleNodes.length<=DENSE_GRAPH_THRESHOLD) {
+        if (workflowId || visibleNodes.length <= fitNodeLimit) {
           network.fit({animation:false});
           return;
         }
         const focus=denseGraphFocus(visibleNodes,visibleEdges);
-        if (focus) network.focus(focus.id,{scale:.68,animation:false});
+        if (focus) network.focus(focus.id,{scale:focusScale,animation:false});
     }
     function positionPipelineNodes(visibleNodes,visibleEdges) {
       const nodeById=new Map(visibleNodes.map(node => [node.id,node]));
@@ -352,6 +359,7 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
       const stageSpacing = 150;
       const bandSpacing = 120;
       const targetAspect = 1.75;
+      const minRows = 10;
       const largestStage = orderedStages.reduce((largest, [, nodes]) => Math.max(largest, nodes.length), 0);
       const stripWidth = rows => orderedStages.reduce(
         (width, [, nodes]) => width + Math.ceil(nodes.length / rows) * columnSpacing,
@@ -359,7 +367,7 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
       );
 
       // Increase column capacity until the footprint is balanced or each stage fits one column.
-      let rowLimit = Math.min(10, largestStage);
+      let rowLimit = Math.min(minRows, largestStage);
       let upperLimit = largestStage;
       while (rowLimit < upperLimit) {
         const rows = Math.floor((rowLimit + upperLimit) / 2);
@@ -453,7 +461,7 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
     search.addEventListener('input', () => {
       const query=search.value.trim().toLowerCase(); searchResults.replaceChildren();
       if (!query) { searchResults.style.display='none'; return; }
-      const matches=allNodeRecords.filter(node => searchable(node).includes(query)).slice(0,8);
+      const matches=allNodeRecords.filter(node => searchable(node).includes(query)).slice(0, limits.pipeline_search_limit || undefined);
       matches.forEach(node => { const button=document.createElement('button'); button.className='search-result'; button.textContent=node.label;
         button.addEventListener('click', () => focusNode(node.id)); searchResults.appendChild(button); });
       searchResults.style.display=matches.length ? 'block' : 'none';
@@ -484,8 +492,8 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
         addRow(box,'Kind',node.raw.kind); addRow(box,'Results',String(node.raw.items.length));
         addRow(box,'Workflows',node.raw.workflow_ids.map(id => workflowById.get(id)?.name || id).join(', '));
         addRow(box,'Meaning',node.raw.observed_terminal ? 'End of available static evidence' : 'Observed graph effect');
-        const heading=document.createElement('h2'); heading.style.marginTop='18px'; heading.textContent='Representative results'; box.appendChild(heading);
-        const unique=[...new Map(node.raw.items.map(item => [item.label,item])).values()].slice(0,20);
+        const heading=document.createElement('h2'); heading.style.marginTop='18px'; heading.textContent='Distinct results'; box.appendChild(heading);
+        const unique = new Map(node.raw.items.map(item => [item.label, item]));
         unique.forEach(result => { const item=document.createElement('div'); item.className='symbol';
           const name=document.createElement('div'); name.className='symbol-name'; name.textContent=result.label;
           const relation=document.createElement('div'); relation.className='symbol-location'; relation.textContent=result.kind;
@@ -499,7 +507,13 @@ def render_pipeline_html(pipeline: ProjectPipeline) -> str:
 </body>
 </html>
 """
-    return template.replace("__PROJECT_NAME__", project_name).replace("__PIPELINE_DATA__", payload)
+    replacements = {
+        "__VIS_NETWORK__": vis_network_script(),
+        "__PROJECT_NAME__": project_name,
+        "__PIPELINE_DATA__": payload,
+    }
+    return re.sub(r"__VIS_NETWORK__|__PROJECT_NAME__|__PIPELINE_DATA__",
+                  lambda match: replacements[match[0]], template)
 
 
 def _write_text_atomic(path: Path, text: str) -> Path:

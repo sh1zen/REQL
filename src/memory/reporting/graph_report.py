@@ -4,10 +4,18 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from ..config import default_config
+from ..config.models import MarkdownReportPolicy
+from .presentation import omitted_items
+
 from ..domain.models import MemoryNode
 
 
 class GraphReportBuilder:
+    def __init__(self, *, policy: MarkdownReportPolicy | None = None) -> None:
+        self.policy = policy if policy is not None else default_config().reporting.markdown
+        self.analysis_rows = min(self.policy.section_limit or self.policy.analysis_limit, self.policy.analysis_limit)
+
     def render(self, context: dict[str, Any]) -> str:
         lines = ["# REQL Project Report", "", f"Generated at: {context['generated_at']}", ""]
         self._project_summary(lines, context)
@@ -17,6 +25,8 @@ class GraphReportBuilder:
         self._code_graph(lines, context)
         self._communities(lines, context)
         self._hubs(lines, context)
+        if warnings := context.get("analysis_warnings"):
+            self._plain_list(lines, "Analysis warnings", warnings)
         self._health(lines, context)
         return "\n".join(lines).rstrip() + "\n"
 
@@ -64,8 +74,6 @@ class GraphReportBuilder:
         lines.append(f"- Cached artifacts: {cached_artifacts}")
         lines.append(f"- Dirty artifacts: {status.get('dirty_artifacts', 0)}")
         lines.append(f"- Skipped artifacts: {len(c.get('skipped_files') or [])}")
-        self._counter(lines, "Parser versions", _count_prop(entries, "parser_version"))
-        self._counter(lines, "Chunking versions", _count_prop(entries, "chunking_version"))
 
     def _artifact_ingestion(self, lines: list[str], c: dict[str, Any]) -> None:
         artifacts = c["artifacts"]
@@ -73,10 +81,11 @@ class GraphReportBuilder:
         if not artifacts:
             lines.append("- No data yet.")
             return
-        top = sorted(artifacts, key=lambda n: int(n.properties.get("size_bytes") or 0), reverse=True)[:10]
+        top = sorted(artifacts, key=lambda n: int(n.properties.get("size_bytes") or 0), reverse=True)
         lines.append("Top artifacts by size:")
-        for node in top:
+        for node in top[:self.policy.section_limit or None]:
             lines.append(f"- `{node.properties.get('relative_path', node.label)}` size={node.properties.get('size_bytes', 0)} parser={node.properties.get('parser_name', 'not compiled')} status={node.properties.get('status', node.status)}")
+        lines.extend(omitted_items(len(top), self.policy.section_limit))
         parser_errors = [node for node in artifacts if node.properties.get("parser_errors")]
         partial = [node for node in artifacts if node.properties.get("status") == "partially_readable"]
         needs_ocr = [node for node in artifacts if node.properties.get("status") == "needs_ocr"]
@@ -92,44 +101,45 @@ class GraphReportBuilder:
         lines.extend(["", "## Code graph summary", ""])
         for type_ in ["Module", "Class", "Function", "Method", "Variable", "Import", "StaticAnalysisFinding"]:
             lines.append(f"- {type_.lower()}s: {counts.get(type_, 0)}")
-        lines.append(f"- call edges: {len(c['call_edges'])}")
-        top = sorted([node for node in nodes if node.type in {"Class", "Function", "Method", "CodeSymbol"} and not _external_code_symbol(node)], key=lambda n: (n.salience, n.properties.get("name") or ""), reverse=True)[:10]
+        lines.append(f"- call edges: {c['call_edge_count']}")
+        top = sorted([node for node in nodes if node.type in {"Class", "Function", "Method", "CodeSymbol"} and not _external_code_symbol(node)], key=lambda n: (n.salience, n.properties.get("name") or ""), reverse=True)
         self._node_list(lines, "Top symbols", top, name_field="qualified_name")
         cleanup = sorted(
             [node for node in nodes if node.type == "StaticAnalysisFinding"],
             key=lambda n: (_cleanup_priority_rank(n), float(n.properties.get("confidence") or n.confidence)),
             reverse=True,
-        )[:10]
+        )
         self._node_list(lines, "Top cleanup candidates", cleanup, name_field="qualified_name")
 
     def _communities(self, lines: list[str], c: dict[str, Any]) -> None:
         lines.extend(["", "## Communities", ""])
-        communities = sorted(c["communities"], key=lambda n: (float(n.properties.get("salience") or n.salience), int(n.properties.get("size") or 0)), reverse=True)[:10]
+        communities = sorted(c["communities"], key=lambda n: (float(n.properties.get("salience") or n.salience), int(n.properties.get("size") or 0)), reverse=True)
         if not communities:
             lines.append("- No data yet.")
             return
-        for node in communities:
+        for node in communities[:self.analysis_rows]:
             lines.append(f"- `{node.id}` {node.label}: size={node.properties.get('size', 0)}, density={float(node.properties.get('density') or 0):.2f}, salience={node.salience:.2f}")
+
+        lines.extend(omitted_items(len(communities), self.analysis_rows))
 
     def _hubs(self, lines: list[str], c: dict[str, Any]) -> None:
         lines.extend(["", "## God nodes / hubs", ""])
-        hubs = c["hubs"][:10]
+        hubs = c["hubs"]
         if not hubs:
             lines.append("- No data yet.")
-        for hub in hubs:
+        for hub in hubs[:self.analysis_rows]:
             lines.append(f"- rank={hub.hub_rank} `{hub.node_type}` score={hub.hub_score:.2f}: {hub.label} - {'; '.join(hub.reasons[:4])}")
-        warnings = c["hub_warnings"] or [f"Generic high-degree node: {n.label or n.id} degree={degree} penalty={penalty:.2f}" for n, degree, penalty in c["generic_warnings"]]
-        self._plain_list(lines, "Generic hub warnings", warnings)
+        lines.extend(omitted_items(len(hubs), self.analysis_rows))
+        self._plain_list(lines, "Generic hub warnings", c["hub_warnings"])
 
     def _health(self, lines: list[str], c: dict[str, Any]) -> None:
         lines.extend(["", "## Memory health", ""])
-        lines.append(f"- Stale nodes: {len(c['stale_nodes'])}")
-        lines.append(f"- Archived nodes: {len(c['archived_nodes'])}")
-        lines.append(f"- Overly generic high-degree nodes: {len(c['generic_warnings'])}")
+        lines.append(f"- Stale nodes: {c['stale_count']}")
+        lines.append(f"- Archived nodes: {c['archived_count']}")
         actions = []
-        if c["stale_nodes"]:
+        if c["stale_count"]:
             actions.append("Review stale active nodes and archive stale project facts.")
-        if c["generic_warnings"]:
+        if c["hub_warnings"]:
             actions.append("Rename or split generic high-degree nodes so retrieval stays specific.")
         if not actions:
             actions.append("No immediate action recommended.")
@@ -144,26 +154,27 @@ class GraphReportBuilder:
         for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             lines.append(f"- {key}: {count}")
 
-    @staticmethod
-    def _node_list(lines: list[str], title: str, nodes: list[MemoryNode], *, include_errors: bool = False, name_field: str = "relative_path") -> None:
+    def _node_list(self, lines: list[str], title: str, nodes: list[MemoryNode], *, include_errors: bool = False, name_field: str = "relative_path") -> None:
         lines.append(f"{title}:")
         if not nodes:
             lines.append("- No data yet.")
             return
-        for node in nodes[:10]:
+        for node in nodes[:self.policy.section_limit or None]:
             name = node.properties.get(name_field) or node.properties.get("name") or node.label or node.id
             suffix = ""
             if include_errors:
-                suffix = " - " + "; ".join(str(e) for e in node.properties.get("parser_errors", [])[:2])
+                suffix = " - " + "; ".join(map(str, node.properties["parser_errors"]))
             lines.append(f"- `{name}` status={node.properties.get('status', node.status)}{suffix}")
 
-    @staticmethod
-    def _plain_list(lines: list[str], title: str, items: list[str]) -> None:
+        lines.extend(omitted_items(len(nodes), self.policy.section_limit))
+
+    def _plain_list(self, lines: list[str], title: str, items: list[str]) -> None:
         lines.append(f"{title}:")
         if not items:
             lines.append("- No data yet.")
             return
-        lines.extend(f"- {item}" for item in items[:10])
+        lines.extend(f"- {item}" for item in items[:self.policy.section_limit or None])
+        lines.extend(omitted_items(len(items), self.policy.section_limit))
 
 def _count_prop(nodes: list[MemoryNode], prop: str) -> Counter[str]:
     return Counter(str(node.properties.get(prop) or "unknown") for node in nodes)

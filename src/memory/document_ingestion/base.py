@@ -5,7 +5,10 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import ClassVar, Protocol
 
+from config import VERSION
+
 from ..artifacts.models import SourceArtifact
+from ..artifacts.text_encoding import decode_text
 from .metadata import basic_file_metadata
 from .models import DocumentParseResult
 
@@ -22,10 +25,10 @@ class BaseDocumentParser(ABC):
     """Common base for concrete document format parsers."""
 
     parser_name: str
-    parser_version: str
+    parser_version: str = VERSION
     artifact_types: ClassVar[frozenset[str]] = frozenset()
     languages: ClassVar[frozenset[str]] = frozenset()
-    encoding: str = "utf-8"
+    encoding: str = "utf-8-sig"
 
     def supports(self, artifact: SourceArtifact) -> bool:
         artifact_type = artifact.artifact_type.casefold()
@@ -33,7 +36,7 @@ class BaseDocumentParser(ABC):
         return artifact_type in self.artifact_types or language in self.languages
 
     def decode_text(self, content: bytes) -> str:
-        return content.decode(self.encoding, errors="replace")
+        return decode_text(content, default_encoding=self.encoding, errors="replace")
 
     def base_metadata(self, artifact: SourceArtifact) -> dict[str, object]:
         return basic_file_metadata(artifact.path)

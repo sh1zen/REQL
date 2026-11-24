@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "reql"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Relational Entities Query Language: a graph-native deterministic memory engine."
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
@@ -38,42 +38,44 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "tree-sitter>=0.25,<0.26",
-  "tree-sitter-bash>=0.25",
-  "tree-sitter-c>=0.24",
-  "tree-sitter-c-sharp>=0.23",
-  "tree-sitter-cpp>=0.23",
-  "tree-sitter-elixir>=0.3",
+  "tree-sitter>=0.25,<0.28",
+  "tree-sitter-bash>=0.25.1",
+  "tree-sitter-c>=0.24.2",
+  "tree-sitter-c-sharp>=0.24.0",
+  "tree-sitter-cpp>=0.23.4",
+  "tree-sitter-elixir>=0.3.5",
   "tree-sitter-fortran>=0.6",
   "tree-sitter-go>=0.25",
   "tree-sitter-hcl>=1.2",
-  "tree-sitter-java>=0.23",
+  "tree-sitter-java>=0.23.5",
   "tree-sitter-javascript>=0.25",
-  "tree-sitter-julia>=0.23",
+  "tree-sitter-julia>=0.23.1",
   "tree-sitter-kotlin>=1.1",
-  "tree-sitter-language-pack>=1.8",
+  "tree-sitter-language-pack>=1.23.1; python_version < '3.11'",
+  "tree-sitter-language-pack>=1.25.2; python_version >= '3.11'",
   "tree-sitter-lua>=0.5",
-  "tree-sitter-make>=1.1",
-  "tree-sitter-php>=0.24",
-  "tree-sitter-powershell>=0.26",
+  "tree-sitter-make>=1.1.1",
+  "tree-sitter-php>=0.25.2",
+  "tree-sitter-powershell>=0.26.4",
   "tree-sitter-python>=0.25",
-  "tree-sitter-ruby>=0.23",
-  "tree-sitter-rust>=0.24",
-  "tree-sitter-scala>=0.26",
-  "tree-sitter-solidity>=1.2",
-  "tree-sitter-sql>=0.3",
-  "tree-sitter-swift>=0.7",
-  "tree-sitter-typescript>=0.23",
-  "tree-sitter-verilog>=1.0",
-  "tree-sitter-zig>=1.1",
+  "tree-sitter-ruby>=0.23.1",
+  "tree-sitter-rust>=0.24.2",
+  "tree-sitter-scala>=0.26.13",
+  "tree-sitter-solidity>=1.2.13",
+  "tree-sitter-sql>=0.3.13",
+  "tree-sitter-swift>=0.7.4",
+  "tree-sitter-typescript>=0.23.2",
+  "tree-sitter-verilog>=1.0.3",
+  "tree-sitter-zig>=1.1.2",
 ]
 
 [project.optional-dependencies]
-pdf = ["pypdf>=4.0"]
-all = ["pypdf>=4.0"]
+pdf = ["pypdf>=7.1.1"]
+all = ["pypdf>=7.1.1"]
 dev = [
-  "coverage[toml]>=7.10,<8",
-  "pypdf>=4.0",
+  "coverage[toml]>=7.16.2,<8; python_version < '3.11'",
+  "coverage[toml]>=7.17.5,<8; python_version >= '3.11'",
+  "pypdf>=7.1.1",
 ]
 
 [project.urls]
@@ -85,15 +87,23 @@ Source = "https://github.com/sh1zen/reql"
 reql = "memory.cli:main"
 reql-mcp = "mcp.server:main"
 
+[tool.setuptools]
+py-modules = ["config", "reql"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "config.VERSION"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 agents = ["py.typed", "gen-skill.py"]
 api = ["py.typed"]
-memory = ["py.typed", "config/conf.yaml"]
+memory = ["py.typed"]
+config = ["core.yaml", "user.yaml"]
+"memory.reporting" = ["vendor/vis-network.min.js", "vendor/vis-network.LICENSE-MIT"]
 mcp = ["py.typed"]
-reql = ["py.typed"]
 
 [tool.coverage.run]
 branch = true

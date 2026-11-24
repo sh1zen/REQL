@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from functools import cached_property
+import sys
+
+from config import VERSION
 
 from ..code_analysis.base import TreeSitterCodeParser, artifact_grammar
 from ..code_analysis.catalog import grammar_packages
@@ -11,15 +14,16 @@ from .fingerprint import tree_sitter_versions
 from .models import SourceArtifact
 
 
+_COMPILER_CONTRACT_VERSION = 3
+
+
 class ArtifactCompileIdentity:
     """Resolve and memoize the compiler contract for each artifact's parser."""
 
     def __init__(
-        self, parser_version: str, chunking_version: str, options_digest: str, *,
+        self, options_digest: str, *,
         scoped: bool = True, scoped_documents: bool = True, code_parsers: CodeParserRegistry | None = None,
     ) -> None:
-        self.parser_version = parser_version
-        self.chunking_version = chunking_version
         self.options_digest = options_digest
         self.scoped = scoped
         self.scoped_documents = scoped_documents
@@ -30,8 +34,8 @@ class ArtifactCompileIdentity:
     def _custom_contract(self) -> str:
         """Invalidate custom parsers on any grammar-package change."""
         return stable_id(
-            "compilation", "custom-v1", self.parser_version, self.chunking_version, self.options_digest,
-            sorted(tree_sitter_versions().items()),
+            "compilation", "custom", VERSION, _COMPILER_CONTRACT_VERSION, self.options_digest,
+            sorted(tree_sitter_versions().items()), sys.version_info[:2],
         )
 
     def current(self, artifact: SourceArtifact) -> str:
@@ -52,7 +56,6 @@ class ArtifactCompileIdentity:
         if existing is not None:
             return existing
         extractor_name: tuple[str, ...] = ()
-        revisions: tuple[tuple[str, int], ...] = ()
         versions: tuple[tuple[str, str | None], ...] = ()
         if grammar:
             from ..code_analysis.factory import EXTRACTOR_BY_LANGUAGE
@@ -60,12 +63,11 @@ class ArtifactCompileIdentity:
             extractor = EXTRACTOR_BY_LANGUAGE.get(grammar)
             if extractor is not None:
                 extractor_name = (extractor.__module__, extractor.__qualname__)
-                revisions = extractor.facts_revisions()
             packages = tree_sitter_versions()
             versions = tuple((package, packages.get(package)) for package in grammar_packages(grammar))
         fingerprint = stable_id(
-            "compilation", "scoped-v1", self.parser_version, self.chunking_version, self.options_digest,
-            grammar, extractor_name, revisions, versions,
+            "compilation", "scoped", VERSION, _COMPILER_CONTRACT_VERSION, self.options_digest,
+            grammar, extractor_name, versions, sys.version_info[:2] if grammar == "python" else (),
         )
         self._by_grammar[grammar] = fingerprint
         return fingerprint

@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from memory.storage import BlockGraphStore
+from memory.storage import BlockGraphStore, inspect_store_locks
 from memory.storage.adapters.lexical_index import LEXICAL_INDEX_SCHEMA_VERSION
 from memory.domain.exceptions import StorageError
 from reql import MemoryEdge, MemoryNode
@@ -60,7 +60,7 @@ class StorageTransactionTests(unittest.TestCase):
                         reopened.close()
                     self.assertEqual(self.path.read_bytes(), checkpoint)
                     self.assertFalse(self.path.with_name(self.path.name + ".wal").exists())
-                    self.assertFalse(self.path.with_name(self.path.name + ".lock").exists())
+                    self.assertFalse(inspect_store_locks(self.path)["locked"])
 
     def test_nested_journal_rollback_restores_records_indexes_and_deferred_terms(self) -> None:
         store = self.open_store()
@@ -154,7 +154,7 @@ class StorageTransactionTests(unittest.TestCase):
                             self.open_store(read_only=read_only, defer_lexical_index=deferred)
                         self.assertEqual(self.path.read_bytes(), checkpoint)
                         self.assertFalse(self.path.with_name(self.path.name + ".wal").exists())
-                        self.assertFalse(self.path.with_name(self.path.name + ".lock").exists())
+                        self.assertFalse(inspect_store_locks(self.path)["locked"])
 
 
 if __name__ == "__main__":

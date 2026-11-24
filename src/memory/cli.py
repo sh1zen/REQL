@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import shlex
 import sys
 from contextlib import AbstractContextManager, closing, nullcontext
 from collections.abc import Callable
@@ -33,9 +33,11 @@ from .domain.query_context import (
     DEFAULT_MAX_ITEMS,
     DEFAULT_TOP_K,
     QueryContextRequest,
+    SeenSourceRange,
 )
 from .reporting.html_graph import write_graph_html
 from .reporting.project_pipeline import write_pipeline_html, write_pipeline_mermaid
+from .shell import shell_option
 from .storage import BlockGraphStore, inspect_store_locks
 from .storage.maintenance import clear_project_storage
 
@@ -44,19 +46,10 @@ if TYPE_CHECKING:
 
 DEFAULT_STORAGE_DIR = ".reql"
 DEFAULT_STORAGE_FILE = "memory.reql"
-LOCKED_FOR_WRITE_PREFIX = "REQL block store is locked for write: "
 
 
 class _PromptInterrupted(Exception):
     pass
-
-
-class _VerifiedFinishRejected(Exception):
-    """Keep the check results available when completion cannot proceed."""
-
-    def __init__(self, verification: dict[str, Any]) -> None:
-        super().__init__("Verification did not establish a successful task completion")
-        self.verification = verification
 
 
 @dataclass(frozen=True)
@@ -72,6 +65,7 @@ class AccessMode(str, Enum):
 
     READ_ONLY = "read_only"
     EXISTING_READ_ONLY = "existing_read_only"
+    READ_ONLY_OR_EMPTY = "read_only_or_empty"
     SIDECAR_WRITE = "sidecar_write"
     MUTATING = "mutating"
 
@@ -119,13 +113,7 @@ def _print_json(payload: object) -> None:
 
 
 def _format_storage_error(error: StorageError) -> str:
-    message = str(error)
-    if message.startswith(LOCKED_FOR_WRITE_PREFIX):
-        return (
-            "reql is locked for write: to fix any possible stale: "
-            "reql storage locks --recover-stale"
-        )
-    return f"reql: {message}"
+    return f"reql: {error}"
 
 
 def _agent_command_name(args: argparse.Namespace) -> str:
@@ -167,7 +155,7 @@ def _print_agent_identity_error(error: Any, args: argparse.Namespace) -> None:
     print(f"Action: {payload['next'][0]}", file=sys.stderr)
 
 
-def _print_agent_command_error(error: ValueError, args: argparse.Namespace, *,
+def _print_agent_command_error(error: Exception, args: argparse.Namespace, *,
                                recovery: str | None = None) -> None:
     """Render an agent command validation error with a recovery step."""
     command = f"reql {_agent_command_name(args)}"
@@ -188,35 +176,18 @@ def _print_agent_command_error(error: ValueError, args: argparse.Namespace, *,
         print(f"Next: {recovery}", file=sys.stderr)
 
 
-def _shell_argument(value: str) -> str:
-    """Quote an argument for POSIX shells or Windows PowerShell."""
-    quoted = shlex.quote(value)
-    if os.name == "nt" and quoted != value:
-        quoted = "'" + value.replace("'", "''") + "'"
-    return quoted
-
-
-def _shell_option(name: str, value: str) -> str:
-    """Format an option whose value may itself start with a dash."""
-    separator = "=" if value.startswith("-") else " "
-    return f"{name}{separator}{_shell_argument(value)}"
-
-
-def _finish_command(workspace: ProgressingAgentWorkspace, task_id: str,
-                    *, summary: str | None = None) -> str:
+def _finish_command(workspace: ProgressingAgentWorkspace, task_id: str) -> str:
     """Render a bound finish for the same task and agent activity."""
-    command = f"reql agent {_shell_option('--agent', workspace.agent_id)}"
+    command = f"reql agent {shell_option('--agent', workspace.agent_id)}"
     if workspace.activity_id:
-        command += f" {_shell_option('--activity', workspace.activity_id)}"
-    options = f"--task {task_id}"
-    if summary is not None and summary.startswith("-"):
-        return f"{command} finish {options} -- {_shell_argument(summary)}"
-    argument = "'SUMMARY'" if summary is None else _shell_argument(summary)
-    return f"{command} finish {argument} {options}"
+        command += f" {shell_option('--activity', workspace.activity_id)}"
+    return f"{command} finish 'SUMMARY' --task {task_id}"
 
 
 def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: ProgressingAgentWorkspace) -> int:
     """Claim work and optionally return its verified source through the same CLI response."""
+    if args.source and args.query is None and not args.next_task:
+        raise ValueError("--source requires --query or --next")
     request = None
     storage = Path(args.storage)
     has_graph = (args.query is not None or args.next_task) and (
@@ -226,7 +197,7 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
         if args.task_id is None and not args.next_task:
             raise ValueError("--query requires --next or --task")
         request = QueryContextRequest.from_raw(
-            text=args.query, scopes=["code"], task_id=args.task_id, include_source=args.json,
+            text=args.query, scopes=["code"], task_id=args.task_id, include_source=args.source,
         )
         if not has_graph and not args.next_task:
             raise ValueError("Source context requires an indexed project. Run project compile before claiming with --query.")
@@ -237,7 +208,7 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
     task = result.get("claimed_task")
     if args.next_task and task is not None:
         request = (replace(request, task_id=task["id"]) if request is not None else QueryContextRequest.from_raw(
-            text=task["title"] or task["content"], scopes=["code"], task_id=task["id"], include_source=args.json,
+            text=task["title"] or task["content"], scopes=["code"], task_id=task["id"], include_source=args.source,
         ))
     if args.next_task and not has_graph and request is not None and task is not None:
         result["source_context_error"] = "Source context requires an indexed project. Run project compile."
@@ -246,9 +217,10 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
     if request is not None and task is not None and has_graph:
         try:
             with closing(MemoryGraph.open(Path(args.storage), config=config, read_only=True,
-                                          defer_lexical_index=True, lock_timeout_seconds=0.05)) as graph:
+                                          defer_lexical_index=True, lock_timeout_seconds=args.lock_timeout,
+                                          wait_for_lock=args.lock_timeout is None)) as graph:
                 service = graph.query_context_service
-                source = service.execute(request, brief=not args.json)
+                source = service.execute(request, include_previews=False) if args.json else service.execute(request, brief=True)
                 if args.json:
                     result["source_context"] = source.to_dict()
                 else:
@@ -265,7 +237,7 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
                     else:
                         waiting = (current["execution_state"] == "blocked" and current["waiting_on"])
                         notice = ("Claim active. Finish waits for the listed prerequisites. "
-                                  "Read a prerequisite update with reql agent show ID."
+                                  f"Wait for a prerequisite with `reql agent wait {waiting[0]}`."
                                   if waiting else "Claim active. Reconcile the listed blockers before finishing.")
                         source_text = notice + "\n\n" + service.render(source, brief=True, allow_work_commands=False)
         except (StorageError, TypeError, ValueError) as exc:
@@ -273,11 +245,11 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
             result["source_context_error"] = str(exc)
     if task is not None and "source_context_error" in result:
         query = request.text if request is not None else task["title"]
-        result["source_context_retry"] = (f"reql query_context --task {task['id']} {_shell_option('--query', query)}"
+        result["source_context_retry"] = (f"reql query_context --task {task['id']} {shell_option('--query', query)}"
                                           " --code --brief")
         try:
             if args.next_task:
-                result["work_context"] = workspace.coordination.context(record_id=task["id"], limit=6)
+                result["work_context"] = workspace.coordination.context(record_id=task["id"])
             else:
                 result.update(workspace.coordination.assignment_context(task["id"]))
         except (StorageError, ValueError) as exc:
@@ -298,7 +270,7 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
             print(f"{action} task: {task['id']}\tr{task['revision']}")
             if work := result.get("work_context"):
                 from memory.services.coordination import render_work_context
-                print(render_work_context(work, max_chars=4000, record_id=task["id"]))
+                print(render_work_context(work, record_id=task["id"]))
             if not source_has_overlaps and (overlaps := result.get("file_overlaps")):
                 from memory.services.coordination import render_file_overlaps
 
@@ -308,10 +280,8 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
             print("No ready task.")
             for blocker in result.get("blockers", ()):
                 links = list(dict.fromkeys(blocker["waiting_on"] + blocker["obsolete_dependencies"] + blocker["conflicts"]))
-                suffix = ": " + ", ".join(links[:3]) if links else ""
+                suffix = ": " + ", ".join(links) if links else ""
                 print(f"- {blocker['id']} ({blocker['execution_state']}){suffix}")
-            if omitted := result.get("omitted_blockers"):
-                print(f"- {omitted} more blocked tasks. See `reql project overview`.")
         if source_text is not None:
             print(source_text)
         if error := result.get("source_context_error"):
@@ -319,6 +289,28 @@ def _handle_agent_init(args: argparse.Namespace, config: REQLConfig, workspace: 
             if retry := result.get("source_context_retry"):
                 print(f"Recover context: `{retry}`", file=sys.stderr)
     return 2 if "source_context_error" in result else 0
+
+
+def _handle_agent_verify(args: argparse.Namespace, config: REQLConfig) -> int:
+    """Execute the explicit plan and keep command output separate from a JSON receipt."""
+    from .services.verification import VerificationService
+
+    stream = sys.stderr if args.json else sys.stdout
+    try:
+        raw = sys.stdin.read() if args.plan == "-" else Path(args.plan).read_text(encoding="utf-8-sig")
+        service = VerificationService(Path.cwd(), Path(args.storage), config)
+        result = service.verify(json.loads(raw), emit=lambda output: print(output, file=stream, end=""))
+    except (OSError, StorageError, ValueError) as exc:
+        _print_agent_command_error(exc, args)
+        return 2
+    if args.json:
+        _print_json(result)
+    else:
+        for check in result["checks"]:
+            status = ("reused" if check["reused"] else
+                      f"failed (exit {check['exit_code']})" if check["exit_code"] else "passed")
+            print(f"{check['stage']} {check['check']}\t{status}")
+    return 0 if result["passed"] else 1
 
 
 def _print_compile_result(result: Any) -> None:
@@ -565,19 +557,9 @@ def _print_storage_inspection(payload: dict[str, Any]) -> None:
 def _print_storage_locks(payload: dict[str, Any]) -> None:
     print(f"Path: {payload['path']}")
     print(f"Locked: {payload['locked']}")
-    locks = [payload["writer"]] if payload.get("writer") else []
-    locks.extend(payload.get("readers") or [])
-    for item in locks:
-        alive = item.get("process_alive")
-        alive_text = "unknown" if alive is None else str(bool(alive)).lower()
-        print(
-            f"  {item['mode']}: command={item.get('command') or 'unknown'}; "
-            f"pid={item.get('pid')}; duration={float(item.get('duration_seconds', 0.0)):.3f}s; "
-            f"alive={alive_text}; "
-            f"stale={str(bool(item.get('stale'))).lower()}"
-        )
-    for item in payload.get("recovered") or []:
-        print(f"Recovered stale {item['mode']} lock: {item['lock_path']}")
+    if payload["mode"]:
+        print(f"Mode: {payload['mode']}")
+    print(f"Lock path: {payload['lock_path']}")
 
 
 def _print_storage_compaction(payload: dict[str, Any]) -> None:
@@ -680,7 +662,7 @@ def _print_agent_dashboard(payload: dict[str, Any]) -> None:
 def _configure_project_overview_parser(parser: argparse.ArgumentParser) -> None:
     """Configure the working-directory project overview command."""
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
-    parser.add_argument("--limit", type=int, default=5, help="Maximum items per overview section (1-20)")
+    parser.add_argument("--limit", type=int, help="Maximum items per overview section")
     parser.add_argument("--details", action="store_true", help="Include full architecture and operational history")
 
 
@@ -720,7 +702,7 @@ def _handle_project_overview(context: CommandContext) -> int:
     if summaries:
         print("\n### Public summaries")
         for item in summaries[:args.limit]:
-            print(f"- {item['content'][:600]} ({item['agent_id']}, {item['timestamp']})")
+            print(f"- {item['content']} ({item['agent_id']}, {item['timestamp']})")
     return 0
 
 
@@ -732,15 +714,15 @@ def _configure_project_context_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task", dest="record_id", default=None)
     parser.add_argument("--history", action="store_true", help="Include obsolete approaches and their replacements")
     parser.add_argument("--failures-only", action="store_true", help="Recover active failures matching the task or files")
-    parser.add_argument("--limit", type=int, default=8)
+    parser.add_argument("--limit", type=int)
     parser.add_argument("--json", action="store_true")
 
 
-def _handle_project_context(args: argparse.Namespace) -> int:
+def _handle_project_context(args: argparse.Namespace, config: REQLConfig) -> int:
     """Read causal engineering context independently of private sessions."""
     from memory.services.coordination import CoordinationStore, render_work_context
     storage = Path(args.storage)
-    work = CoordinationStore(storage.with_name("agent-dashboard.reql"))
+    work = CoordinationStore.for_project(storage, config=config)
     if args.failures_only:
         from memory.services.failure_context import FailureContextService, render_failure_context
 
@@ -748,7 +730,7 @@ def _handle_project_context(args: argparse.Namespace) -> int:
             raise ValueError("--failures-only selects active failures and cannot be combined with --history")
         arguments = {"files": args.files, "workstream": args.workstream, "record_id": args.record_id, "limit": args.limit}
         if storage.is_file() or storage.with_name(f"{storage.name}.wal").is_file():
-            graph = MemoryGraph.open(storage, read_only=True, defer_lexical_index=True)
+            graph = MemoryGraph.open(storage, config=config, read_only=True, defer_lexical_index=True)
             try:
                 payload = graph.failure_context(args.query, **arguments)
             finally:
@@ -770,9 +752,7 @@ def _handle_project_context(args: argparse.Namespace) -> int:
 
 
 def _read_source_edit_plan(filename: str, *, root: Path) -> Any:
-    """Read bounded edit-plan JSON from stdin or a project-local file."""
-    from memory.artifacts.source_edit import MAX_PLAN_CHARS
-
+    """Read edit-plan JSON from stdin or a project-local file."""
     try:
         source: AbstractContextManager[TextIO]
         if filename == "-":
@@ -783,9 +763,7 @@ def _read_source_edit_plan(filename: str, *, root: Path) -> Any:
                 raise ValueError("Edit plan must be inside the project, or use stdin")
             source = path.open(encoding="utf-8")
         with source as stream:
-            text = stream.read(MAX_PLAN_CHARS + 1)
-        if len(text) > MAX_PLAN_CHARS:
-            raise ValueError(f"Edit plan exceeds {MAX_PLAN_CHARS} characters")
+            text = stream.read()
         return json.loads(text.removeprefix("\ufeff"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f"Cannot read edit plan JSON: {exc}") from exc
@@ -801,7 +779,7 @@ def _handle_source_edit(
     root = Path(args.path).resolve()
     plan = _read_source_edit_plan(args.plan, root=root)
     with closing(MemoryGraph.open(Path(args.storage), config=config, read_only=True,
-                                  defer_lexical_index=True, lock_timeout_seconds=0.05)) as graph:
+                                  defer_lexical_index=True, lock_timeout_seconds=args.lock_timeout)) as graph:
         revision = graph.revisions.latest(project_id(str(root)))
     if revision is None:
         raise ValueError("No compiled source revision for this project. Run `reql project compile` from its root first.")
@@ -833,22 +811,6 @@ def _print_source_edit(result: SourceEditResult) -> None:
         print(f"Unchanged {path}")
 
 
-def _print_verification(result: dict[str, Any]) -> None:
-    prefix = "Reused " if result["reused"] else ""
-    for check in result["checks"]:
-        count = f" ({check['tests']} tests)" if "tests" in check else ""
-        print(f"{prefix}{check['name']}: {'passed' if check['passed'] else 'failed'}{count}")
-        if not check["passed"] and check.get("error"):
-            print(check["error"])
-    if result["status"] == "passed" and not result["receipt"]:
-        print("Inputs changed while checks ran. Run again to retain a current receipt.")
-    if refresh := result.get("refresh"):
-        if refresh["status"] == "source_changed":
-            print("Inputs changed after verification. Verify the current source before completion.")
-        else:
-            _print_graph_refresh(refresh)
-
-
 def _print_graph_refresh(refresh: dict[str, Any]) -> None:
     """Render the incremental compilation outcome."""
     if refresh["status"] in {"failed", "completed"}:
@@ -858,78 +820,12 @@ def _print_graph_refresh(refresh: dict[str, Any]) -> None:
             print(error)
 
 
-def _verify_assigned_finish(
-    args: argparse.Namespace, config: REQLConfig, profile_logger: PerformanceLogger | None,
-    *, expected_plan: str | None = None,
-) -> dict[str, Any]:
-    """Run saved checks and verify their source still matches after the refresh."""
-    from memory.testing.evidence_store import TestEvidenceStore
-    from memory.testing.verification import receipt_matches_source, run_saved_checks
-
-    root = Path(args.path).resolve()
-    evidence = TestEvidenceStore(Path(args.storage))
-    result = run_saved_checks(root, evidence, task_id=args.task_id, timeout=300, expected_plan=expected_plan)
-    if result["status"] != "passed" or not result["receipt"]:
-        raise _VerifiedFinishRejected(result)
-    result["refresh"] = _refresh_project(args, config, profile_logger)
-    if result["refresh"]["status"] == "failed":
-        raise _VerifiedFinishRejected(result)
-    if not receipt_matches_source(root, evidence, result["receipt"]):
-        result["refresh"]["status"] = "source_changed"
-        raise _VerifiedFinishRejected(result)
-    return result
-
-
-def _handle_agent_finish(
-    args: argparse.Namespace, config: REQLConfig, workspace: ProgressingAgentWorkspace,
-    profile_logger: PerformanceLogger | None,
-) -> int:
-    """Verify the saved checks for an assigned task and publish its handoff."""
-    from memory.testing.evidence_store import (
-        TestEvidenceStore, VerificationEvidenceChanged, VerificationPlanChanged, verification_plan,
-    )
-
-    root = Path(args.path).resolve()
-    evidence = TestEvidenceStore(Path(args.storage))
-    saved = evidence.verification(str(root), args.task_id) if args.task_id else None
-    expected_plan = verification_plan(saved)["id"] if saved is not None else None
-    guard_receipt = None
-
-    def verify_finish() -> dict[str, Any]:
-        nonlocal guard_receipt
-        outcome = _verify_assigned_finish(args, config, profile_logger, expected_plan=expected_plan)
-        guard_receipt = outcome["receipt"]
-        return outcome
-
-    def completion_guard() -> AbstractContextManager[dict[str, Any]]:
-        return evidence.guard_verification_plan(str(root), args.task_id, expected_plan, verified=guard_receipt)
-
-    try:
-        result = workspace.finish(
-            args.summary, task_id=args.task_id,
-            before_finish=verify_finish if expected_plan is not None else None,
-            completion_guard=completion_guard if expected_plan is not None else None,
-        )
-    except _VerifiedFinishRejected as exc:
-        refresh_failed = exc.verification.get("refresh", {}).get("status") == "failed"
-        retry = _finish_command(workspace, args.task_id, summary=args.summary) if refresh_failed else None
-        if args.json:
-            _print_json({"status": "verification_failed", "verification": exc.verification,
-                         **({"retry_command": retry} if retry is not None else {})})
-        else:
-            _print_verification(exc.verification)
-            print(str(exc), file=sys.stderr)
-            if retry is not None:
-                print(f"Checks passed. When the refresh can run, retry this finish: {retry}", file=sys.stderr)
-        return 1
-    except (VerificationPlanChanged, VerificationEvidenceChanged) as exc:
-        _print_agent_command_error(exc, args, recovery="Recover the current task brief and review its checks.")
-        return 2
+def _handle_agent_finish(args: argparse.Namespace, workspace: ProgressingAgentWorkspace) -> int:
+    """Publish the agent's handoff and optionally complete its assigned task."""
+    result = workspace.finish(args.summary, task_id=args.task_id)
     if args.json:
         _print_json(result)
     else:
-        if verified := result.get("verification"):
-            _print_verification(verified)
         print(f"Agent finished: {result['agent_id']}\tclosed_session={result.get('closed_session_id') or 'none'}")
         _print_agent_retention(result.get("retention") or {})
         if task := result.get("completed_task"):
@@ -997,7 +893,7 @@ def _handle_project_pipeline(context: CommandContext) -> int:
         if output_format == "mermaid":
             written = write_pipeline_mermaid(pipeline, output_path)
         else:
-            written = write_pipeline_html(pipeline, output_path)
+            written = write_pipeline_html(pipeline, output_path, policy=context.config.reporting.html)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1061,6 +957,19 @@ def _handle_project_compile(context: CommandContext) -> int:
     result = graph.compile_project(args.path, **compile_kwargs)
     _print_compile_result(result)
     return 0 if not result.run.errors else 1
+
+
+def _timeout_seconds(value: str) -> float:
+    """Validate a finite timeout before opening a store."""
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("timeout must be finite and non-negative")
+    return seconds
+
+
+def _add_lock_timeout(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--lock-timeout", type=_timeout_seconds, metavar="SECONDS",
+                        help="Wait up to this many seconds for each graph open")
 
 
 def _configure_tests_for(parser: argparse.ArgumentParser) -> None:
@@ -1154,7 +1063,10 @@ def _handle_project_diff(context: CommandContext) -> int:
 
 def _handle_project_report(context: CommandContext) -> int:
     args = context.args
-    files = context.graph.project_report(args.path, output_dir=args.output or context.config.reporting.output_dir)
+    files = context.graph.project_report(
+        args.path, output_dir=args.output or context.config.reporting.output_dir,
+        config_path=_effective_config_path(args),
+    )
     if args.json:
         _print_json(files.to_dict())
     else:
@@ -1188,10 +1100,13 @@ def _handle_query_context(context: CommandContext) -> int:
             include_archived=args.include_archived,
             include_source=args.source,
             task_id=args.task_id,
+            seen_source=map(SeenSourceRange.parse, args.seen_source),
         )
         brief = args.brief and not args.json
         if args.follow_up and (not brief or request.task_id is None):
             raise ValueError("--follow-up requires --task and --brief text output")
+        if request.seen_source and not args.follow_up:
+            raise ValueError("--seen-source requires --follow-up")
         result = (context.graph.query_context_service.execute(request, brief=True, follow_up=args.follow_up)
                   if brief else context.graph.query_context_result(request))
     except (TypeError, ValueError) as exc:
@@ -1246,7 +1161,7 @@ def _handle_query_memories(context: CommandContext) -> int:
     return 0
 
 
-_MUTATING_REQL_COMMANDS = {"COMMUNITIES", "HUBS"}
+_MUTATING_REQL_COMMANDS = {"ACTIVATE", "COMMUNITIES", "HUBS"}
 
 
 def _query_access_mode(args: argparse.Namespace) -> AccessMode:
@@ -1380,7 +1295,7 @@ def _handle_export(context: CommandContext) -> int:
     args = context.args
     payload = context.graph.export_json()
     if args.html:
-        html_path = write_graph_html(payload, _graph_html_path(args.out))
+        html_path = write_graph_html(payload, _graph_html_path(args.out), config=context.config)
         print(html_path)
         if args.json:
             json_path = html_path.with_name("graph.json")
@@ -1445,7 +1360,8 @@ def _open(
         with (profile_logger.span("storage.open", path=str(path), read_only=True) if profile_logger else nullcontext()):
             return MemoryGraph.open(
                 path, config=config, profile_logger=profile_logger, read_only=True, defer_lexical_index=True,
-                lock_timeout_seconds=0.05,
+                allow_empty_read_only=mode is AccessMode.READ_ONLY_OR_EMPTY,
+                lock_timeout_seconds=getattr(args, "lock_timeout", None),
             )
     except StorageError as exc:
         if not str(exc).startswith("Cannot open missing REQL storage in read-only mode:"):
@@ -1465,6 +1381,7 @@ def _open_write_graph(
     compiling: bool,
 ) -> MemoryGraph:
     """Open the canonical graph; the compiler checkpoints after applying its changes."""
+    lock_timeout = getattr(args, "lock_timeout", None)
     if profile_logger:
         profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=False)
         with profile_logger.span("storage.open", path=str(args.storage), read_only=False):
@@ -1473,9 +1390,11 @@ def _open_write_graph(
                 config=config,
                 profile_logger=profile_logger,
                 defer_lexical_index=compiling,
+                lock_timeout_seconds=lock_timeout,
             )
     else:
-        graph = MemoryGraph.open(Path(args.storage), config=config, defer_lexical_index=compiling)
+        graph = MemoryGraph.open(Path(args.storage), config=config, defer_lexical_index=compiling,
+                                 lock_timeout_seconds=lock_timeout)
     if not compiling:
         try:
             _checkpoint_opened_store_if_needed(graph, profile_logger)
@@ -1556,8 +1475,11 @@ def _add_query_memories_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_query_context_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--query", required=True)
+    _add_lock_timeout(parser)
     parser.add_argument("--task", dest="task_id", help="Attach the named task or checkpoint and its causal work")
     parser.add_argument("--follow-up", action="store_true", help="Find missing evidence without repeating the task brief")
+    parser.add_argument("--seen-source", action="append", default=[], metavar="PATH#LSTART-LEND@SHA256",
+                        help="Omit a verified source range already displayed by the task brief")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH)
     parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS, help="Maximum rendered context items")
@@ -1659,7 +1581,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         path=("project", "compile"),
         access=AccessMode.MUTATING,
         help="Scan and incrementally compile dirty artifacts",
-        configure_parser=None,
+        configure_parser=_add_lock_timeout,
         handler=_handle_project_compile,
     ),
     CommandSpec(
@@ -1699,7 +1621,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         path=("project", "report"),
-        access=AccessMode.MUTATING,
+        access=AccessMode.READ_ONLY_OR_EMPTY,
         help="Write project Markdown reports",
         configure_parser=_configure_project_report_parser,
         handler=_handle_project_report,
@@ -1835,7 +1757,9 @@ def build_parser() -> argparse.ArgumentParser:
     assignment.add_argument("--next", dest="next_task", action="store_true", help="Claim the next ready task and return its brief")
     agent_init.add_argument("--workstream", help="Filter the ready queue by an exact workstream (requires --next)")
     agent_init.add_argument("--query", help="Include brief code and linked work context for the assigned task")
+    agent_init.add_argument("--source", action="store_true", help="Embed current source bodies in the context result")
     agent_init.add_argument("--json", action="store_true", help="Print structured JSON result")
+    _add_lock_timeout(agent_init)
     from memory.services.coordination import KINDS
 
     record_kinds = KINDS - {"task"}
@@ -1886,17 +1810,27 @@ def build_parser() -> argparse.ArgumentParser:
     agent_show = agent_sub.add_parser("show", help="Show an agent-owned item")
     agent_show.add_argument("id")
     agent_show.add_argument("--json", action="store_true", help="Print structured JSON result")
+    from memory.services.coordination import STATUSES
+
+    agent_wait = agent_sub.add_parser("wait", help="Wait for a shared work record to reach a status")
+    agent_wait.add_argument("id")
+    agent_wait.add_argument("--status", action="append", choices=sorted(STATUSES),
+                            help="Accept this status (repeatable, defaults to done or resolved)")
+    agent_wait.add_argument("--timeout", type=_timeout_seconds, default=60.0, metavar="SECONDS")
+    agent_wait.add_argument("--json", action="store_true", help="Print the last record and whether its status matched")
+    agent_verify = agent_sub.add_parser("verify", help="Run focused and broad checks from an explicit plan")
+    agent_verify.add_argument("--plan", required=True, help="JSON plan path, or - for standard input")
+    agent_verify.add_argument("--json", action="store_true", help="Print structured check outcomes")
     agent_list = agent_sub.add_parser("list", help="List active agents")
     agent_list.add_argument("--all", dest="all_agents", action="store_true", help="Include finished and terminated agents")
     agent_list.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_dashboard = agent_sub.add_parser("dashboard", help="Read shared and selected private dashboards")
-    agent_dashboard.add_argument("--limit", type=int, default=5, help="Maximum items per dashboard section (1-20)")
+    agent_dashboard.add_argument("--limit", type=int, help="Maximum items per dashboard section")
     agent_dashboard.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_finish = agent_sub.add_parser("finish", help="Run saved task checks and publish the final handoff")
+    agent_finish = agent_sub.add_parser("finish", help="Publish the final handoff and optionally complete an assigned task")
     agent_finish.add_argument("summary", help="Save the outcome, checks, blockers, and next action in a shared checkpoint")
     agent_finish.add_argument("--task", dest="task_id", default=None, help="Complete an assigned task and clear its next action before finish")
     agent_finish.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_finish.set_defaults(path=".")
     agent_terminate = agent_sub.add_parser("terminate", help="Force-terminate a stale agent and release its private store")
     agent_terminate.add_argument("agent_id")
     agent_terminate.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -1928,6 +1862,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--path", default=".", help="Project root")
     edit.add_argument("--plan", required=True, help="File with a JSON array of line edits, or - for stdin")
     edit.add_argument("--json", action="store_true", help="Print changed paths, unchanged paths, and refresh status as JSON")
+    _add_lock_timeout(edit)
 
     storage = sub.add_parser("storage", help="Storage commands: inspect, locks, compact, clear")
     storage.set_defaults(path=".")
@@ -1939,8 +1874,7 @@ def build_parser() -> argparse.ArgumentParser:
     storage_compact.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_inspect = storage_sub.add_parser("inspect", help="Inspect block layout, compression, dense nodes, and indexes")
     storage_inspect.add_argument("--json", action="store_true", help="Print structured JSON result")
-    storage_locks = storage_sub.add_parser("locks", help="Inspect lock owners, liveness, duration, and stale status")
-    storage_locks.add_argument("--recover-stale", action="store_true", help="Remove only locks proven stale; incomplete local locks require a safety grace period")
+    storage_locks = storage_sub.add_parser("locks", help="Inspect the current store lock mode")
     storage_locks.add_argument("--json", action="store_true", help="Print structured JSON result")
 
     _configure_declared_commands(
@@ -2116,7 +2050,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "project" and args.project_command == "context":
-        return _handle_project_context(args)
+        return _handle_project_context(args, config)
 
     if args.command == "edit":
         return _handle_source_edit(args, config, profile_logger)
@@ -2146,15 +2080,38 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         if args.agent_command == "show":
             from memory.services.coordination import CoordinationStore
-            shared = CoordinationStore(Path(args.storage).with_name("agent-dashboard.reql"))
+            shared = CoordinationStore.for_project(args.storage, config=config)
             item = shared.find(args.id)
             if item is not None:
                 if args.json:
                     _print_json({"kind": "node", "node": item})
                 else:
                     from memory.services.coordination import render_work_context
-                    print(render_work_context(shared.context(record_id=args.id, limit=1, include_history=True), record_id=args.id))
+                    print(render_work_context(shared.context(record_id=args.id, limit=1, include_history=True),
+                                              record_id=args.id))
                 return 0
+        if args.agent_command == "verify":
+            return _handle_agent_verify(args, config)
+        if args.agent_command == "wait":
+            from memory.services.coordination import CoordinationStore
+
+            shared = CoordinationStore.for_project(args.storage, config=config)
+            try:
+                row, matched = shared.wait_for_status(
+                    args.id, frozenset(args.status or ("done", "resolved")), timeout_seconds=args.timeout,
+                )
+            except ValueError as exc:
+                _print_agent_command_error(exc, args)
+                return 2
+            if args.json:
+                _print_json({"matched": matched, "node": row})
+            elif row is not None:
+                print(f"{row['id']}\t{row['status']}\tr{row['revision']}")
+                if not matched:
+                    print("Requested status was not reached.", file=sys.stderr)
+            else:
+                print("Timed out waiting to read shared work.", file=sys.stderr)
+            return 0 if matched else 1
         if args.agent_command == "search":
             result = AgentWorkspace.search_dashboards(args.storage, args.query, limit=args.limit, config=config)
             if args.json:
@@ -2256,14 +2213,14 @@ def _main(argv: list[str] | None = None) -> int:
                     _print_agent_dashboard(result)
                 return 0
             if args.agent_command == "finish":
-                return _handle_agent_finish(args, config, workspace, profile_logger)
+                return _handle_agent_finish(args, workspace)
         except ValueError as exc:
             _print_agent_command_error(exc, args)
             return 2
 
     if args.command == "storage":
         if args.storage_command == "locks":
-            payload = inspect_store_locks(Path(args.storage), recover_stale=args.recover_stale)
+            payload = inspect_store_locks(Path(args.storage))
             if args.json:
                 _print_json(payload)
             else:
@@ -2286,7 +2243,8 @@ def _main(argv: list[str] | None = None) -> int:
         read_only = args.storage_command == "inspect"
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=read_only)
-        store = BlockGraphStore(Path(args.storage), read_only=read_only)
+        store = BlockGraphStore(Path(args.storage), read_only=read_only, policy=config.storage,
+                                lexical_config=config.lexical)
         try:
             if args.storage_command == "inspect":
                 if profile_logger:

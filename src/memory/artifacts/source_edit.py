@@ -1,7 +1,7 @@
-"""Apply bounded UTF-8 line replacements against a verified source revision."""
+"""Apply line replacements against a verified source revision."""
 from __future__ import annotations
 
-from codecs import BOM_UTF8
+from codecs import BOM_UTF8, BOM_UTF16_BE
 from collections.abc import Collection
 from dataclasses import dataclass
 from hashlib import sha256
@@ -12,12 +12,10 @@ from tempfile import TemporaryDirectory
 from typing import Any, TypedDict
 
 from ..storage import StoreLease
-from .fingerprint import normalize_relative_lookup_path, project_id, read_bounded_file
+from .fingerprint import normalize_relative_lookup_path, project_id
 from .revision import ProjectRevision
-
-
-MAX_PLAN_CHARS = 192 * 1024
-MAX_EDITED_BYTES = 4 * 1024 * 1024
+from .scanner import fingerprint_file
+from .text_encoding import TEXT_SAMPLE_BYTES, utf16_encoding
 
 
 class SourceEditResult(TypedDict):
@@ -43,8 +41,8 @@ class AnchoredEdit:
 
 
 def _plan(value: Any) -> dict[str, list[LineEdit | AnchoredEdit]]:
-    if not isinstance(value, list) or not 1 <= len(value) <= 32:
-        raise ValueError("An edit plan must contain between one and 32 line edits in a JSON array")
+    if not isinstance(value, list) or not value:
+        raise ValueError("An edit plan must contain one or more line edits in a JSON array")
     result: dict[str, list[LineEdit | AnchoredEdit]] = {}
     for item in value:
         if not isinstance(item, dict) or item.keys() not in (
@@ -96,10 +94,17 @@ def _anchored_range(edit: AnchoredEdit, lines: str, path: str) -> LineEdit:
 
 
 def _splice(raw: bytes, edits: list[LineEdit | AnchoredEdit], path: str) -> bytes:
+    encoding = utf16_encoding(raw[:TEXT_SAMPLE_BYTES]) or "utf-8"
+    bom = b""
+    if encoding == "utf-16":
+        bom = raw[:2]
+        encoding = "utf-16-be" if bom == BOM_UTF16_BE else "utf-16-le"
+    elif encoding == "utf-8" and raw.startswith(BOM_UTF8):
+        bom = BOM_UTF8
     try:
-        source = raw.decode("utf-8-sig")
+        source = raw[len(bom):].decode(encoding)
     except UnicodeError as exc:
-        raise ValueError(f"Source edit requires UTF-8: {path}") from exc
+        raise ValueError(f"Source edit requires UTF-8 or UTF-16: {path}") from exc
     if "\x00" in source:
         raise ValueError(f"Source edit requires text: {path}")
     lines = source.splitlines(keepends=True)
@@ -134,8 +139,7 @@ def _splice(raw: bytes, edits: list[LineEdit | AnchoredEdit], path: str) -> byte
         if rendered and end == len(lines) and not has_final_ending:
             rendered[-1] = replacement[-1]
         lines[start:end] = rendered
-    data = "".join(lines).encode("utf-8")
-    return BOM_UTF8 + data if raw.startswith(BOM_UTF8) else data
+    return bom + "".join(lines).encode(encoding)
 
 
 def apply_source_edits(root: Path, revision: ProjectRevision, value: Any, *,
@@ -154,23 +158,27 @@ def apply_source_edits(root: Path, revision: ProjectRevision, value: Any, *,
     changed: list[str] = []
     unchanged: list[str] = []
 
-    def original(relative: str) -> tuple[Path, bytes]:
+    def indexed_path(relative: str) -> Path:
         path = root / relative
         if relative not in revision.manifest or path.resolve() != path or not path.is_file():
             raise ValueError(f"Source edit needs a regular indexed file in the workspace: {relative}")
-        raw = read_bounded_file(path, MAX_EDITED_BYTES)
-        if raw is None or sha256(raw).hexdigest() != revision.manifest[relative]["sha256"]:
-            raise ValueError(f"Source changed or exceeds the edit limit: {relative}")
-        return path, raw
+        return path
+
+    def verify_digest(relative: str, digest: str | None) -> None:
+        if digest != revision.manifest[relative]["sha256"]:
+            raise ValueError(f"Source changed since compilation: {relative}")
 
     try:
-        with StoreLease(private / "source-edit", timeout_seconds=2.0), TemporaryDirectory(dir=private) as folder:
+        with (
+            StoreLease(private / "source-edit", blocking=True),
+            TemporaryDirectory(dir=private) as folder,
+        ):
             staged = []
             for relative, edits in plan.items():
-                path, raw = original(relative)
+                path = indexed_path(relative)
+                raw = path.read_bytes()
+                verify_digest(relative, sha256(raw).hexdigest())
                 updated = _splice(raw, edits, relative)
-                if len(updated) > MAX_EDITED_BYTES:
-                    raise ValueError(f"Edited file exceeds the size limit: {relative}")
                 if updated == raw:
                     unchanged.append(relative)
                     continue
@@ -179,7 +187,8 @@ def apply_source_edits(root: Path, revision: ProjectRevision, value: Any, *,
                 temporary.chmod(S_IMODE(path.stat().st_mode))
                 staged.append((relative, path, temporary))
             for relative, path, temporary in staged:
-                original(relative)
+                _, digest, _ = fingerprint_file(indexed_path(relative))
+                verify_digest(relative, digest)
                 os.replace(temporary, path)
                 changed.append(relative)
     except (OSError, ValueError) as exc:

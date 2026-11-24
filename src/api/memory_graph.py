@@ -7,7 +7,6 @@ from typing import Any, TypeVar
 
 from memory.config import REQLConfig, default_config
 from memory.diagnostics import PerformanceLogger
-from memory.domain.exceptions import StorageError
 from memory.domain.models import (
     ActivationOptions,
     ActivationResult,
@@ -44,21 +43,10 @@ from memory.services.failure_context import FailureContextService
 from memory.services.retrieval import RetrievalEngine
 from memory.explanation import RepositoryExplanation, RepositoryExplanationService
 from memory.pipeline import ProjectPipeline, ProjectPipelineService
-from memory.testing import TestAssociation, TestIntelligenceService
+from memory.testing import TestAssociation
 
 
 MemoryGraphT = TypeVar("MemoryGraphT", bound="MemoryGraph")
-
-
-def _ensure_readable_storage_payload(path: Path) -> None:
-    wal_path = path.with_name(f"{path.name}.wal")
-    try:
-        has_store_payload = path.exists() and path.stat().st_size > 0
-        has_wal_payload = wal_path.exists() and wal_path.stat().st_size > 0
-    except OSError as exc:
-        raise StorageError(f"Cannot inspect REQL storage at {path}: {exc}") from exc
-    if not has_store_payload and not has_wal_payload:
-        raise StorageError(f"Cannot open missing REQL storage in read-only mode: {path}")
 
 
 def _scan_workspace(
@@ -106,28 +94,33 @@ class MemoryGraph:
         self.store = store
         self.config = config or default_config()
         self.profile_logger = profile_logger
-        self.extractor = extractor or DeterministicExtractor()
-        self.activation = ActivationEngine(store)
-        self.retrieval = RetrievalEngine(store, self.extractor, profile_logger=profile_logger)
-        self.query_context_service = QueryContextService(self.retrieval)
-        self.salience = SalienceEngine(store)
-        self.project_reporter = ProjectReportGenerator(store)
+        self.extractor = extractor or DeterministicExtractor(
+            policy=self.config.lexical.seeds, normalization=self.config.lexical.normalization,
+        )
+        analysis = self.config.analysis
+        self.activation = ActivationEngine(store, policy=analysis.activation)
+        self.retrieval = RetrievalEngine(store, self.extractor, profile_logger=profile_logger, config=self.config)
+        self.query_context_service = QueryContextService(self.retrieval, config=self.config)
+        self.salience = SalienceEngine(store, policy=analysis.salience)
         self.projects = ProjectRegistry(store)
-        self.test_intelligence = TestIntelligenceService(store)
+        self.test_intelligence = self.retrieval.test_intelligence
         self.revisions = RevisionRepository(store)
-        self.repository_explainer = RepositoryExplanationService(store)
-        self.project_pipeline_service = ProjectPipelineService(store)
+        self.repository_explainer = RepositoryExplanationService(store, config=analysis)
+        self.project_pipeline_service = ProjectPipelineService(store, config=analysis)
         self.incremental = IncrementalCompilationService(
             store,
             compile_options=CompilationOptions.from_config(self.config),
+            scan_config=self.config.scan,
+            cache_enabled=self.config.cache.enabled,
             retention_commits=self.config.retention.commits,
             profile_logger=profile_logger,
         )
+        self.project_reporter = ProjectReportGenerator(store, compilation=self.incremental, config=self.config)
         from memory.analysis.communities import CommunityDetector
         from memory.analysis.hubs import HubAnalyzer
 
-        self.community_detector = CommunityDetector(store)
-        self.hub_analyzer = HubAnalyzer(store)
+        self.community_detector = CommunityDetector(store, policy=analysis.communities)
+        self.hub_analyzer = HubAnalyzer(store, config=analysis)
 
     @classmethod
     def open(
@@ -140,21 +133,18 @@ class MemoryGraph:
         read_only: bool = False,
         defer_lexical_index: bool = False,
         lock_timeout_seconds: float | None = None,
+        allow_empty_read_only: bool = False,
+        wait_for_lock: bool = False,
     ) -> MemoryGraphT:
-        storage_path = Path(path).expanduser()
-        if read_only:
-            _ensure_readable_storage_payload(storage_path)
-        options: dict[str, Any] = {
-            "read_only": read_only,
-            "defer_lexical_index": defer_lexical_index,
-        }
-        if lock_timeout_seconds is not None:
-            options["lock_timeout_seconds"] = lock_timeout_seconds
-        elif read_only:
-            options["lock_timeout_seconds"] = 0.05
-        store = BlockGraphStore(storage_path, **options)
+        """Open graph storage with the selected access and lock policy."""
+        selected_config = config or default_config()
+        store = BlockGraphStore(
+            path, read_only=read_only, allow_empty_read_only=allow_empty_read_only,
+            defer_lexical_index=defer_lexical_index, lock_timeout_seconds=lock_timeout_seconds,
+            wait_for_lock=wait_for_lock, policy=selected_config.storage, lexical_config=selected_config.lexical,
+        )
         try:
-            return cls(store, extractor=extractor, config=config, profile_logger=profile_logger)
+            return cls(store, extractor=extractor, config=selected_config, profile_logger=profile_logger)
         except Exception:
             store.close()
             raise
@@ -396,14 +386,17 @@ class MemoryGraph:
             ActivationOptions(max_depth=max_depth, min_activation=min_activation),
         )
 
-    def project_report(self, path: str | Path, *, output_dir: str | Path) -> ProjectReportFiles:
-        return self.project_reporter.write_reports(path, output_dir=output_dir)
+    def project_report(
+        self, path: str | Path, *, output_dir: str | Path, config_path: str | Path | None = None,
+    ) -> ProjectReportFiles:
+        """Write reports using the same source and cache policy as compilation."""
+        return self.project_reporter.write_reports(path, output_dir=output_dir, config_path=config_path)
 
     def export_json(self) -> dict[str, Any]:
         return self.store.export_json()
 
     def export_html(self, output_path: str | Path) -> Path:
-        return write_graph_html(self.export_json(), output_path)
+        return write_graph_html(self.export_json(), output_path, config=self.config)
 
     def query(self, statement: str):
         """Execute a REQL statement.
@@ -474,12 +467,12 @@ class MemoryGraph:
 
     def failure_context(self, query: str = "", *, files: list[str] | None = None,
                         symbol_ids: list[str] | None = None, record_id: str | None = None,
-                        workstream: str | None = None, limit: int = 5) -> dict[str, Any]:
+                        workstream: str | None = None, limit: int | None = None) -> dict[str, Any]:
         """Recover scoped failure records from the associated engineering store."""
         storage = getattr(self.store, "path", None)
         if storage is None:
             raise ValueError("Failure context requires a persistent engineering store")
-        work = CoordinationStore(Path(storage).with_name("agent-dashboard.reql"))
+        work = CoordinationStore.for_project(storage, config=self.config)
         return FailureContextService(work, self.store).context(query, files=files, symbol_ids=symbol_ids,
                                                                record_id=record_id, workstream=workstream, limit=limit)
 
@@ -533,16 +526,15 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-        max_file_size_bytes: int = 10 * 1024 * 1024,
+        max_file_size_bytes: int | None = None,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
-        cache_enabled: bool = True,
+        cache_enabled: bool | None = None,
         parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         return self.incremental.compile_path(
             path,
-
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
@@ -555,17 +547,16 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-        max_file_size_bytes: int = 10 * 1024 * 1024,
+        max_file_size_bytes: int | None = None,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
-        cache_enabled: bool = True,
+        cache_enabled: bool | None = None,
         parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         """Incrementally update a project through the compile pipeline."""
         return self.compile_project(
             path,
-
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
@@ -578,16 +569,15 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-        max_file_size_bytes: int = 10 * 1024 * 1024,
+        max_file_size_bytes: int | None = None,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
-        cache_enabled: bool = True,
+        cache_enabled: bool | None = None,
         parsing_options: CompilationOptions | None = None,
     ) -> dict[str, object]:
         return self.incremental.cache_status(
             path,
-
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
@@ -616,13 +606,13 @@ class MemoryGraph:
     def analyze_hubs(
         self,
         project_id: str | None = None,
-        limit: int = 20,
+        limit: int | None = 20,
         node_types: set[str] | None = None,
     ) -> HubReport:
         return self.hub_analyzer.analyze(project_id=project_id, limit=limit, node_types=node_types)
 
-    def explain_hub(self, node_id: str):
-        return self.hub_analyzer.explain(node_id)
+    def explain_hub(self, node_id: str, *, complete: bool = False):
+        return self.hub_analyzer.explain(node_id, complete=complete)
 
     def add_node(self, node: MemoryNode) -> tuple[MemoryNode, bool]:
         return self.store.upsert_node(node)

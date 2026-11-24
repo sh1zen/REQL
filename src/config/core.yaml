@@ -1,0 +1,326 @@
+# Internal policy for extraction, retrieval, graph queries, and storage.
+
+lexical:
+  normalization:
+    fold_accents: true
+    split_identifiers: true
+    expand_plurals: true
+    min_token_chars: 2
+    min_token_signal: 0
+    phrase_min_signal: 0.5
+    phrase_frequency: 1.25
+    phrase_specificity: 1.15
+    sentence_clause_chars: 260
+  seeds:
+    topic_candidates: 14
+    topic_limit: 10
+    signature_topics: 8
+    topic_min_chars: 3
+    topic_min_signal: 0.45
+    entity_limit: 16
+    entity_confidence: 0.65
+    quoted_entities: true
+    capitalized_entities: true
+    structured_entities: true
+    quality_base: 0.25
+    quality_per_topic: 0.15
+    quality_per_entity: 0.15
+  documents:
+    max_terms: 32
+    max_relations: 96
+    max_events_per_term: 2
+    frequency_weight: 0.48
+    specificity_weight: 0.34
+    distribution_weight: 0.18
+    phrase_boost: 0.14
+    ubiquitous_factor: 0.85
+    ubiquitous_min_fragments: 3
+    bigram_min_signal: 0.5
+    trigram_min_signal: 0.65
+    bigram_frequency: 1.4
+    trigram_frequency: 1.8
+    token_min_signal: 0.45
+    phrase_min_signal: 0.35
+    event_frequency_boost: 0.25
+    relation_frequency_weight: 0.55
+    relation_term_weight: 0.45
+    relation_min_rank: 0.18
+  index:
+    metadata_weight: 1.2
+    token_base_weight: 0.3
+    token_signal_weight: 0.55
+    token_rarity_weight: 0.15
+    salience_bonus: 0.15
+    phrase_query_weight: 1.35
+    idf_base_weight: 0.2
+    idf_weight: 0.8
+    compound_coverage: 0.75
+    normalized_score_weight: 0.85
+    matched_term_bonus: 0.02
+
+retrieval:
+  search:
+    exact_path_score: 1.0
+    exact_symbol_score: 1.0
+    field_owner_score: 0.7
+    field_owner_match_floor: 0.36
+    topic_seed_base: 0.55
+    topic_seed_weight: 0.4
+    entity_seed_base: 0.6
+    entity_seed_weight: 0.35
+    exact_symbol_match_floor: 0.4
+    identifier_min_chars: 3
+    informative_min_chars: 3
+    strong_identifier_signal: 0.85
+    phrase_min_chars: 4
+    phrase_word_signal: 0.75
+    phrase_full_coverage: 0.5
+    phrase_high_coverage: 0.75
+    phrase_medium_coverage: 0.5
+    high_phrase_min_coverage: 0.5
+    medium_phrase_min_coverage: 0.4
+    high_token_coverage: 0.75
+    medium_token_coverage: 0.5
+    identifier_phrase_coverage_floor: 0.9
+    text_phrase_coverage_floor: 0.9
+    prefix_coverage_floor: 0.8
+    strong_coverage_floor: 0.55
+    source_min_coverage: 0.5
+    weak_overlap_count: 1
+    weak_overlap_ratio: 0.25
+    exact_topic: 0.98
+    exact_text: 0.94
+    exact_identifier: 0.92
+    identifier_phrase: 0.86
+    identifier_full_with_phrase: 0.82
+    identifier_full: 0.78
+    text_phrase: 0.86
+    text_prefix: 0.78
+    text_full_with_phrase: 0.76
+    text_full: 0.7
+    phrase_high: 0.68
+    phrase_medium: 0.58
+    strong_overlap: 0.64
+    coverage_high: 0.56
+    coverage_medium: 0.4
+    coverage_partial_limit: 0.38
+    coverage_partial_weight: 0.16
+    coverage_phrase_weight: 0.18
+    source_coverage_weight: 0.3
+    type_bonuses: {"Function":0.1,"Method":0.1,"Class":0.1,"Interface":0.1,"Module":0.1,"SourceArtifact":0.07,"File":0.07,"Endpoint":0.07,"Schema":0.07,"Config":0.07,"Test":0.07,"Variable":0.04,"Import":0.04,"Dependency":0.04,"StaticAnalysisFinding":0.04,"SourceFragment":0.02,"DocumentFragment":0.02}
+  ranking:
+    min_edge_weight: 0.01
+    context_min_edge_weight: 0.25
+    unresolved_edge_factor: 0.35
+    step_previous_weight: 0.55
+    step_coverage_weight: 0.25
+    step_edge_weight: 0.2
+    path_edge_weight: 0.6
+    path_coverage_weight: 0.4
+    direct_weight: 0.52
+    coverage_weight: 0.28
+    path_weight: 0.14
+    seed_weight: 0.06
+    depth_penalty_max: 0.3
+    depth_penalty_per_hop: 0.08
+    linked_source_penalty: 0.08
+    unlinked_source_penalty: 0.16
+    weak_path_min_coverage: 0.35
+    weak_match_min_score: 0.1
+    weak_query_min_terms: 4
+    exact_symbol_bonus: 0.18
+    exact_owner_bonus: 0.24
+    resolved_edge_bonus: 0.18
+  source:
+    brief_max_source_chars: 12000
+    setup_headings: []
+    setup_preferred_paths: []
+  context:
+    min_confidence: 0.25
+  explore:
+    owner_edges: ["CONTAINS","DEFINES","EVIDENCED_BY","HAS_FINDING","METHOD"]
+    caller_edges: ["CALLS","INSTANTIATES"]
+    public_surface_edges: ["HANDLES_ROUTE","IMPLEMENTS","IMPORTS","IMPORTS_FROM","RE_EXPORTS"]
+    serialization_edges: ["READS","WRITES","RETURNS","RAISES","REFERENCES","EVIDENCED_BY","DEPENDS_ON","IMPORTS_FROM"]
+    owner_nodes: ["Module","Function","Class","Interface","Method","Endpoint","Schema","Config","StaticAnalysisFinding"]
+    public_surface_nodes: ["Module","Class","Interface","Endpoint","Schema","Import","Function","Method"]
+    docs_edges: ["REFERENCES","EVIDENCED_BY","DERIVED_FROM","HAS_DOCSTRING","HAS_COMMENT"]
+    docs_nodes: ["SourceFragment","DocumentFragment","Docstring","Comment"]
+    duplicate_min_tags: 3
+    duplicate_min_features: 2
+    duplicate_similarity: 0.5
+
+query:
+  path:
+    edge_weight: 0.85
+    salience_weight: 0.15
+  defaults:
+    activate_min: 0.03
+    explain_hub_columns: ["node_id","node_type","label","hub_score","hub_rank","is_hub","reasons"]
+    communities_columns: ["id","label","size","density","salience"]
+    hubs_columns: ["rank","id","type","label","hub_score","specificity","generic_penalty","reason"]
+    stats_columns: ["nodes", "edges"]
+    cache_columns: ["project_id","total_entries","active_entries","archived_entries","cached_artifacts","latest_compiled_at"]
+    node_columns: ["id","type","label","text","status","salience","confidence","activation"]
+    edge_columns: ["id","type","from_id","to_id","weight","confidence","polarity","origin"]
+    search_columns: ["rank","score","id","type","label","text","salience","confidence","activation"]
+    retrieve_columns: ["rank","score","id","type","label","text","source_for","relation","direction","relative_path","line_start","line_end"]
+    match_columns: ["a.id","a.type","a.label","r.type","r.weight","b.id","b.type","b.label"]
+    activate_columns: ["id","type","label","text","activation","salience","confidence"]
+    path_columns: ["length","score","node_ids","node_labels","edge_types","edge_ids"]
+    explain_node_columns: ["node_id","node_type","direction","edge_type","weight","confidence","neighbor_id","neighbor_type","neighbor_label"]
+    explain_search_columns: ["rank","score","id","type","label","text","reasons"]
+    verify_finding_columns: ["finding","minimal_snippet","uses_found","scopes_checked","risks","recommended_action"]
+    projects_columns: ["id","name","root_path","status","updated_at"]
+    artifacts_columns: ["id","relative_path","path","artifact_type","language","status","size_bytes","sha256"]
+    fragments_columns: ["id","artifact_id","fragment_type","section_path","start_line","end_line","status","text"]
+    symbols_columns: ["id","type","name","qualified_name","relative_path","start_line","end_line","status"]
+    findings_columns: ["id","finding_type","severity","symbol_type","symbol_name","qualified_name","relative_path","directory","file_count","files","line_start","cleanup_priority","cleanup_rank","evidence_scope","confidence","reason","status"]
+    deltas_columns: ["id","run_id","project_id","artifact_id","created_at","added_nodes","updated_nodes","archived_nodes"]
+
+analysis:
+  enable_hubs: true
+  enable_communities: true
+  activation:
+    blocked_edge_types: ["EXTRACTED_FROM", "COMPILED_IN", "AFFECTED_BY_DELTA"]
+    negative_edge_types: ["INHIBITS", "SUPPRESSES", "BLOCKS", "WEAKENS"]
+    min_edge_weight: 0.01
+    latent_factor: 0.35
+    negative_factor: 0.75
+  salience:
+    half_life_days: 14.0
+    type_priors: {"Topic": 0.03, "Entity": 0.02, "Project": 0.05, "Directory": 0.04, "File": 0.08, "SourceArtifact": 0.08, "Module": 0.1, "Class": 0.11, "Interface": 0.1, "Function": 0.12, "Method": 0.12, "Endpoint": 0.12, "Schema": 0.1, "StaticAnalysisFinding": 0.12}
+    default_prior: 0.04
+    novelty_weight: 0.16
+    recency_weight: 0.12
+    centrality_weight: 0.24
+    code_priority_weight: 0.18
+    evidence_weight: 0.12
+    confidence_weight: 0.18
+    degree_saturation: 12.0
+    priority_saturation: 3.0
+    evidence_saturation: 5.0
+    inactive_factor: 0.25
+    signal_weight: 0.82
+    volatility_weight: 0.08
+  hubs:
+    min_score: 0.18
+    max_generic_penalty: 0.65
+    excluded_node_types: ["Community", "CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace"]
+    warning_generic_penalty: 0.45
+    warning_centrality: 0.5
+    degree_weight: 0.2
+    weighted_degree_weight: 0.15
+    activation_weight: 0.15
+    retrieval_weight: 0.15
+    salience_weight: 0.1
+    community_weight: 0.1
+    specificity_weight: 0.1
+    confidence_weight: 0.05
+    generic_penalty_weight: 0.2
+  bridges:
+    min_score: 0.3
+    max_generic_penalty: 0.45
+    min_communities: 2
+    excluded_node_types: ["Community", "CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace", "Bridge"]
+    ignored_edge_types: ["BELONGS_TO_COMMUNITY", "BRIDGES_COMMUNITY", "SUPPORTED_BY"]
+    community_saturation: 3.0
+    incident_saturation: 12.0
+    novelty_community_saturation: 4.0
+    centrality_community_weight: 0.55
+    centrality_incident_weight: 0.45
+    novelty_distance_weight: 0.75
+    novelty_community_weight: 0.25
+    utility_salience_weight: 0.35
+    utility_specificity_weight: 0.4
+    utility_evidence_weight: 0.25
+    randomness_min_evidence: 2
+    randomness_min_strength: 0.45
+    randomness_min_specificity: 0.35
+    randomness_min_distance: 0.25
+    randomness_count_penalty: 0.35
+    randomness_strength_penalty: 0.25
+    randomness_specificity_penalty: 0.2
+    randomness_distance_penalty: 0.2
+    distance_weight: 0.25
+    novelty_weight: 0.2
+    utility_weight: 0.2
+    evidence_weight: 0.15
+    centrality_weight: 0.1
+    specificity_weight: 0.1
+    randomness_weight: 0.25
+    generic_penalty_weight: 0.15
+  centrality:
+    activation_saturation: 20.0
+    community_saturation: 3.0
+    excluded_node_types: ["CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace"]
+    ignored_edge_types: ["BELONGS_TO_COMMUNITY", "BRIDGES_COMMUNITY"]
+  specificity:
+    generic_types: ["GraphDelta", "ArtifactCacheEntry", "SourceFragment", "URI"]
+    specific_types: ["Function", "Class", "Method", "Module", "SourceArtifact", "Concept", "File", "StaticAnalysisFinding"]
+    generic_artifact_types: ["binary", "unknown"]
+    specific_artifact_types: ["code", "markdown", "text"]
+    base_score: 0.35
+    concise_min_tokens: 2
+    concise_max_tokens: 8
+    overlong_min_tokens: 15
+    single_min_chars: 5
+    weak_max_chars: 3
+    topical_min_chars: 6
+    concise_bonus: 0.2
+    overlong_penalty: 0.1
+    single_bonus: 0.05
+    weak_token_weight: 0.35
+    weak_ratio_threshold: 0.45
+    topical_bonus: 0.15
+    specific_type_bonus: 0.15
+    generic_type_penalty: 0.25
+    external_symbol_penalty: 0.45
+    entropy_threshold: 1.5
+    entropy_penalty: 0.12
+    focused_bonus: 0.08
+    high_degree_threshold: 8
+    low_focus_threshold: 0.55
+    max_degree_penalty: 0.25
+    degree_saturation: 80.0
+    generic_artifact_penalty: 0.08
+    specific_artifact_bonus: 0.04
+    max_usage_bonus: 0.1
+    usage_saturation: 10.0
+  communities:
+    min_size: 2
+    excluded_node_types: ["Community", "CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace"]
+    ignored_edge_types: ["BELONGS_TO_COMMUNITY", "BRIDGES_COMMUNITY"]
+    bridge_weight: 0.7
+    bridge_confidence: 0.8
+  architecture:
+    source_roots: []
+    generic_capability_names: []
+    generic_owner_names: []
+    generic_module_names: []
+    symbol_suffixes: []
+    layer_precedence: ["interface", "application", "domain", "infrastructure"]
+    fallback_layer: "core"
+    application_tokens: []
+    domain_tokens: []
+    infrastructure_tokens: []
+    core_tokens: []
+    dominant_root_min_paths: 3
+    dominant_root_ratio: 0.55
+  workflow:
+    entry_names: []
+    entry_roles: ["command", "controller", "endpoint", "entrypoint", "handler", "public-api", "route"]
+    interface_path_tokens: []
+    excluded_names: []
+    infer_roots: true
+    generic_tokens: []
+    additional_semantic_suffixes: []
+    infrastructure_suffixes: []
+    orchestration_suffixes: []
+    policy_suffixes: []
+
+storage:
+  block_size_bytes: 65536
+  page_cache_blocks: 128
+  dense_node_threshold: 1024
+  checkpoint_wal_bytes: 8388608

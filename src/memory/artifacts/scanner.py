@@ -10,6 +10,7 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Iterable
 
+from ..config.policies import TestDiscoveryPolicy
 from ..config import (
     PROJECT_CONFIG_FILENAME,
     ScanConfig,
@@ -28,11 +29,11 @@ from .fingerprint import (
 )
 from .mime import classify_path, is_unsupported_media_file
 from .models import Project, ScanError, ScanResult, ScanSkippedFile, SourceArtifact
+from .text_encoding import TEXT_SAMPLE_BYTES
 
 _DEFAULT_SCAN_CONFIG = default_config().scan
 DEFAULT_MAX_FILE_SIZE_BYTES = _DEFAULT_SCAN_CONFIG.max_file_size_bytes
 _DEFAULT_EXCLUDE_RULES = tuple(resolve_scan_exclude_pattern(pattern) for pattern in _DEFAULT_SCAN_CONFIG.exclude)
-SAMPLE_BYTES = 8192
 SMALL_SCAN_MAX_FILES = 64
 SMALL_SCAN_WORKERS = 2
 MAX_SCAN_WORKERS = 8
@@ -57,14 +58,16 @@ class ProjectScanner:
     def __init__(
         self,
         *,
-        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
+        max_file_size_bytes: int | None = DEFAULT_MAX_FILE_SIZE_BYTES,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         use_default_ignores: bool = True,
         ignored_paths: tuple[Path, ...] = (),
+        test_discovery: TestDiscoveryPolicy | None = None,
     ) -> None:
         self.max_file_size_bytes = max_file_size_bytes
+        self.test_discovery = test_discovery
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
         self.exclude_rules = tuple(resolve_scan_exclude_pattern(pattern) for pattern in self.exclude_patterns)
@@ -74,12 +77,13 @@ class ProjectScanner:
 
     @classmethod
     def from_config(cls, config: ScanConfig, *, config_path: Path | None,
-                    ignored_paths: tuple[Path, ...] = ()) -> ProjectScanner:
+                    ignored_paths: tuple[Path, ...] = (),
+                    test_discovery: TestDiscoveryPolicy | None = None) -> ProjectScanner:
         """Apply the effective project policy at filesystem entry points."""
         return cls(max_file_size_bytes=config.max_file_size_bytes,
                    include_patterns=config.include, exclude_patterns=config.exclude,
                    config_path=config_path, use_default_ignores=not config.ignore_defaults,
-                   ignored_paths=ignored_paths)
+                   ignored_paths=ignored_paths, test_discovery=test_discovery)
 
     def scan(
         self,
@@ -228,6 +232,7 @@ class ProjectScanner:
             path=normalized,
             relative_path=rel,
             artifact_type=classification.artifact_type,
+            test_discovery=self.test_discovery,
             language=classification.language,
             size_bytes=size,
             sha256=sha256,
@@ -253,7 +258,7 @@ def fingerprint_file(path: Path, *, max_bytes: int | None = None) -> tuple[os.st
             opened = os.fstat(stream.fileno())
             if _file_stamp(before) != _file_stamp(opened):
                 continue
-            sample = stream.read(SAMPLE_BYTES)
+            sample = stream.read(TEXT_SAMPLE_BYTES)
             digest.update(sample)
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)

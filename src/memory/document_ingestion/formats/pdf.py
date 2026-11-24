@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from io import BytesIO
 from typing import Any
 
 from ...artifacts.models import SourceArtifact
@@ -12,7 +13,6 @@ from ..models import DocumentParseResult
 
 class PDFParser(BaseDocumentParser):
     parser_name = "pdf"
-    parser_version = "pdf-v1"
     artifact_types = frozenset({"pdf"})
     languages = frozenset({"pdf"})
 
@@ -25,8 +25,10 @@ class PDFParser(BaseDocumentParser):
 
         try:
             pdf_module = import_module("pypdf")
-        except Exception:
-            metadata.update({"status": "needs_parser", "partially_readable": True, "needs_ocr": True})
+        except ModuleNotFoundError as exc:
+            if exc.name != "pypdf":
+                raise
+            metadata.update({"status": "needs_parser", "partially_readable": True})
             errors.append("PDF parser dependency unavailable; install pypdf for text extraction")
             fragments.append(
                 make_fragment(
@@ -42,7 +44,7 @@ class PDFParser(BaseDocumentParser):
 
         PdfReader = pdf_module.PdfReader
         try:
-            reader = PdfReader(artifact.path)
+            reader = PdfReader(BytesIO(content))
             info = getattr(reader, "metadata", None)
             if info:
                 pdf_metadata = {str(k).lstrip("/"): str(v) for k, v in dict(info).items() if v is not None}

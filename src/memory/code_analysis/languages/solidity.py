@@ -357,8 +357,10 @@ def _resolve_solidity_import(
         if source_path.startswith(prefix):
             suffix = source_path[len(prefix) :]
             candidates.append((project_root / target / suffix).resolve(strict=False))
+    if not candidates and not Path(source_path).is_absolute():
+        candidates.append((project_root / source_path).resolve(strict=False))
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             try:
                 return candidate.relative_to(project_root).as_posix()
             except ValueError:

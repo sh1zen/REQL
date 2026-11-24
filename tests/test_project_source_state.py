@@ -12,8 +12,7 @@ from mcp.tools import query_context, reql_project_status
 from memory.artifacts.scanner import ProjectScanner
 from memory.cli import main
 from memory.domain.exceptions import StorageError
-from memory.testing.evidence_store import TestEvidenceStore
-from memory.testing.verification import run_saved_checks
+from memory.storage import BlockGraphStore
 from reql import MemoryGraph, QueryContextRequest
 
 
@@ -124,14 +123,6 @@ class ProjectSourceStateTests(unittest.TestCase):
         self.assertFalse(stats["cache"]["cache_enabled"])
         self.assertEqual(stats["cache"]["total_artifacts"], 0)
 
-    def test_scan_commands_reject_removed_size_override(self) -> None:
-        """Use project configuration as the CLI source of the size limit."""
-        for command in (["project", "compile"], ["stats"]):
-            with self.subTest(command=command), redirect_stderr(StringIO()) as error:
-                with self.assertRaises(SystemExit) as rejected:
-                    main([*command, "--max-file-size-mb", "5"])
-                self.assertEqual(rejected.exception.code, 2)
-                self.assertIn("unrecognized arguments: --max-file-size-mb", error.getvalue())
     def test_list_workspaces_api_reads_registered_roots_without_scanning(self) -> None:
         """List only roots in the selected store, including their last compiled revisions."""
         other = TemporaryDirectory()
@@ -191,25 +182,16 @@ class ProjectSourceStateTests(unittest.TestCase):
         self.assertEqual(stats["workspace"], status)
         self.assertIsNone(stats["cache"])
 
-    def test_native_diff_checks_added_and_modified_text(self) -> None:
-        """Only changed project files are checked against the last native revision."""
-        self.source.write_bytes(b"VALUE = 1 \r\n")
+    def test_compile_checks_checkpoint_only_after_applying_changes(self) -> None:
+        """An existing WAL does not cause two checkpoints in one compile."""
         with closing(MemoryGraph.open(self.storage)) as graph:
             self.assertIsNotNone(graph.compile_project(self.root).revision)
-        added = self.root / "new.py"
-        added.write_bytes(b"VALUE = 2\t\r\n<<<<<<< edit\r\n")
-        evidence = TestEvidenceStore(self.storage)
-        task_id = "task:source-check"
-        evidence.record_verification({"root": str(self.root), "task_id": task_id, "patterns": [], "diff": True,
-                                      "extra_inputs": [], "fingerprint": "", "checks": []})
-        with patch("subprocess.Popen", side_effect=AssertionError("source checks must stay in process")):
-            result = run_saved_checks(self.root, evidence, task_id=task_id, timeout=20)
-            self.assertEqual(result["status"], "failed")
-            check = result["checks"][0]
-            self.assertIn("new.py:1: trailing whitespace", check["error"])
-            self.assertIn("new.py:2: unresolved conflict marker", check["error"])
-            self.assertNotIn("service.py", check["error"])
-            added.write_bytes(b"VALUE = 2\r\n")
-            result = run_saved_checks(self.root, evidence, task_id=task_id, timeout=20)
-            self.assertEqual(result["status"], "passed")
-            self.assertTrue(result["checks"][0]["passed"])
+        self.source.write_text("def dispatch():\n    return 'changed'\n", encoding="utf-8")
+        checkpoint = BlockGraphStore.checkpoint_if_needed
+        with (patch.object(BlockGraphStore, "checkpoint_if_needed", autospec=True,
+                           side_effect=lambda store: checkpoint(store, wal_bytes_threshold=0)) as writes,
+              patch("subprocess.Popen", side_effect=AssertionError("compile must not launch checks")),
+              redirect_stdout(StringIO())):
+            self.assertEqual(main(["project", "compile"]), 0)
+        self.assertEqual(writes.call_count, 1)
+        self.assertFalse(self.storage.with_suffix(".reql.wal").exists())

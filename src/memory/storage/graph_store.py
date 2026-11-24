@@ -54,14 +54,14 @@ class GraphStore(Protocol):
     list[MemoryEdge]: ...
 
     def neighbors(self, node_id: str, *, direction: str = "both", edge_types: set[str] | None = None,
-                  min_weight: float = 0.0, limit: int = 500,
+                  min_weight: float = 0.0, limit: int | None = 500,
                   clone: bool = True) -> list[tuple[MemoryEdge, MemoryNode]]: ...
 
     def find_nodes_by_property(self, property_name: str, value: Any, *, type_: str | None = None,
                                status: str | Sequence[str] | None = None, limit: int | None = 1000,
                                clone: bool = True) -> list[MemoryNode]: ...
 
-    def find_edges_by_property(self, property_name: str, value: Any, *, type_: str | None = None, limit: int = 1000,
+    def find_edges_by_property(self, property_name: str, value: Any, *, type_: str | None = None, limit: int | None = 1000,
                                clone: bool = True) -> list[MemoryEdge]: ...
 
     def bounded_neighborhood(self, node_id: str, *, max_depth: int = 2, edge_types: set[str] | None = None,
@@ -104,7 +104,8 @@ class GraphStore(Protocol):
                             include_global_project: bool = True, clone: bool = True) -> list[tuple[MemoryNode, int, float]]: ...
 
     def lexical_search(self, text: str, *, top_k: int | None = 20, node_types: set[str] | None = None,
-                       include_archived: bool = False, clone: bool = True) -> list[tuple[MemoryNode, float]]: ...
+                       include_archived: bool = False, project_id: str | None = None,
+                       clone: bool = True) -> list[tuple[MemoryNode, float]]: ...
 
     def degree(self, node_id: str, *, edge_types: set[str] | None = None) -> int: ...
 

@@ -1,11 +1,13 @@
 """Exercise revision-bound source edits through the public CLI."""
 from codecs import BOM_UTF8
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stderr, redirect_stdout
 from hashlib import sha256
 from io import StringIO
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +15,8 @@ from api import MemoryGraph
 from memory.artifacts.revision import RevisionRepository
 from memory.cli import main
 from memory.domain.exceptions import StorageError
+from memory.storage import StoreLease
+from memory.storage.adapters import store_lock
 
 
 class SourceEditTests(unittest.TestCase):
@@ -74,6 +78,29 @@ class SourceEditTests(unittest.TestCase):
             self.assertEqual(json.loads(output)["refresh"]["status"], "completed")
         self.assertEqual(self.code.read_bytes(), b"def run():\n    return 3")
 
+    def test_waiting_edit_revalidates_files_after_acquiring_its_lease(self) -> None:
+        """Reject an edit when the current lease holder changed its source."""
+        waiting = Event()
+        acquire = store_lock._acquire
+
+        def observe(fd: int, *, shared: bool, blocking: bool) -> bool:
+            if blocking and not shared:
+                waiting.set()
+            return acquire(fd, shared=shared, blocking=blocking)
+
+        plan = [self._range("sample.py", 2, 2, "    return 3")]
+        updated = b"def run():\n    return 2"
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with StoreLease(self.root / ".reql/source-edit"), patch.object(store_lock, "_acquire", observe):
+                pending = worker.submit(self._edit, plan)
+                self.assertTrue(waiting.wait(10))
+                self.assertFalse(pending.done())
+                self.code.write_bytes(updated)
+            status, output = pending.result(timeout=10)
+        self.assertEqual(status, 2, output)
+        self.assertIn("Source changed since compilation: sample.py", output)
+        self.assertEqual(self.code.read_bytes(), updated)
+
     def test_edit_requires_a_compiled_revision_for_its_own_root(self) -> None:
         """A graph with revisions for another root cannot authorize edits here."""
         other = self.root.parent / "other"
@@ -87,13 +114,6 @@ class SourceEditTests(unittest.TestCase):
             self.assertEqual(main(["edit", "--path", str(other), "--plan", "-"]), 2)
         self.assertIn("Run `reql project compile` from its root first", error.getvalue())
         self.assertEqual(target.read_bytes(), self.original_code)
-
-    def test_edit_rejects_the_removed_revision_option(self) -> None:
-        """Reject the obsolete flag before reading an edit plan."""
-        with redirect_stderr(StringIO()) as error, self.assertRaises(SystemExit) as rejected:
-            main(["edit", "--plan", "-", "--source-revision", self.source_revision])
-        self.assertEqual(rejected.exception.code, 2)
-        self.assertIn("unrecognized arguments: --source-revision", error.getvalue())
 
     def test_no_op_skips_graph_refresh(self) -> None:
         """A plan that writes no files should incur no compilation."""
